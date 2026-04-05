@@ -1,0 +1,23 @@
+# Environment / secrets
+.env
+drb-edge-node/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Runtime-generated configs and recordings
+configs/
+recordings/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

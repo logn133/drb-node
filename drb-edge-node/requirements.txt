@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+paho-mqtt>=2.0.0
+httpx
+discord.py[voice]
+PyNaCl
+pytest
+pytest-asyncio

@@ -1,0 +1,6 @@
+__pycache__*
+bot-poc.py
+configs*
+.env
+*.log*
+.venv
