@@ -53,9 +53,18 @@ class OP25Client:
         """Poll the OP25 HTTP terminal for current call metadata."""
         try:
             async with httpx.AsyncClient(timeout=3) as client:
-                r = await client.get(f"{self.terminal_url}/0/status.json")
+                r = await client.post(
+                    self.terminal_url,
+                    json=[{"command": "update", "arg1": 0, "arg2": 0}],
+                )
                 r.raise_for_status()
-                return r.json()
+                messages = r.json()
+                for msg in messages:
+                    if msg.get("json_type") == "channel_update":
+                        channels = msg.get("channels", [])
+                        if channels:
+                            return msg.get(str(channels[0]), {})
+                return None
         except Exception:
             return None
 

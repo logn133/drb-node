@@ -175,7 +175,7 @@
         document.getElementById('tgid').textContent = d.active_tgid ?? '—';
         document.getElementById('call-id').textContent = d.active_call_id ? d.active_call_id.slice(0, 8) + '…' : '—';
         document.getElementById('system-id').textContent = d.assigned_system_id ?? '—';
-        document.getElementById('op25-status').textContent = d.op25?.running ? 'Running' : 'Stopped';
+        document.getElementById('op25-status').textContent = d.op25?.status === 'running' ? 'Running' : 'Stopped';
         document.getElementById('location').textContent = `${d.lat}, ${d.lon}`;
         document.getElementById('configured').textContent = d.configured ? 'Yes' : 'No';
 

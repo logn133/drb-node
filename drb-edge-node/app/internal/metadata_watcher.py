@@ -7,8 +7,8 @@ from app.internal.logger import logger
 
 CallbackFn = Callable[[dict], Awaitable[None]]
 
-HANG_THRESHOLD = 3   # polls before declaring a call ended (1 poll/sec → 3s hang time)
-POLL_INTERVAL = 1.0  # seconds
+HANG_THRESHOLD = 2   # polls before declaring a call ended (0.5s poll → 1s hang time)
+POLL_INTERVAL = 0.5  # seconds
 
 
 class MetadataWatcher:

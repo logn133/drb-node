@@ -29,7 +29,7 @@ def save_whitelist(talkgroup_tags: List[int]) -> None:
     with open("/configs/active.cfg.whitelist.tsv", 'w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file, delimiter='\t', lineterminator='\n')
         # Write rows
-        for tag in talkgroup_tags:
+        for tag in (talkgroup_tags or []):
             writer.writerow([tag])
 
 def del_none_in_dict(d):

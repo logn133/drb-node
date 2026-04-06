@@ -12,9 +12,11 @@ services:
     restart: unless-stopped
     privileged: true
     network_mode: host
+    env_file: .env
     volumes:
       - ./configs:/configs
       - /dev:/dev
+      - ./op25-container/app:/app
     depends_on:
       - icecast
 
@@ -26,6 +28,7 @@ services:
     volumes:
       - ./configs:/configs
       - ./recordings:/recordings
+      - ./drb-edge-node/app:/app/app
     depends_on:
       - icecast
       - op25
