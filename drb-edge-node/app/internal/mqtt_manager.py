@@ -5,6 +5,7 @@ from typing import Optional, Callable, Awaitable, Dict, Any
 import paho.mqtt.client as mqtt
 from app.config import settings
 from app.internal.logger import logger
+from app.internal import credentials
 
 CommandCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 ConfigCallback = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -26,10 +27,11 @@ class MQTTManager:
         self._t_checkin   = f"nodes/{nid}/checkin"
         self._t_status    = f"nodes/{nid}/status"
         self._t_metadata  = f"nodes/{nid}/metadata"
-        self._t_commands  = f"nodes/{nid}/commands"
-        self._t_config    = f"nodes/{nid}/config"
-        self._t_api_key   = f"nodes/{nid}/api_key"
-        self._t_discovery = "nodes/discovery/request"
+        self._t_commands    = f"nodes/{nid}/commands"
+        self._t_config      = f"nodes/{nid}/config"
+        self._t_api_key     = f"nodes/{nid}/api_key"
+        self._t_key_request = f"nodes/{nid}/key_request"
+        self._t_discovery   = "nodes/discovery/request"
 
     def _build_client(self) -> mqtt.Client:
         client = mqtt.Client(
@@ -61,6 +63,7 @@ class MQTTManager:
             client.subscribe(self._t_discovery, qos=0)
             logger.info("MQTT connected.")
             asyncio.run_coroutine_threadsafe(self._publish_checkin(), self._loop)
+            asyncio.run_coroutine_threadsafe(self._maybe_request_key(), self._loop)
         else:
             logger.error(f"MQTT connect refused: {reason_code}")
 
@@ -128,6 +131,14 @@ class MQTTManager:
             **data,
         }
         self._publish(self._t_metadata, payload, qos=1)
+
+    async def _maybe_request_key(self):
+        """After connecting, wait for any retained api_key message to arrive.
+        If no key materialises within 5 seconds, ask the server to re-deliver it."""
+        await asyncio.sleep(5)
+        if not credentials.get_api_key():
+            logger.info("No API key on disk — requesting re-delivery from C2 server.")
+            self._publish(self._t_key_request, {}, qos=1)
 
     async def _publish_checkin(self):
         payload = {
