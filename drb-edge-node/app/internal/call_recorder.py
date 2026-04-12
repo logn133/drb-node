@@ -27,12 +27,15 @@ class CallRecorder:
         self._current_file = self._recordings_dir / f"{ts}_{call_id}.mp3"
         self._current_call_id = call_id
 
-        # Read directly from the PulseAudio monitor source (zero-delay, no Icecast burst buffer).
-        # PULSE_SERVER env var is set in the container environment.
+        # Read from the Icecast stream. burst-size=0 in icecast config ensures
+        # each new connection starts at the live position with no buffered data.
+        stream_url = f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
         cmd = [
             "ffmpeg", "-y",
-            "-f", "pulse",
-            "-i", "default",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-i", stream_url,
             "-acodec", "libmp3lame",
             "-ar", "22050",
             "-b:a", "32k",

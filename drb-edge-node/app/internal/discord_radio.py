@@ -46,10 +46,8 @@ class RadioBot:
             # Remember where we are so the watchdog can rejoin if we drop
             self._guild_id = guild_id
             self._channel_id = channel_id
-            if call_active:
-                self._was_streaming = True
-                self._play_stream()
-            logger.info(f"Joined #{channel.name} in {guild.name} (streaming={'yes' if call_active else 'waiting for call'})")
+            self._play_stream()
+            logger.info(f"Joined #{channel.name} in {guild.name}")
             return True
         except Exception as e:
             logger.error(f"Failed to join voice channel: {e}")
@@ -73,19 +71,12 @@ class RadioBot:
         return False
 
     def start_stream(self):
-        """Called when an OP25 call starts — begin transmitting audio and light the ring."""
-        self._was_streaming = True
-        if self._voice_client and self._voice_client.is_connected():
-            if not self._voice_client.is_playing():
-                self._play_stream()
-                logger.debug("Stream started (call active).")
+        """Called when an OP25 call starts — stream plays continuously, nothing to do."""
+        pass
 
     def stop_stream(self):
-        """Called when an OP25 call ends — stop transmitting so the ring goes dark."""
-        self._was_streaming = False
-        if self._voice_client and self._voice_client.is_connected():
-            self._stop_stream()
-            logger.debug("Stream stopped (call ended).")
+        """Called when an OP25 call ends — stream plays continuously, nothing to do."""
+        pass
 
     async def stop(self):
         self._guild_id = None
@@ -110,16 +101,22 @@ class RadioBot:
     def _play_stream(self):
         if not self._voice_client:
             return
-        # Read directly from PulseAudio monitor (zero-delay, no Icecast buffer).
-        # PULSE_SERVER is set in the container environment to the shared socket.
+        from app.config import settings
+        stream_url = f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
         source = discord.FFmpegPCMAudio(
-            "default",
-            before_options="-f pulse",
+            stream_url,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32 -analyzeduration 0 -fflags nobuffer",
         )
         self._voice_client.play(
             discord.PCMVolumeTransformer(source, volume=1.0),
-            after=lambda e: logger.error(f"Stream ended unexpectedly: {e}") if e else None,
+            after=self._on_stream_end,
         )
+
+    def _on_stream_end(self, error):
+        if error:
+            logger.error(f"Stream ended: {error}")
+        if self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing():
+            asyncio.get_event_loop().call_soon_threadsafe(self._play_stream)
 
     def _stop_stream(self):
         if self._voice_client and self._voice_client.is_playing():
@@ -144,7 +141,6 @@ class RadioBot:
                         self._guild_id,
                         self._channel_id,
                         self._current_token,
-                        call_active=self._was_streaming,
                     )
                     if rejoined:
                         logger.info("Watchdog: successfully rejoined voice channel.")
