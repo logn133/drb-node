@@ -17,6 +17,7 @@ class RadioBot:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._ready_event: Optional[asyncio.Event] = None
         self._current_token: Optional[str] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Remembered so we can rejoin after an unexpected disconnect
         self._guild_id: Optional[int] = None
@@ -115,8 +116,8 @@ class RadioBot:
     def _on_stream_end(self, error):
         if error:
             logger.error(f"Stream ended: {error}")
-        if self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing():
-            asyncio.get_event_loop().call_soon_threadsafe(self._play_stream)
+        if self._loop and self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing():
+            self._loop.call_soon_threadsafe(self._play_stream)
 
     def _stop_stream(self):
         if self._voice_client and self._voice_client.is_playing():
@@ -162,6 +163,7 @@ class RadioBot:
         self._bot = commands.Bot(command_prefix="!", intents=intents)
         self._ready_event = asyncio.Event()
         self._current_token = token
+        self._loop = asyncio.get_event_loop()
 
         @self._bot.event
         async def on_ready():
