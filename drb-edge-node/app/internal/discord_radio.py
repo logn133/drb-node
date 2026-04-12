@@ -113,7 +113,7 @@ class RadioBot:
         # Read directly from PulseAudio monitor (zero-delay, no Icecast buffer).
         # PULSE_SERVER is set in the container environment to the shared socket.
         source = discord.FFmpegPCMAudio(
-            "default.monitor",
+            "default",
             before_options="-f pulse",
         )
         self._voice_client.play(

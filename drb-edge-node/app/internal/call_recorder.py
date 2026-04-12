@@ -32,7 +32,7 @@ class CallRecorder:
         cmd = [
             "ffmpeg", "-y",
             "-f", "pulse",
-            "-i", "default.monitor",
+            "-i", "default",
             "-acodec", "libmp3lame",
             "-ar", "22050",
             "-b:a", "32k",
