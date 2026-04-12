@@ -43,10 +43,18 @@ class CallRecorder:
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            logger.info(f"Recording started: {self._current_file.name}")
+            
+            # Quick check if it died immediately (e.g. Pulse source not found)
+            await asyncio.sleep(0.5)
+            if self._process.returncode is not None:
+                _, stderr = await self._process.communicate()
+                logger.error(f"FFmpeg exited immediately ({self._process.returncode}): {stderr.decode()}")
+                return False
+            
+            logger.info(f"Recording process started: {self._current_file.name}")
             return True
         except Exception as e:
             logger.error(f"FFmpeg start failed: {e}")

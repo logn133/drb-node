@@ -34,6 +34,10 @@ async def on_call_end(data: dict):
         audio_url = await call_recorder.upload_recording(file_path, data["call_id"])
         if audio_url:
             data["audio_url"] = audio_url
+        else:
+            logger.error(f"Audio upload failed for call {data['call_id']}. Verify C2_URL and Node API Key.")
+    else:
+        logger.warning(f"No recording file generated for call {data['call_id']}. Is PulseAudio working?")
     await mqtt_manager.publish_metadata("call_end", data)
     await mqtt_manager.publish_status("online")
 
