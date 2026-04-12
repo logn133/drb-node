@@ -51,6 +51,7 @@ class RadioBot:
             self._guild_id = guild_id
             self._channel_id = channel_id
             if call_active:
+                self._was_streaming = True
                 self._play_stream()
             logger.info(f"Joined #{channel.name} in {guild.name} (streaming={'yes' if call_active else 'waiting for call'})")
             return True
@@ -183,10 +184,11 @@ class RadioBot:
             if self._bot.user and member.id != self._bot.user.id:
                 return
             if before.channel is not None and after.channel is None:
-                # Bot was disconnected (kicked or server drop)
-                logger.warning("Bot was disconnected from voice channel — watchdog will rejoin.")
-                # Nullify the voice client so the watchdog sees it as disconnected
-                self._voice_client = None
+                # Bot was disconnected (kicked or server drop).
+                # Don't null _voice_client here — Discord.py reconnects voice
+                # transparently and would leave _voice_client stale as None.
+                # The watchdog detects real disconnects via is_connected().
+                logger.warning("Bot was disconnected from voice channel — watchdog will rejoin if needed.")
 
         @self._bot.event
         async def on_message(message: discord.Message):
