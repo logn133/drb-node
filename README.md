@@ -1,12 +1,10 @@
 # DRB Client (Edge Node)
 
-Software stack for a DRB (Discord Radio Bot) edge node. Runs on the SDR hardware machine. Decodes P25/DMR/NBFM radio with OP25, streams decoded audio via Icecast, and streams live audio into Discord voice channels on demand.
+Software stack for a DRB (Discord Radio Bot) edge node. Runs on the SDR hardware machine. Decodes P25/DMR/NBFM radio with OP25, routes decoded audio through PulseAudio for low-latency Discord streaming and call recording, and secondarily streams to Icecast for browser listening.
 
-## System Overview
+## Audio Architecture
 
-An edge node is a machine (typically a small Linux box or Raspberry Pi) with an RTL-SDR dongle attached. It connects to the central DRB C2 server over MQTT and waits for a radio system config. Once configured, it decodes transmissions and streams audio. When a Discord user runs `/join`, the server sends the node a `discord_join` command and the node puts a Discord bot in the user's voice channel that plays the live Icecast stream.
-
-The Discord bot's speaking ring (green animated border) **only lights up when radio is actively transmitting** — not while it's silently waiting in the channel.
+**PulseAudio is the primary audio path. Icecast is for browser listening only.**
 
 ```
 RTL-SDR dongle
@@ -14,22 +12,49 @@ RTL-SDR dongle
     ▼
 op25-container  ←── GnuRadio + OP25 + Liquidsoap
     │  decodes P25/DMR/NBFM
-    │  streams MP3 audio to Icecast on port 8000
     │  HTTP API on port 8001  (start/stop/generate-config)
     │  HTTP terminal on port 8081  (live talkgroup metadata)
     │
-    ▼
-icecast  ←── Icecast2
-    │  serves audio at http://localhost:8000/radio
+    ├──► PulseAudio (drb_sink null sink)          ← PRIMARY audio path
+    │        ~250ms latency, synchronized with OP25 call events
+    │        shared via named Docker volume (pulse_socket:/run/pulse)
     │
-    ▼
+    └──► Icecast on port 8000                     ← BROWSER STREAMING ONLY
+             serves http://localhost:8000/radio
+             2-5s buffering lag — NOT suitable for recording or Discord
+```
+
+```
+PulseAudio (drb_sink.monitor — default source)
+    │
+    ├──► drb-edge-node: FFmpeg call recorder
+    │        records each call to MP3, uploads to C2 server
+    │        aligned with OP25 call_start / call_end events
+    │
+    └──► drb-edge-node: discord.py bot
+             streams live audio into Discord voice channel
+             continuous stream while bot is in channel
+```
+
+> **Why not Icecast for recording/Discord?**
+> Icecast introduces 2-5 seconds of pipeline buffering that grows over time. Since
+> call_start and call_end events fire in real-time from OP25 RF detection, using
+> Icecast as the recording source causes recordings to miss the beginning and end
+> of transmissions — especially on short calls (< 8s). PulseAudio has ~250ms
+> latency and stays locked to the live audio position.
+
+## System Overview
+
+An edge node is a machine (typically a small Linux box or Raspberry Pi) with an RTL-SDR dongle attached. It connects to the central DRB C2 server over MQTT and waits for a radio system config. Once configured, it decodes transmissions and streams audio. When a Discord user runs `/join`, the server sends the node a `discord_join` command and the node puts a Discord bot in the user's voice channel that plays the live PulseAudio stream.
+
+```
 drb-edge-node  ←── FastAPI
     │  polls OP25 terminal every 0.5s — detects call start/end events
     │  publishes call metadata + status to C2 server over MQTT
-    │  records each call with FFmpeg, uploads recording to C2
+    │  records each call with FFmpeg from PulseAudio, uploads to C2
     │  receives discord_join/leave commands over MQTT
     │  starts Discord bot (discord.py), joins voice channel
-    │  starts/stops FFmpeg→Discord stream on OP25 call events
+    │  streams PulseAudio continuously into Discord while bot is connected
     │  serves local web dashboard on port 8080
     │
     ▼
@@ -43,9 +68,9 @@ C2 Server  (remote — over MQTT + HTTP)
 
 | Service | Container | Description |
 |---|---|---|
-| `icecast` | Icecast2 (Debian) | Audio streaming server — receives encoded audio from OP25/Liquidsoap, serves it over HTTP |
-| `op25` | OP25 + GnuRadio (Debian) | SDR decoder — tunes to a radio system, decodes P25/DMR/NBFM, streams via Liquidsoap to Icecast |
-| `edge-node` | Python 3.11 / FastAPI | Node agent — bridges OP25 metadata, C2 MQTT commands, call recording, and Discord voice |
+| `op25` | OP25 + GnuRadio (Debian) | SDR decoder — tunes to a radio system, decodes P25/DMR/NBFM, outputs audio to PulseAudio (primary) and Icecast (browser) via Liquidsoap |
+| `edge-node` | Python 3.11 / FastAPI | Node agent — bridges OP25 metadata, C2 MQTT commands, call recording from PulseAudio, and Discord voice streaming from PulseAudio |
+| `icecast` | Icecast2 (Debian) | Browser audio streaming only — serves the stream at `http://<node>:8000/radio` for local/remote listening. Not used for recording or Discord. |
 
 All services run with `network_mode: host` so they share the host network and reach each other on `localhost` without any port mapping.
 
@@ -71,8 +96,8 @@ Client/
 │   │       ├── mqtt_manager.py     # MQTT: checkin/status/metadata pub + command/config/apikey sub
 │   │       ├── metadata_watcher.py # Polls OP25 terminal at 0.5s — fires on_call_start/on_call_end
 │   │       ├── op25_client.py      # HTTP client to op25-container API (start/stop/status/config)
-│   │       ├── discord_radio.py    # discord.py bot — joins voice, streams Icecast, @mention commands
-│   │       ├── call_recorder.py    # FFmpeg recording from Icecast per call, uploads to C2
+│   │       ├── discord_radio.py    # discord.py bot — joins voice, streams PulseAudio, @mention commands
+│   │       ├── call_recorder.py    # FFmpeg recording from PulseAudio per call, uploads to C2
 │   │       ├── credentials.py      # Persists C2-issued API key to /configs/credentials.json
 │   │       ├── config_manager.py   # Reads/writes /configs/node_config.json
 │   │       └── logger.py           # Stdout logging setup
@@ -176,10 +201,10 @@ The C2 server translates these into OP25's `active.cfg.json` format (with Hz fre
 2. Server sends a `discord_join` command to c2-core with the target guild ID, channel ID, and an optional preferred token.
 3. c2-core picks a free token from the pool, marks it `in_use`, and forwards everything to the edge node over MQTT.
 4. Edge node starts a `discord.py` bot with that token and connects it to the voice channel.
-5. The bot **sits silently** in the channel until radio is active (no speaking ring while idle).
-6. When OP25 detects an active call → `start_stream()` → FFmpegPCMAudio opens the Icecast URL → Discord speaking ring lights up.
-7. When the call ends (1s of inactivity on the talkgroup) → `stop_stream()` → FFmpeg stops → ring goes dark.
-8. On `/leave`, the bot disconnects and the token is released back to the pool.
+5. The bot immediately begins streaming from PulseAudio (`drb_sink.monitor`) — continuous stream while connected.
+6. On `/leave`, the bot disconnects and the token is released back to the pool.
+
+**Audio source:** PulseAudio (`-f pulse "default"` → `drb_sink.monitor`). ~250ms latency, in sync with live RF. Icecast is **not** used for Discord streaming.
 
 **Direct bot commands:**
 
@@ -212,10 +237,12 @@ The `configs` volume is critical — without it, the node forgets its API key an
 
 ## Call Recording
 
-Every call is recorded via FFmpeg pulling from the Icecast stream. Recordings are:
+Every call is recorded via FFmpeg reading from PulseAudio (`drb_sink.monitor`, the default source). Recordings are:
 - Saved to `/recordings/YYYYMMDD_HHMMSS_<call_id>.mp3`
 - Uploaded to the C2 server (if `C2_URL` is set) using the node's API key as a Bearer token
 - Capped at 600 seconds for safety
+
+**Audio source:** PulseAudio (`-f pulse -i default`). Recording starts the moment `call_start` fires from OP25, capturing the full transmission including short calls (< 8s). Icecast is **not** used for recording — its 2-5s buffering lag causes recordings to miss the start of calls and produce empty files for short transmissions.
 
 ## Makefile Targets
 

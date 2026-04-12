@@ -1,16 +1,22 @@
 # PulseAudio system daemon configuration for DRB containers.
-# Allows anonymous connections so the edge-node container can read the audio monitor.
+#
+# Audio architecture:
+#   Liquidsoap (op25 container) → output.pulseaudio() → drb_sink (null sink)
+#   FFmpeg (edge-node container) → -f pulse -i default → drb_sink.monitor
+#
+# Icecast is a secondary output for browser listening only.
+# PulseAudio is the primary path for Discord streaming and call recording.
 
 .nofail
 
 # Native protocol with anonymous auth — required for inter-container access
 load-module module-native-protocol-unix socket=/run/pulse/native auth-anonymous=1
 
-# Always provide a default sink even without audio hardware
-load-module module-always-sink
+# Named null sink — Liquidsoap outputs here; edge-node records from its monitor
+load-module module-null-sink sink_name=drb_sink sink_properties=device.description=DRB-Sink
 
-# Restore device/stream settings across restarts
-load-module module-device-restore
-load-module module-stream-restore
+# Make the sink and its monitor the system defaults
+set-default-sink drb_sink
+set-default-source drb_sink.monitor
 
 .fail
