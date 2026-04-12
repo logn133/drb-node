@@ -1,0 +1,16 @@
+# PulseAudio system daemon configuration for DRB containers.
+# Allows anonymous connections so the edge-node container can read the audio monitor.
+
+.nofail
+
+# Native protocol with anonymous auth — required for inter-container access
+load-module module-native-protocol-unix socket=/run/pulse/native auth-anonymous=1
+
+# Always provide a default sink even without audio hardware
+load-module module-always-sink
+
+# Restore device/stream settings across restarts
+load-module module-device-restore
+load-module module-stream-restore
+
+.fail

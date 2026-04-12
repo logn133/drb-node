@@ -15,9 +15,6 @@ class CallRecorder:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._current_call_id: Optional[str] = None
         self._current_file: Optional[Path] = None
-        self._icecast_url = (
-            f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
-        )
         self._recordings_dir = Path(settings.recordings_path)
 
     async def start_recording(self, call_id: str) -> bool:
@@ -30,10 +27,15 @@ class CallRecorder:
         self._current_file = self._recordings_dir / f"{ts}_{call_id}.mp3"
         self._current_call_id = call_id
 
+        # Read directly from the PulseAudio monitor source (zero-delay, no Icecast burst buffer).
+        # PULSE_SERVER env var is set in the container environment.
         cmd = [
             "ffmpeg", "-y",
-            "-i", self._icecast_url,
-            "-acodec", "copy",
+            "-f", "pulse",
+            "-i", "default.monitor",
+            "-acodec", "libmp3lame",
+            "-ar", "22050",
+            "-b:a", "32k",
             "-t", str(MAX_RECORDING_SECONDS),
             str(self._current_file),
         ]
