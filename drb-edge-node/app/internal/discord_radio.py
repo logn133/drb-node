@@ -115,8 +115,17 @@ class RadioBot:
 
     def _on_stream_end(self, error):
         if error:
-            logger.error(f"Stream ended: {error}")
-        if self._loop and self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing():
+            logger.error(f"Stream ended with error: {error}")
+        if not (self._loop and self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing()):
+            return
+        if error:
+            # Back off before retrying — prevents tight loop when PulseAudio is unavailable
+            async def _delayed_restart():
+                await asyncio.sleep(5)
+                if self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing():
+                    self._play_stream()
+            self._loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_delayed_restart()))
+        else:
             self._loop.call_soon_threadsafe(self._play_stream)
 
     def _stop_stream(self):
