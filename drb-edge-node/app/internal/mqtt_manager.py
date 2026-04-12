@@ -141,11 +141,13 @@ class MQTTManager:
             self._publish(self._t_key_request, {}, qos=1)
 
     async def _publish_checkin(self):
+        from app.internal.discord_radio import radio_bot
         payload = {
             "node_id": settings.node_id,
             "name": settings.node_name,
             "lat": settings.node_lat,
             "lon": settings.node_lon,
+            "discord_connected": radio_bot.is_connected,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._publish(self._t_checkin, payload, qos=1)

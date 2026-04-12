@@ -17,6 +17,7 @@ services:
       - ./configs:/configs
       - /dev:/dev
       - ./op25-container/app:/app
+      - pulse_socket:/run/pulse
     depends_on:
       - icecast
 
@@ -29,6 +30,12 @@ services:
       - ./configs:/configs
       - ./recordings:/recordings
       - ./drb-edge-node/app:/app/app
+      - pulse_socket:/run/pulse
+    environment:
+      PULSE_SERVER: unix:/run/pulse/native
     depends_on:
       - icecast
       - op25
+
+volumes:
+  pulse_socket:

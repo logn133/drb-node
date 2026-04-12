@@ -2,7 +2,6 @@ import asyncio
 from typing import Optional
 import discord
 from discord.ext import commands
-from app.config import settings
 from app.internal.logger import logger
 
 BOT_READY_TIMEOUT = 15   # seconds to wait for Discord bot to become ready
@@ -18,9 +17,6 @@ class RadioBot:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._ready_event: Optional[asyncio.Event] = None
         self._current_token: Optional[str] = None
-        self._icecast_url = (
-            f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
-        )
 
         # Remembered so we can rejoin after an unexpected disconnect
         self._guild_id: Optional[int] = None
@@ -114,9 +110,11 @@ class RadioBot:
     def _play_stream(self):
         if not self._voice_client:
             return
+        # Read directly from PulseAudio monitor (zero-delay, no Icecast buffer).
+        # PULSE_SERVER is set in the container environment to the shared socket.
         source = discord.FFmpegPCMAudio(
-            self._icecast_url,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            "default.monitor",
+            before_options="-f pulse",
         )
         self._voice_client.play(
             discord.PCMVolumeTransformer(source, volume=1.0),
