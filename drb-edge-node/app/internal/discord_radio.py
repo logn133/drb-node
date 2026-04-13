@@ -102,11 +102,11 @@ class RadioBot:
     def _play_stream(self):
         if not self._voice_client:
             return
-        # Stream from PulseAudio (drb_sink.monitor, the default source).
-        # ~250ms latency vs 2-5s for Icecast — stays in sync with live transmissions.
+        from app.config import settings
+        stream_url = f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
         source = discord.FFmpegPCMAudio(
-            "default",
-            before_options="-f pulse",
+            stream_url,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         )
         self._voice_client.play(
             discord.PCMVolumeTransformer(source, volume=1.0),
