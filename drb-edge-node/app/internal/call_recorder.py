@@ -89,7 +89,14 @@ class CallRecorder:
         logger.warning("Recording file empty or missing — discarding.")
         return None
 
-    async def upload_recording(self, file_path: Path, call_id: str) -> Optional[str]:
+    async def upload_recording(
+        self,
+        file_path: Path,
+        call_id: str,
+        talkgroup_id: Optional[int] = None,
+        talkgroup_name: Optional[str] = None,
+        system_id: Optional[str] = None,
+    ) -> Optional[str]:
         if not settings.c2_url:
             logger.info("No C2_URL configured — skipping upload.")
             return None
@@ -98,13 +105,21 @@ class CallRecorder:
         api_key = credentials.get_api_key()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
+        form: dict = {"call_id": call_id, "node_id": settings.node_id}
+        if talkgroup_id is not None:
+            form["talkgroup_id"] = str(talkgroup_id)
+        if talkgroup_name:
+            form["talkgroup_name"] = talkgroup_name
+        if system_id:
+            form["system_id"] = system_id
+
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 with open(file_path, "rb") as f:
                     r = await client.post(
                         upload_url,
                         files={"file": (file_path.name, f, "audio/mpeg")},
-                        data={"call_id": call_id, "node_id": settings.node_id},
+                        data=form,
                         headers=headers,
                     )
                     r.raise_for_status()

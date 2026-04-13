@@ -31,7 +31,14 @@ async def on_call_end(data: dict):
     radio_bot.stop_stream()
     file_path = await call_recorder.stop_recording()
     if file_path:
-        audio_url = await call_recorder.upload_recording(file_path, data["call_id"])
+        node_cfg = load_node_config()
+        audio_url = await call_recorder.upload_recording(
+            file_path,
+            data["call_id"],
+            talkgroup_id=data.get("tgid"),
+            talkgroup_name=data.get("tgid_name"),
+            system_id=node_cfg.assigned_system_id,
+        )
         if audio_url:
             data["audio_url"] = audio_url
         else:

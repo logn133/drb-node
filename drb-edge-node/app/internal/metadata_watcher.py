@@ -15,6 +15,7 @@ class MetadataWatcher:
     def __init__(self):
         self._running = False
         self._current_tgid: Optional[int] = None
+        self._current_tgid_name: Optional[str] = None
         self._hang_counter: int = 0
         self._active_call_id: Optional[str] = None
         self._call_started_at: Optional[datetime] = None
@@ -82,10 +83,11 @@ class MetadataWatcher:
     async def _start_call(self, tgid: int, meta: dict):
         self._active_call_id = str(uuid.uuid4())
         self._call_started_at = datetime.now(timezone.utc)
+        self._current_tgid_name = meta.get("tag") or meta.get("tgid_tag") or ""
         payload = {
             "call_id": self._active_call_id,
             "tgid": tgid,
-            "tgid_name": meta.get("tag") or meta.get("tgid_tag") or "",
+            "tgid_name": self._current_tgid_name,
             "freq": meta.get("freq"),
             "srcaddr": meta.get("srcaddr"),
             "started_at": self._call_started_at.isoformat(),
@@ -100,12 +102,14 @@ class MetadataWatcher:
         payload = {
             "call_id": self._active_call_id,
             "tgid": self._current_tgid,
+            "tgid_name": self._current_tgid_name or "",
             "started_at": self._call_started_at.isoformat() if self._call_started_at else None,
             "ended_at": datetime.now(timezone.utc).isoformat(),
         }
         logger.info(f"Call end: id={self._active_call_id}")
         self._active_call_id = None
         self._current_tgid = None
+        self._current_tgid_name = None
         self._hang_counter = 0
         self._call_started_at = None
         if self.on_call_end:
