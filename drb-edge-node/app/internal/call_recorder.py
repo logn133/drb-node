@@ -27,13 +27,13 @@ class CallRecorder:
         self._current_file = self._recordings_dir / f"{ts}_{call_id}.mp3"
         self._current_call_id = call_id
 
-        # Record from PulseAudio (drb_sink.monitor, set as the default source).
-        # PulseAudio is the primary audio path — it has ~250ms latency vs 2-5s for Icecast,
-        # so recordings align with OP25 call_start/call_end events.
+        stream_url = f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
         cmd = [
             "ffmpeg", "-y",
-            "-f", "pulse",
-            "-i", "default",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-i", stream_url,
             "-acodec", "libmp3lame",
             "-ar", "22050",
             "-b:a", "32k",
