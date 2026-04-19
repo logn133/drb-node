@@ -158,6 +158,7 @@ async def lifespan(app: FastAPI):
     # Start services (radio_bot starts on-demand when a discord_join command arrives)
     await mqtt_manager.connect()
     await metadata_watcher.start()
+    await call_recorder.start()  # persistent Icecast stream buffer
 
     # Report initial status and resume OP25 if node was already configured before this restart
     node_cfg = load_node_config()
@@ -181,6 +182,7 @@ async def lifespan(app: FastAPI):
     logger.info("Edge node shutting down.")
     heartbeat_task.cancel()
     await metadata_watcher.stop()
+    await call_recorder.stop()
     await radio_bot.stop()
     await mqtt_manager.disconnect()
 
