@@ -30,7 +30,7 @@ jobs:
         with:
           registry: git.vpn.cusano.net
           username: ${{ gitea.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ gitea.token }}
 
       - name: Validate build configuration
         uses: docker/build-push-action@v6
