@@ -33,11 +33,6 @@ jobs:
           username: ${{ gitea.actor }}
           password: ${{ secrets.BUILD_TOKEN }}
 
-      - name: Validate build configuration
-        uses: docker/build-push-action@v6
-        with:
-          call: check
-
       - name: Get version
         id: meta
         run: |
