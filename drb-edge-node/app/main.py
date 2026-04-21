@@ -74,6 +74,18 @@ async def on_command(payload: dict):
         await op25_client.stop()
         await asyncio.sleep(2)
         await op25_client.start()
+    elif action == "node_update":
+        # TODO: Full OTA update — register a host-level systemd service (e.g. drb-update.service)
+        # that stops all DRB containers, runs `docker compose pull`, then `docker compose up -d`.
+        # The C2 server triggers it by sending this MQTT command; the host service watches for the
+        # restart signal (e.g. via a Unix socket, a sentinel file, or a lightweight webhook).
+        # Not implemented yet — for now, just restart the container so any pre-pulled image
+        # is picked up (requires a prior `docker compose pull` on the host).
+        logger.info("Node update requested — restarting container to pick up latest image.")
+        await mqtt_manager.publish_status("offline")
+        await asyncio.sleep(1)
+        import os
+        os._exit(0)  # Docker restart=unless-stopped will bring the container back up
     else:
         logger.warning(f"Unknown command: {action}")
 
