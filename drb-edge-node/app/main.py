@@ -44,7 +44,10 @@ async def on_call_end(data: dict):
         else:
             logger.error(f"Audio upload failed for call {data['call_id']}. Verify C2_URL and Node API Key.")
     else:
-        logger.warning(f"No recording file generated for call {data['call_id']} — call may have been too short or Icecast unreachable.")
+        logger.warning(
+            f"No recording file generated for call {data['call_id']} "
+            "— call may have been too short or Icecast unreachable."
+        )
     await mqtt_manager.publish_metadata("call_end", data)
     await mqtt_manager.publish_status("online")
 

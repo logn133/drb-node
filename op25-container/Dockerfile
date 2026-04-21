@@ -1,4 +1,4 @@
-## OP25 Core Container
+# OP25 Core Container
 FROM python:slim-trixie
 
 # Set environment variables

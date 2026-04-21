@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-from typing import Optional
 from app.config import settings
 from app.models import NodeConfig, SystemConfig
 from app.internal.logger import logger

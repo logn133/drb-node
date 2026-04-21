@@ -24,14 +24,14 @@ class MQTTManager:
         self.on_api_key: Optional[ApiKeyCallback] = None
 
         nid = settings.node_id
-        self._t_checkin   = f"nodes/{nid}/checkin"
-        self._t_status    = f"nodes/{nid}/status"
-        self._t_metadata  = f"nodes/{nid}/metadata"
-        self._t_commands    = f"nodes/{nid}/commands"
-        self._t_config      = f"nodes/{nid}/config"
-        self._t_api_key     = f"nodes/{nid}/api_key"
+        self._t_checkin = f"nodes/{nid}/checkin"
+        self._t_status = f"nodes/{nid}/status"
+        self._t_metadata = f"nodes/{nid}/metadata"
+        self._t_commands = f"nodes/{nid}/commands"
+        self._t_config = f"nodes/{nid}/config"
+        self._t_api_key = f"nodes/{nid}/api_key"
         self._t_key_request = f"nodes/{nid}/key_request"
-        self._t_discovery   = "nodes/discovery/request"
+        self._t_discovery = "nodes/discovery/request"
 
     def _build_client(self) -> mqtt.Client:
         client = mqtt.Client(
@@ -49,9 +49,9 @@ class MQTTManager:
         client.will_set(self._t_status, lwt, qos=1, retain=True)
 
         client.reconnect_delay_set(min_delay=2, max_delay=60)
-        client.on_connect    = self._on_connect
+        client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
-        client.on_message    = self._on_message
+        client.on_message = self._on_message
         return client
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):

@@ -1,3 +1,4 @@
+# Icecast streaming server
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive

@@ -10,10 +10,10 @@ from app.config import settings
 from app.internal import credentials
 from app.internal.logger import logger
 
-MAX_RECORDING_SECONDS = 600   # safety cap; drop call if it runs this long
-PRE_BUFFER_SECONDS    = 1.0   # seconds of audio to include before call_start
-RING_BUFFER_SECONDS   = 60    # how much history to keep when no call is active
-READ_CHUNK_BYTES      = 4096  # bytes per httpx read
+MAX_RECORDING_SECONDS = 600  # safety cap; drop call if it runs this long
+PRE_BUFFER_SECONDS = 1.0  # seconds of audio to include before call_start
+RING_BUFFER_SECONDS = 60  # how much history to keep when no call is active
+READ_CHUNK_BYTES = 4096  # bytes per httpx read
 
 
 class CallRecorder:
@@ -119,9 +119,9 @@ class CallRecorder:
         if not self._call_id:
             return None
 
-        call_id        = self._call_id
-        call_start     = self._call_start_mono
-        self._call_id  = None
+        call_id = self._call_id
+        call_start = self._call_start_mono
+        self._call_id = None
         self._call_start_mono = None
 
         # Slice: everything from (call_start - pre_buffer) to now
@@ -180,8 +180,8 @@ class CallRecorder:
             return None
 
         upload_url = f"{settings.c2_url}/upload"
-        api_key    = credentials.get_api_key()
-        headers    = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        api_key = credentials.get_api_key()
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
         form: dict = {"call_id": call_id, "node_id": settings.node_id}
         if talkgroup_id is not None:

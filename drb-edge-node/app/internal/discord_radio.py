@@ -6,7 +6,7 @@ from app.internal.logger import logger
 
 BOT_READY_TIMEOUT = 15   # seconds to wait for Discord bot to become ready
 WATCHDOG_INTERVAL = 30   # seconds between voice-connection health checks
-REJOIN_DELAY      = 5    # seconds to wait before attempting a rejoin
+REJOIN_DELAY = 5  # seconds to wait before attempting a rejoin
 
 
 class RadioBot:
@@ -116,7 +116,8 @@ class RadioBot:
     def _on_stream_end(self, error):
         if error:
             logger.error(f"Stream ended with error: {error}")
-        if not (self._loop and self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing()):
+        vc = self._voice_client
+        if not (self._loop and vc and vc.is_connected() and not vc.is_playing()):
             return
         if error:
             # Back off before retrying — prevents tight loop when PulseAudio is unavailable
