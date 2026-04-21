@@ -1,6 +1,7 @@
 name: Build edge-node
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
     paths:

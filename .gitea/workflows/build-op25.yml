@@ -1,6 +1,7 @@
 name: Build op25
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
     paths:
