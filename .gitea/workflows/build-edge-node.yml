@@ -30,7 +30,7 @@ jobs:
         with:
           registry: git.vpn.cusano.net
           username: ${{ gitea.actor }}
-          password: ${{ secrets.GITHUB_COM_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get version
         id: meta
