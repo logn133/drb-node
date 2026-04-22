@@ -1,6 +1,6 @@
 services:
   icecast:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-}/${DOCKER_REPO:-}/icecast:latest
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/icecast:latest
     build: ./icecast
     restart: unless-stopped
     network_mode: host
@@ -9,7 +9,7 @@ services:
       ICECAST_ADMIN_PASSWORD: ${ICECAST_ADMIN_PASSWORD:-admin}
 
   op25:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-}/${DOCKER_REPO:-}/op25-client:stable
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/op25-client:stable
     build: ./op25-container
     restart: unless-stopped
     privileged: true
@@ -26,7 +26,7 @@ services:
       - icecast
 
   edge-node:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-}/${DOCKER_REPO:-}/edge-node:latest
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/edge-node:latest
     build: ./drb-edge-node
     restart: unless-stopped
     network_mode: host
