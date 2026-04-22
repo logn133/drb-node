@@ -1,13 +1,60 @@
 #!/usr/bin/env bash
 # Interactive first-time setup for a DRB edge node.
-# Writes .env and optionally builds + starts the stack.
+# Installs system dependencies (Docker, make, curl) then writes .env
+# and optionally builds + starts the stack.
 set -e
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'; NC='\033[0m'
 cd "$(dirname "$0")"
 
 echo -e "${CYAN}DRB Edge Node Setup${NC}"
 echo "-------------------"
+
+# ── Dependency installation ──────────────────────────────────────────────────
+install_deps() {
+  if ! command -v apt-get &>/dev/null; then
+    echo -e "${YELLOW}⚠  apt-get not found — skipping auto-install. Ensure docker, make, and curl are installed.${NC}"
+    return
+  fi
+
+  echo ""
+  echo -e "${CYAN}Installing system dependencies…${NC}"
+  sudo apt-get update -qq
+
+  local pkgs=()
+  command -v make &>/dev/null  || pkgs+=(make)
+  command -v curl &>/dev/null  || pkgs+=(curl)
+  command -v git  &>/dev/null  || pkgs+=(git)
+
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    echo "  Installing: ${pkgs[*]}"
+    sudo apt-get install -y -qq "${pkgs[@]}"
+  fi
+
+  # Docker — use get.docker.com if not present
+  if ! command -v docker &>/dev/null; then
+    echo "  Installing Docker via get.docker.com…"
+    curl -fsSL https://get.docker.com | sudo sh
+    # Allow current user to run docker without sudo
+    sudo usermod -aG docker "$USER"
+    echo -e "${YELLOW}  ⚠  Docker group added. You may need to log out and back in for it to take effect.${NC}"
+    echo -e "${YELLOW}     If 'docker compose' fails below, run: newgrp docker${NC}"
+  else
+    echo -e "${GREEN}  ✓ docker$(docker --version | grep -oP ' \d+\.\d+\.\d+' | head -1)${NC}"
+  fi
+
+  # Docker Compose plugin check (comes with Docker Engine ≥ 20.10)
+  if ! docker compose version &>/dev/null 2>&1; then
+    echo -e "${RED}  docker compose plugin not found. Installing…${NC}"
+    sudo apt-get install -y -qq docker-compose-plugin
+  else
+    echo -e "${GREEN}  ✓ docker compose $(docker compose version --short 2>/dev/null || true)${NC}"
+  fi
+
+  echo -e "${GREEN}✓ Dependencies ready${NC}"
+}
+
+install_deps
 
 if [ -f .env ]; then
   echo -e "${YELLOW}Warning: .env already exists.${NC}"
