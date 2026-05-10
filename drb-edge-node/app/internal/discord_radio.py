@@ -24,7 +24,7 @@ class RadioBot:
         self._channel_id: Optional[int] = None
         self._was_streaming: bool = False
 
-    async def join(self, guild_id: int, channel_id: int, token: str, call_active: bool = False) -> bool:
+    async def join(self, guild_id: int, channel_id: int, token: str, call_active: bool = False, system_name: str = None) -> bool:
         # (Re)start the bot if the token changed or the bot isn't running
         if self._current_token != token or not self._is_bot_running():
             if not await self._start_bot(token):
@@ -48,6 +48,13 @@ class RadioBot:
             self._guild_id = guild_id
             self._channel_id = channel_id
             self._play_stream()
+            if system_name:
+                await self._bot.change_presence(
+                    activity=discord.Activity(
+                        type=discord.ActivityType.listening,
+                        name=system_name,
+                    )
+                )
             logger.info(f"Joined #{channel.name} in {guild.name}")
             return True
         except Exception as e:
@@ -65,6 +72,7 @@ class RadioBot:
                 self._stop_stream()
                 await self._voice_client.disconnect(force=True)
                 self._voice_client = None
+                await self._bot.change_presence(activity=None)
                 logger.info("Disconnected from voice channel.")
                 return True
             except Exception as e:

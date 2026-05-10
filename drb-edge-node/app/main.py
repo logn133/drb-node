@@ -66,6 +66,7 @@ async def on_command(payload: dict):
             channel_id=int(payload["channel_id"]),
             token=token,
             call_active=metadata_watcher.is_active,
+            system_name=payload.get("system_name"),
         )
     elif action == "discord_leave":
         await radio_bot.leave()
