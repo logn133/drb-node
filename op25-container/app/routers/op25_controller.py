@@ -3,7 +3,7 @@ import subprocess
 import os
 import signal
 import json
-from models import ConfigGenerator, DecodeMode, ChannelConfig, DeviceConfig, TrunkingConfig, TrunkingChannelConfig, TerminalConfig, MetadataConfig, MetadataStreamConfig
+from models import ConfigGenerator, DecodeMode, ChannelConfig, DeviceConfig, TrunkingConfig, TrunkingChannelConfig, TerminalConfig, MetadataConfig, MetadataStreamConfig, HARDWARE_PRESETS
 from internal.logger import create_logger
 from internal.op25_config_utls import save_talkgroup_tags, save_whitelist, del_none_in_dict, get_current_system_from_config
 from internal.liquidsoap_config_utils import generate_liquid_script
@@ -73,16 +73,18 @@ def create_op25_router():
     async def generate_config(generator: ConfigGenerator):
         try:
             if generator.type == DecodeMode.P25:
+                preset = HARDWARE_PRESETS.get(generator.hardware_preset, HARDWARE_PRESETS["other"])
+                ppm = generator.ppm_override if generator.ppm_override is not None else preset["ppm"]
                 channels = [ChannelConfig(
                     name=generator.systemName,
                     trunking_sysname=generator.systemName,
                     enable_analog="off",
                     demod_type="cqpsk",
-                    cqpsk_tracking=True,
+                    cqpsk_tracking=preset["cqpsk_tracking"],
                     filter_type="rc",
                     meta_stream_name="stream_0"
                 )]
-                devices = [DeviceConfig()]
+                devices = [DeviceConfig(gains=preset["gains"], ppm=ppm)]
                 save_talkgroup_tags(generator.tags)
                 save_whitelist(generator.whitelist)
                 has_talkgroups = bool(generator.whitelist)

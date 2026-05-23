@@ -31,6 +31,8 @@ class NodeConfig(BaseModel):
     assigned_system_id: Optional[str] = None
     system_config: Optional[SystemConfig] = None
     configured: bool = False
+    hardware_preset: str = "rtl-sdr-v3"
+    ppm_override: Optional[float] = None
 
 
 class CallEvent(BaseModel):

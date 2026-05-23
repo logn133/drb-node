@@ -2,6 +2,29 @@ from pydantic import BaseModel
 from typing import List, Optional, Union
 from enum import Enum
 
+# Preset device settings for common RTL-SDR hardware.
+# gains: OP25 gain string passed to the device block.
+# ppm: frequency offset correction (user should calibrate and override).
+# cqpsk_tracking: disable for TCXO dongles (RTL-SDR v3, NESDR) once PPM is dialled in;
+#                 leave enabled for unknown hardware as a safety net.
+HARDWARE_PRESETS: dict = {
+    "rtl-sdr-v3": {
+        "gains": "lna:34",
+        "ppm": 0.0,
+        "cqpsk_tracking": False,
+    },
+    "nesdr-smart-v4": {
+        "gains": "lna:32",
+        "ppm": 0.0,
+        "cqpsk_tracking": False,
+    },
+    "other": {
+        "gains": "lna:32",
+        "ppm": 0.0,
+        "cqpsk_tracking": True,
+    },
+}
+
 class DecodeMode(str, Enum):
     P25 = "P25"
     DMR = "DMR"
@@ -18,6 +41,8 @@ class ConfigGenerator(BaseModel):
     tags: Optional[List[TalkgroupTag]]
     whitelist: Optional[List[int]]
     icecastConfig: Optional[IcecastConfig]
+    hardware_preset: str = "rtl-sdr-v3"
+    ppm_override: Optional[float] = None  # when set, overrides the preset's default PPM
 
 class DemodType(str, Enum):
     CQPSK = "cqpsk"

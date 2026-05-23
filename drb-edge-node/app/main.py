@@ -107,6 +107,7 @@ def _to_hz(freq) -> int:
 async def _generate_op25_config(config: SystemConfig) -> bool:
     """Translate a SystemConfig (Firestore format) into OP25 active.cfg.json + op25.liq."""
     from app.internal.op25_client import op25_client
+    node_cfg = load_node_config()
     raw = config.config
     payload = {
         "type": config.type,
@@ -124,12 +125,16 @@ async def _generate_op25_config(config: SystemConfig) -> bool:
             "icecast_mountpoint": settings.icecast_mount,
             "icecast_password": settings.icecast_source_password,
         },
+        "hardware_preset": node_cfg.hardware_preset,
+        **({"ppm_override": node_cfg.ppm_override} if node_cfg.ppm_override is not None else {}),
     }
     return await op25_client.generate_config(payload)
 
 
 async def on_config_push(payload: dict):
     """C2 pushes a system config — translate it to OP25 format and restart OP25."""
+    hardware_preset = payload.pop("hardware_preset", None)
+    ppm_override = payload.pop("ppm_override", None)
     try:
         config = SystemConfig(**payload)
     except Exception as e:
@@ -140,6 +145,10 @@ async def on_config_push(payload: dict):
     node_cfg.assigned_system_id = config.system_id
     node_cfg.system_config = config
     node_cfg.configured = True
+    if hardware_preset is not None:
+        node_cfg.hardware_preset = hardware_preset
+    if ppm_override is not None:
+        node_cfg.ppm_override = float(ppm_override)
     save_node_config(node_cfg)
 
     from app.internal.op25_client import op25_client
