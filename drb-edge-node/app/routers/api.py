@@ -14,6 +14,21 @@ router = APIRouter(prefix="/api", tags=["api"])
 async def get_status():
     node_cfg = load_node_config()
     op25_status = await op25_client.status()
+    
+    active_tgid = metadata_watcher.current_tgid
+    active_tgid_name = metadata_watcher.current_tgid_name
+    system_name = None
+    
+    if node_cfg.system_config:
+        system_name = node_cfg.system_config.name
+        if active_tgid:
+            # Reverse engineer the TGID to talkgroup name based on system object
+            tgs = node_cfg.system_config.config.get("talkgroups", [])
+            for tg in tgs:
+                if str(tg.get("id")) == str(active_tgid):
+                    active_tgid_name = tg.get("name")
+                    break
+
     return {
         "node_id": settings.node_id,
         "node_name": settings.node_name,
@@ -21,8 +36,10 @@ async def get_status():
         "lon": settings.node_lon,
         "configured": node_cfg.configured,
         "assigned_system_id": node_cfg.assigned_system_id,
+        "system_name": system_name,
         "is_recording": call_recorder.is_recording,
-        "active_tgid": metadata_watcher.current_tgid,
+        "active_tgid": active_tgid,
+        "active_tgid_name": active_tgid_name,
         "active_call_id": metadata_watcher.active_call_id,
         "discord_connected": radio_bot.is_connected,
         "icecast_url": (

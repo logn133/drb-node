@@ -124,6 +124,10 @@ class MetadataWatcher:
         return self._current_tgid
 
     @property
+    def current_tgid_name(self) -> Optional[str]:
+        return self._current_tgid_name
+
+    @property
     def is_active(self) -> bool:
         return self._active_call_id is not None
 

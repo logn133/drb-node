@@ -3,186 +3,419 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DRB Edge Node</title>
+  <title>DRB Edge Node Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0b0f19;
+      --glass-bg: rgba(20, 25, 40, 0.6);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
 
     body {
-      font-family: ui-monospace, "Cascadia Code", "Source Code Pro", monospace;
-      background: #0f1117;
-      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      background-image: 
+        radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.15), transparent 25%),
+        radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.15), transparent 25%);
+      color: var(--text-main);
       min-height: 100vh;
       padding: 2rem;
+      line-height: 1.5;
     }
 
-    h1 { font-size: 1.25rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.25rem; }
-    .subtitle { font-size: 0.8rem; color: #64748b; margin-bottom: 2rem; }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
 
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 3rem;
+    }
 
-    .card {
-      background: #1e2130;
-      border: 1px solid #2d3250;
+    .title-area h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      background: linear-gradient(to right, #fff, #94a3b8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.02em;
+    }
+
+    .title-area p {
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      margin-top: 0.5rem;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 1rem;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.75rem 1.5rem;
       border-radius: 8px;
-      padding: 1.25rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      border: none;
     }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 4px 14px 0 rgba(59, 130, 246, 0.39);
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 6px 20px rgba(59, 130, 246, 0.23);
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.05);
+      color: white;
+      border: 1px solid var(--glass-border);
+      backdrop-filter: blur(10px);
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .glass-card {
+      background: var(--glass-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .glass-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+      border-color: rgba(255,255,255,0.15);
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      margin-bottom: 1.5rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+
     .card-title {
-      font-size: 0.7rem;
+      font-size: 0.85rem;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: #64748b;
-      margin-bottom: 0.75rem;
+      letter-spacing: 0.1em;
+      font-weight: 700;
+      color: var(--text-muted);
+    }
+
+    .data-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.75rem 0;
+    }
+
+    .data-label {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    .data-value {
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--text-main);
+      text-align: right;
+    }
+
+    .data-value.mono {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
     }
 
     .badge {
-      display: inline-block;
-      padding: 0.2rem 0.6rem;
-      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0.25rem 0.75rem;
+      border-radius: 9999px;
       font-size: 0.75rem;
-      font-weight: 600;
+      font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
-    .badge-online    { background: #14532d; color: #4ade80; }
-    .badge-offline   { background: #450a0a; color: #f87171; }
-    .badge-recording { background: #431407; color: #fb923c; animation: pulse 1.5s infinite; }
-    .badge-unconfigured { background: #1e1b4b; color: #818cf8; }
 
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
-
-    .row { display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid #2d3250; }
-    .row:last-child { border-bottom: none; }
-    .row .label { font-size: 0.78rem; color: #94a3b8; }
-    .row .value { font-size: 0.78rem; color: #e2e8f0; text-align: right; max-width: 60%; word-break: break-all; }
-
-    .listen-btn {
-      display: block;
-      width: 100%;
-      margin-top: 0.75rem;
-      padding: 0.6rem;
-      background: #2563eb;
-      color: #fff;
-      border: none;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      font-family: inherit;
-      cursor: pointer;
-      text-align: center;
-      text-decoration: none;
+    .badge-online { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.2); }
+    .badge-offline { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.2); }
+    .badge-recording { 
+      background: rgba(245, 158, 11, 0.15); 
+      color: var(--warning); 
+      border: 1px solid rgba(245, 158, 11, 0.2);
+      animation: pulse-border 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
     }
-    .listen-btn:hover { background: #1d4ed8; }
+    .badge-unconfigured { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.2); }
 
-    .config-section { margin-top: 1.5rem; }
-    .config-section h2 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 1rem; }
+    @keyframes pulse-border {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* Player Section */
+    .player-card {
+      grid-column: 1 / -1;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    
+    .player-controls {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      background: rgba(0,0,0,0.2);
+      padding: 1rem;
+      border-radius: 12px;
+    }
+    
+    audio {
+      flex: 1;
+      height: 40px;
+      outline: none;
+    }
+
+    audio::-webkit-media-controls-panel {
+      background-color: var(--text-main);
+    }
 
     .alert {
-      background: #1e1b4b;
-      border: 1px solid #4338ca;
-      border-radius: 6px;
-      padding: 0.75rem 1rem;
-      font-size: 0.8rem;
-      color: #818cf8;
-      margin-bottom: 1rem;
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      padding: 1rem 1.5rem;
+      color: #bfdbfe;
+      margin-bottom: 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .alert code {
+      background: rgba(0,0,0,0.3);
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
     }
 
-    .updated { font-size: 0.7rem; color: #475569; margin-top: 2rem; }
+    .footer {
+      margin-top: 3rem;
+      text-align: center;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Active Call Highlights */
+    .active-call-highlight {
+      color: var(--accent);
+      font-size: 1.1rem;
+      font-weight: 700;
+    }
   </style>
 </head>
 <body>
-  <h1 id="node-name">DRB Edge Node</h1>
-  <p class="subtitle" id="node-id">Loading…</p>
+  <div class="container">
+    <header>
+      <div class="title-area">
+        <h1 id="node-name">DRB Edge Node</h1>
+        <p>ID: <span id="node-id">Loading…</span></p>
+      </div>
+      <div class="header-actions">
+        <a href="/scanner" target="_blank" class="btn btn-secondary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+          Scanner Mode
+        </a>
+      </div>
+    </header>
 
-  <div class="grid">
-    <div class="card">
-      <div class="card-title">Status</div>
-      <div class="row">
-        <span class="label">State</span>
-        <span class="value"><span id="status-badge" class="badge">—</span></span>
-      </div>
-      <div class="row">
-        <span class="label">MQTT</span>
-        <span class="value" id="mqtt-status">—</span>
-      </div>
-      <div class="row">
-        <span class="label">Discord</span>
-        <span class="value" id="discord-status">—</span>
-      </div>
-      <div class="row">
-        <span class="label">Recording</span>
-        <span class="value" id="recording-status">—</span>
+    <div id="unconfigured-banner" class="alert" style="display:none">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+      <div>
+        <strong>Node Unconfigured</strong> — This node has not been assigned a system yet. Connect it to a C2 server or configure it manually via the API (<code>POST /api/config/system</code>).
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-title">Current Call</div>
-      <div class="row">
-        <span class="label">Talkgroup</span>
-        <span class="value" id="tgid">—</span>
+    <div class="grid">
+      <!-- Status Card -->
+      <div class="glass-card">
+        <div class="card-header">
+          <div class="card-title">System Status</div>
+        </div>
+        <div class="data-row">
+          <span class="data-label">State</span>
+          <span class="data-value"><span id="status-badge" class="badge badge-unconfigured">—</span></span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">Discord</span>
+          <span class="data-value" id="discord-status">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">Recording</span>
+          <span class="data-value" id="recording-status">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">OP25 Core</span>
+          <span class="data-value" id="op25-status">—</span>
+        </div>
       </div>
-      <div class="row">
-        <span class="label">Call ID</span>
-        <span class="value" id="call-id">—</span>
+
+      <!-- Call Card -->
+      <div class="glass-card" id="call-card">
+        <div class="card-header">
+          <div class="card-title">Live Activity</div>
+        </div>
+        <div class="data-row">
+          <span class="data-label">System</span>
+          <span class="data-value active-call-highlight" id="system-name">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">Talkgroup</span>
+          <span class="data-value active-call-highlight" id="tgid-name">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">TGID</span>
+          <span class="data-value mono" id="tgid">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">Call ID</span>
+          <span class="data-value mono" id="call-id">—</span>
+        </div>
       </div>
-      <div class="row">
-        <span class="label">System</span>
-        <span class="value" id="system-id">—</span>
+
+      <!-- Node Info Card -->
+      <div class="glass-card">
+        <div class="card-header">
+          <div class="card-title">Hardware & Config</div>
+        </div>
+        <div class="data-row">
+          <span class="data-label">Location</span>
+          <span class="data-value mono" id="location">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">Configured</span>
+          <span class="data-value" id="configured">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-label">System ID</span>
+          <span class="data-value mono" id="system-id">—</span>
+        </div>
       </div>
-      <div class="row">
-        <span class="label">OP25</span>
-        <span class="value" id="op25-status">—</span>
+
+      <!-- Local Listening Card -->
+      <div class="glass-card player-card">
+        <div class="card-header" style="margin-bottom:0.5rem; border:none;">
+          <div class="card-title">Local Audio Stream</div>
+        </div>
+        <div class="player-controls">
+          <audio id="icecast-player" controls preload="none">
+            Your browser does not support the audio element.
+          </audio>
+          <a id="icecast-link" class="btn btn-primary" href="#" target="_blank" style="padding: 0.5rem 1rem;">Direct Link</a>
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-title">Node Info</div>
-      <div class="row">
-        <span class="label">Lat / Lon</span>
-        <span class="value" id="location">—</span>
-      </div>
-      <div class="row">
-        <span class="label">Configured</span>
-        <span class="value" id="configured">—</span>
-      </div>
-      <a id="icecast-link" class="listen-btn" href="#" target="_blank">Listen via Icecast</a>
+    <div class="footer">
+      Last updated: <span id="last-updated">—</span>
     </div>
   </div>
-
-  <div id="unconfigured-banner" class="config-section" style="display:none">
-    <div class="alert">
-      This node has not been assigned a system yet. Connect it to a C2 server or configure it manually via the API (<code>POST /api/config/system</code>).
-    </div>
-  </div>
-
-  <p class="updated">Last updated: <span id="last-updated">—</span></p>
 
   <script>
+    const player = document.getElementById('icecast-player');
+    let currentIcecastUrl = null;
+
     async function refresh() {
       try {
         const r = await fetch('/api/status');
         if (!r.ok) return;
         const d = await r.json();
 
+        // Header
         document.getElementById('node-name').textContent = d.node_name || 'DRB Edge Node';
         document.getElementById('node-id').textContent = d.node_id || '';
 
+        // Status
         const status = d.is_recording ? 'recording' : (d.configured ? 'online' : 'unconfigured');
         const badge = document.getElementById('status-badge');
         badge.textContent = status;
         badge.className = 'badge badge-' + status;
 
-        document.getElementById('discord-status').textContent = d.discord_connected ? 'Connected' : 'Not connected';
-        document.getElementById('recording-status').textContent = d.is_recording ? 'Yes' : 'No';
+        document.getElementById('discord-status').textContent = d.discord_connected ? 'Connected' : 'Disconnected';
+        document.getElementById('recording-status').textContent = d.is_recording ? 'Active' : 'Idle';
+        document.getElementById('op25-status').textContent = d.op25?.status === 'running' ? 'Running' : 'Stopped';
+
+        // Call Info
+        document.getElementById('system-name').textContent = d.system_name || '—';
+        document.getElementById('tgid-name').textContent = d.active_tgid_name || (d.active_tgid ? `TG ${d.active_tgid}` : 'Scanning...');
         document.getElementById('tgid').textContent = d.active_tgid ?? '—';
         document.getElementById('call-id').textContent = d.active_call_id ? d.active_call_id.slice(0, 8) + '…' : '—';
-        document.getElementById('system-id').textContent = d.assigned_system_id ?? '—';
-        document.getElementById('op25-status').textContent = d.op25?.status === 'running' ? 'Running' : 'Stopped';
+        
+        // Highlight active call card
+        const callCard = document.getElementById('call-card');
+        if (d.is_recording) {
+          callCard.style.borderColor = 'var(--accent)';
+          callCard.style.boxShadow = '0 0 20px rgba(59, 130, 246, 0.2)';
+        } else {
+          callCard.style.borderColor = 'var(--glass-border)';
+          callCard.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1)';
+        }
+
+        // Node Info
         document.getElementById('location').textContent = `${d.lat}, ${d.lon}`;
         document.getElementById('configured').textContent = d.configured ? 'Yes' : 'No';
+        document.getElementById('system-id').textContent = d.assigned_system_id ?? '—';
 
-        const icecastLink = document.getElementById('icecast-link');
-        icecastLink.href = d.icecast_url || '#';
+        // Audio Player
+        if (d.icecast_url && d.icecast_url !== currentIcecastUrl) {
+          currentIcecastUrl = d.icecast_url;
+          player.src = currentIcecastUrl;
+          document.getElementById('icecast-link').href = currentIcecastUrl;
+        }
 
-        document.getElementById('unconfigured-banner').style.display = d.configured ? 'none' : 'block';
+        document.getElementById('unconfigured-banner').style.display = d.configured ? 'none' : 'flex';
         document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
       } catch (e) {
         console.error('Status fetch failed:', e);
@@ -190,7 +423,7 @@
     }
 
     refresh();
-    setInterval(refresh, 3000);
+    setInterval(refresh, 2000); // Polling every 2 seconds
   </script>
 </body>
 </html>
