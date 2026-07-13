@@ -36,7 +36,24 @@ To make the node operate like a real scanner, the UI listens for standard keyboa
 | **Volume Down** | `ArrowDown` | Decreases volume by 10%. |
 | **Toggle Hold** | `Enter` or `H` | Toggles the Hold state (Currently a UI mock, backend support planned). |
 | **Play/Pause** | `P` | Pauses or resumes the audio stream. Useful for temporarily silencing the unit. |
+| **Select System**| `S` | Opens the "Select Radio System" modal to switch systems locally. Arrow keys navigate, Enter selects, Escape cancels. |
+| **Revert Override**| `R` | Reverts the node's override and reload the default system configuration assigned by the C2 server. |
 | **Legend Modal** | Mouse Click | Clicking the "KEY LEGEND" button opens an on-screen modal reminding users of these mappings. |
+
+---
+
+## 3. Local System Overrides
+
+The edge node supports running local system overrides to tune into a system locally.
+
+### Fixed vs. Portable Nodes
+Admin configurations pushed from the C2 server dictate how overrides behave:
+- **Portable Nodes**: Handheld units designed to operate in the field. When a portable node changes its system locally, the C2 server simply stores the active system and **never** enforces timeouts or auto-reverts the config.
+- **Fixed Nodes**: Standard base-station setups. By default, changing the system locally triggers a **24-hour timeout** on the C2 server. If an admin does not acknowledge/extend this timer, the C2 server will automatically push the original assigned configuration back to the node, force-reverting it. You can disable this timeout globally for a fixed node by toggling off "Enforce Timeout" in the C2 Node Settings.
+
+### Offline & Manual Entry
+- When the node boots online, it caches all available systems in `/configs/systems_cache.json`. When offline, pressing `S` displays this cached list to select from.
+- In the `S` selection modal, operators can also use the **Manual Entry** inputs to tune to any frequency/type dynamically on the fly, creating a temporary override config even if no matching system was pre-cached.
 
 ---
 

@@ -135,6 +135,8 @@ async def on_config_push(payload: dict):
     """C2 pushes a system config — translate it to OP25 format and restart OP25."""
     hardware_preset = payload.pop("hardware_preset", None)
     ppm_override = payload.pop("ppm_override", None)
+    node_type = payload.pop("node_type", None)
+    enforce_override_timeout = payload.pop("enforce_override_timeout", None)
     try:
         config = SystemConfig(**payload)
     except Exception as e:
@@ -145,10 +147,16 @@ async def on_config_push(payload: dict):
     node_cfg.assigned_system_id = config.system_id
     node_cfg.system_config = config
     node_cfg.configured = True
+    node_cfg.override_system_id = None
+    node_cfg.override_config = None
     if hardware_preset is not None:
         node_cfg.hardware_preset = hardware_preset
     if ppm_override is not None:
         node_cfg.ppm_override = float(ppm_override)
+    if node_type is not None:
+        node_cfg.node_type = node_type
+    if enforce_override_timeout is not None:
+        node_cfg.enforce_override_timeout = bool(enforce_override_timeout)
     save_node_config(node_cfg)
 
     from app.internal.op25_client import op25_client
@@ -185,16 +193,21 @@ async def lifespan(app: FastAPI):
     await metadata_watcher.start()
     await call_recorder.start()  # persistent Icecast stream buffer
 
+    # Start system caching in background
+    from app.internal.system_cacher import fetch_and_cache_systems
+    asyncio.create_task(fetch_and_cache_systems())
+
     # Report initial status and resume OP25 if node was already configured before this restart
     node_cfg = load_node_config()
     initial_status = "online" if node_cfg.configured else "unconfigured"
     await mqtt_manager.publish_status(initial_status)
 
-    if node_cfg.configured and node_cfg.system_config:
+    active_config = node_cfg.override_config if (node_cfg.override_system_id and node_cfg.override_config) else node_cfg.system_config
+    if node_cfg.configured and active_config:
         from app.internal.op25_client import op25_client
         logger.info("Node is configured — waiting for OP25 API then generating config.")
         for attempt in range(10):
-            if await _generate_op25_config(node_cfg.system_config):
+            if await _generate_op25_config(active_config):
                 await op25_client.start()
                 break
             logger.warning(f"OP25 not ready yet (attempt {attempt + 1}/10), retrying in 3s…")

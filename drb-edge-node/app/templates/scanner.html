@@ -155,8 +155,38 @@
       <li><span>Down Arrow</span> Volume Down</li>
       <li><span>Enter / H</span> Toggle Hold (UI mock)</li>
       <li><span>P</span> Play/Pause Stream</li>
+      <li><span>S</span> Select System</li>
+      <li><span>R</span> Revert Override</li>
     </ul>
     <button class="close-legend" onclick="document.getElementById('legend-modal').style.display='none'">CLOSE</button>
+  </div>
+
+  <div class="legend-modal" id="system-modal">
+    <h2>Select Radio System</h2>
+    <div id="system-list" style="max-height: 180px; overflow-y: auto; margin-bottom: 12px; border: 1px solid #333; padding: 5px; text-align: left;">
+      <!-- Systems list items loaded dynamically -->
+    </div>
+    
+    <div style="border-top: 1px solid #333; padding-top: 8px; margin-bottom: 10px; text-align: left;">
+      <h3 style="color: var(--dept-color); margin-bottom: 6px; font-size: 13px;">Or Enter Freq Manually:</h3>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px; font-size: 11px; margin-bottom: 8px;">
+        <div>
+          <label>Control Freq (MHz/Hz):</label>
+          <input type="text" id="manual-freq" style="background:#222; color:#fff; border:1px solid #555; padding:3px; width:100%; border-radius:2px;">
+        </div>
+        <div>
+          <label>System Type:</label>
+          <select id="manual-type" style="background:#222; color:#fff; border:1px solid #555; padding:3px; width:100%; border-radius:2px;">
+            <option value="P25">P25</option>
+            <option value="DMR">DMR</option>
+            <option value="NBFM">NBFM</option>
+          </select>
+        </div>
+      </div>
+      <button class="legend-btn" style="width:100%; padding:6px; font-weight:bold;" onclick="submitManualSystem()">Submit Manual Entry</button>
+    </div>
+
+    <button class="close-legend" onclick="closeSystemModal()" style="background:#333;">CANCEL</button>
   </div>
 
   <div class="main-display" id="main-display">
@@ -177,9 +207,9 @@
   </div>
 
   <div class="softkeys">
-    <div class="softkey">System</div>
-    <div class="softkey">Dept</div>
-    <div class="softkey">Chan</div>
+    <div class="softkey">VOL (+/-)</div>
+    <div class="softkey">HOLD (H)</div>
+    <div class="softkey">PLAY (P)</div>
   </div>
 
   <div class="overlay" id="overlay">HOLD</div>
@@ -257,8 +287,152 @@
       setTimeout(() => { elOverlay.style.display = 'none'; }, timeout);
     }
 
+    let systems = [];
+    let selectedSystemIndex = 0;
+    let isSystemModalOpen = false;
+
+    async function openSystemModal() {
+      try {
+        const res = await fetch('/api/systems');
+        if (!res.ok) return;
+        systems = await res.json();
+        isSystemModalOpen = true;
+        selectedSystemIndex = 0;
+        renderSystemList();
+        document.getElementById('system-modal').style.display = 'block';
+      } catch (err) {
+        console.error('Failed to load systems', err);
+      }
+    }
+
+    function renderSystemList() {
+      const container = document.getElementById('system-list');
+      container.innerHTML = '';
+      if (systems.length === 0) {
+        container.innerHTML = '<div style="padding: 10px; color: #888;">No cached systems found.</div>';
+        return;
+      }
+      systems.forEach((sys, index) => {
+        const item = document.createElement('div');
+        item.style.padding = '8px 12px';
+        item.style.margin = '4px 0';
+        item.style.border = '1px solid #444';
+        item.style.cursor = 'pointer';
+        item.style.borderRadius = '4px';
+        
+        if (index === selectedSystemIndex) {
+          item.style.background = 'var(--active-bg)';
+          item.style.borderColor = 'var(--sys-color)';
+          item.style.color = '#fff';
+          item.style.fontWeight = 'bold';
+        } else {
+          item.style.background = '#151515';
+          item.style.color = '#ccc';
+        }
+        item.textContent = `${sys.name} (${sys.type})`;
+        item.onclick = () => {
+          selectedSystemIndex = index;
+          selectActiveSystem();
+        };
+        container.appendChild(item);
+      });
+    }
+
+    function closeSystemModal() {
+      isSystemModalOpen = false;
+      document.getElementById('system-modal').style.display = 'none';
+    }
+
+    async function selectActiveSystem() {
+      const selected = systems[selectedSystemIndex];
+      if (!selected) return;
+      closeSystemModal();
+      showOverlay(`APPLYING: ${selected.name.toUpperCase()}`, 3000);
+      try {
+        const res = await fetch('/api/config/override', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ system_id: selected.system_id })
+        });
+        if (res.ok) {
+          showOverlay('SYSTEM OVERRIDDEN', 1500);
+        } else {
+          showOverlay('OVERRIDE FAILED', 2000);
+        }
+      } catch (err) {
+        showOverlay('ERROR APPLYING', 2000);
+      }
+    }
+
+    async function submitManualSystem() {
+      const freqVal = document.getElementById('manual-freq').value.trim();
+      const typeVal = document.getElementById('manual-type').value;
+      if (!freqVal) {
+        alert("Please enter a frequency.");
+        return;
+      }
+      closeSystemModal();
+      showOverlay("APPLYING MANUAL", 3000);
+      const manualConfig = {
+        system_id: "manual-override",
+        name: `Freq ${freqVal} (${typeVal})`,
+        type: typeVal,
+        config: {
+          control_channels: [freqVal],
+          talkgroups: []
+        }
+      };
+      try {
+        const res = await fetch('/api/config/override', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ system_config: manualConfig })
+        });
+        if (res.ok) {
+          showOverlay('MANUAL OVERRIDE OK', 1500);
+        } else {
+          showOverlay('MANUAL OVERRIDE FAIL', 2000);
+        }
+      } catch (err) {
+        showOverlay('ERROR APPLYING', 2000);
+      }
+    }
+
+    async function revertConfig() {
+      showOverlay("REVERTING TO SERVER", 2000);
+      try {
+        const res = await fetch('/api/config/revert', { method: 'POST' });
+        if (res.ok) {
+          showOverlay('SERVER CONFIG LOADED', 1500);
+        } else {
+          showOverlay('REVERT FAILED', 2000);
+        }
+      } catch (err) {
+        showOverlay('REVERT ERROR', 2000);
+      }
+    }
+
     // Keyboard bindings for hardware buttons
     window.addEventListener('keydown', (e) => {
+      if (isSystemModalOpen) {
+        if (e.key === 'ArrowUp') {
+          selectedSystemIndex = (selectedSystemIndex - 1 + systems.length) % systems.length;
+          renderSystemList();
+          e.preventDefault();
+        } else if (e.key === 'ArrowDown') {
+          selectedSystemIndex = (selectedSystemIndex + 1) % systems.length;
+          renderSystemList();
+          e.preventDefault();
+        } else if (e.key === 'Enter') {
+          selectActiveSystem();
+          e.preventDefault();
+        } else if (e.key === 'Escape') {
+          closeSystemModal();
+          e.preventDefault();
+        }
+        return;
+      }
+
       // Simulate hardware interactions
       if (e.key === 'ArrowUp') {
         volume = Math.min(1.0, volume + 0.1);
@@ -271,11 +445,9 @@
         elVol.textContent = `VOL: ${Math.round(volume * 100)}%`;
         showOverlay(`VOL: ${Math.round(volume * 100)}%`);
       } else if (e.key === 'Enter' || e.key === 'h' || e.key === 'H') {
-        // Toggle Hold (not fully implemented in backend yet, just UI mock)
         isHolding = !isHolding;
         showOverlay(isHolding ? 'HOLD ON' : 'HOLD OFF');
       } else if (e.key === 'p' || e.key === 'P') {
-          // Play/Pause audio
           if (audioPlayer.paused) {
               audioPlayer.play();
               showOverlay('PLAY');
@@ -283,6 +455,10 @@
               audioPlayer.pause();
               showOverlay('PAUSED');
           }
+      } else if (e.key === 's' || e.key === 'S') {
+          openSystemModal();
+      } else if (e.key === 'r' || e.key === 'R') {
+          revertConfig();
       }
     });
 

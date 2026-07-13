@@ -1,4 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Body
+from typing import Optional
+import asyncio
+import httpx
 from app.config import settings
 from app.models import SystemConfig
 from app.internal.op25_client import op25_client
@@ -6,6 +9,8 @@ from app.internal.config_manager import load_node_config, save_node_config, appl
 from app.internal.call_recorder import call_recorder
 from app.internal.discord_radio import radio_bot
 from app.internal.metadata_watcher import metadata_watcher
+from app.internal import credentials
+from app.internal.mqtt_manager import mqtt_manager
 
 router = APIRouter(prefix="/api", tags=["api"])
 
@@ -19,11 +24,12 @@ async def get_status():
     active_tgid_name = metadata_watcher.current_tgid_name
     system_name = None
     
-    if node_cfg.system_config:
-        system_name = node_cfg.system_config.name
+    active_config = node_cfg.override_config if (node_cfg.override_system_id and node_cfg.override_config) else node_cfg.system_config
+    if active_config:
+        system_name = active_config.name
         if active_tgid:
-            # Reverse engineer the TGID to talkgroup name based on system object
-            tgs = node_cfg.system_config.config.get("talkgroups", [])
+            # Reverse engineer the TGID to talkgroup name based on active system object
+            tgs = active_config.config.get("talkgroups", [])
             for tg in tgs:
                 if str(tg.get("id")) == str(active_tgid):
                     active_tgid_name = tg.get("name")
@@ -34,6 +40,10 @@ async def get_status():
         "node_name": settings.node_name,
         "lat": settings.node_lat,
         "lon": settings.node_lon,
+        "node_type": node_cfg.node_type,
+        "enforce_override_timeout": node_cfg.enforce_override_timeout,
+        "is_overridden": node_cfg.override_system_id is not None and node_cfg.node_type != "portable",
+        "override_system_id": node_cfg.override_system_id,
         "configured": node_cfg.configured,
         "assigned_system_id": node_cfg.assigned_system_id,
         "system_name": system_name,
@@ -83,6 +93,94 @@ async def set_system_config(config: SystemConfig):
     save_node_config(node_cfg)
     apply_system_config(config)
     return {"ok": True}
+
+
+@router.get("/systems")
+async def get_systems():
+    from app.internal.system_cacher import load_cached_systems, fetch_and_cache_systems
+    asyncio.create_task(fetch_and_cache_systems())
+    return load_cached_systems()
+
+
+@router.post("/config/override")
+async def set_override(
+    system_id: Optional[str] = Body(None),
+    system_config: Optional[dict] = Body(None)
+):
+    node_cfg = load_node_config()
+    config = None
+    
+    if system_id:
+        from app.internal.system_cacher import get_cached_system
+        cached = get_cached_system(system_id)
+        if not cached:
+            raise HTTPException(404, f"System '{system_id}' not found in cache.")
+        config = SystemConfig(**cached)
+    elif system_config:
+        if not all(k in system_config for k in ("system_id", "name", "type", "config")):
+            raise HTTPException(400, "Invalid manual system config schema.")
+        config = SystemConfig(**system_config)
+    else:
+        raise HTTPException(400, "Must specify system_id or system_config.")
+        
+    node_cfg.override_system_id = config.system_id
+    node_cfg.override_config = config
+    save_node_config(node_cfg)
+    
+    from app.main import _generate_op25_config
+    if not await _generate_op25_config(config):
+        raise HTTPException(500, f"Failed to generate OP25 config for override: {config.name}")
+        
+    await op25_client.stop()
+    await asyncio.sleep(2)
+    await op25_client.start()
+    
+    await mqtt_manager._publish_checkin()
+    return {"ok": True}
+
+
+@router.post("/config/revert")
+async def revert_config():
+    node_cfg = load_node_config()
+    if not node_cfg.override_system_id:
+        return {"ok": True, "message": "No override active."}
+        
+    node_cfg.override_system_id = None
+    node_cfg.override_config = None
+    save_node_config(node_cfg)
+    
+    if node_cfg.system_config:
+        from app.main import _generate_op25_config
+        if not await _generate_op25_config(node_cfg.system_config):
+            raise HTTPException(500, "Failed to regenerate original OP25 config.")
+            
+        await op25_client.stop()
+        await asyncio.sleep(2)
+        await op25_client.start()
+        
+    await mqtt_manager._publish_checkin()
+    return {"ok": True}
+
+
+@router.post("/config/override/ack")
+async def ack_override(timeout_minutes: int = Body(1440)):
+    if not settings.c2_url:
+        raise HTTPException(400, "C2_URL not configured.")
+        
+    api_key = credentials.get_api_key()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{settings.c2_url}/nodes/{settings.node_id}/override/ack",
+                json={"timeout_minutes": timeout_minutes},
+                headers=headers
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to contact C2: {e}")
 
 
 @router.post("/discord/join")

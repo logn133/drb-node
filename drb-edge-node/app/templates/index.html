@@ -278,6 +278,18 @@
       </div>
     </div>
 
+    <div id="override-banner" class="alert" style="display:none; background: rgba(245, 158, 11, 0.1); border-color: var(--warning); color: #fef08a;">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+      <div style="flex: 1;">
+        <strong>Local Override Active</strong> — System overridden to: <span id="override-system-text"></span>.
+        <span id="timeout-timer-text">Timeout is active on C2 server.</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <button class="btn btn-secondary" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;" onclick="revertToServerConfig()">Revert</button>
+        <button id="ack-override-btn" class="btn btn-primary" style="padding: 0.4rem 0.8rem; font-size: 0.8rem; background: var(--warning); box-shadow: none;" onclick="ackOverrideC2()">Ack C2 Timer</button>
+      </div>
+    </div>
+
     <div class="grid">
       <!-- Status Card -->
       <div class="glass-card">
@@ -418,10 +430,61 @@
           }
         }
 
+        // Override Banner
+        const overrideBanner = document.getElementById('override-banner');
+        if (d.is_overridden) {
+          overrideBanner.style.display = 'flex';
+          document.getElementById('override-system-text').textContent = d.system_name || 'Manual';
+          
+          const ackBtn = document.getElementById('ack-override-btn');
+          const timerText = document.getElementById('timeout-timer-text');
+          
+          if (d.enforce_override_timeout) {
+            timerText.textContent = "C2 reset timer active (24h default).";
+            ackBtn.style.display = 'inline-flex';
+          } else {
+            timerText.textContent = "No C2 timeout is enforced.";
+            ackBtn.style.display = 'none';
+          }
+        } else {
+          overrideBanner.style.display = 'none';
+        }
+
         document.getElementById('unconfigured-banner').style.display = d.configured ? 'none' : 'flex';
         document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
       } catch (e) {
         console.error('Status fetch failed:', e);
+      }
+    }
+
+    async function revertToServerConfig() {
+      try {
+        const r = await fetch('/api/config/revert', { method: 'POST' });
+        if (r.ok) {
+          alert('Config reverted successfully.');
+          refresh();
+        } else {
+          alert('Failed to revert config.');
+        }
+      } catch (e) {
+        console.error('Revert failed:', e);
+      }
+    }
+
+    async function ackOverrideC2() {
+      try {
+        const r = await fetch('/api/config/override/ack', { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timeout_minutes: 1440 })
+        });
+        if (r.ok) {
+          alert('Override acknowledged on C2.');
+        } else {
+          alert('Failed to send acknowledgement.');
+        }
+      } catch (e) {
+        console.error('Ack failed:', e);
       }
     }
 

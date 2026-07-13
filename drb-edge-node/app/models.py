@@ -33,6 +33,10 @@ class NodeConfig(BaseModel):
     configured: bool = False
     hardware_preset: str = "rtl-sdr-v3"
     ppm_override: Optional[float] = None
+    node_type: str = "fixed"  # fixed or portable
+    enforce_override_timeout: bool = True
+    override_system_id: Optional[str] = None
+    override_config: Optional[SystemConfig] = None
 
 
 class CallEvent(BaseModel):

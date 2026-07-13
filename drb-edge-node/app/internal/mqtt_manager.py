@@ -142,6 +142,8 @@ class MQTTManager:
 
     async def _publish_checkin(self):
         from app.internal.discord_radio import radio_bot
+        from app.internal.config_manager import load_node_config
+        config = load_node_config()
         payload = {
             "node_id": settings.node_id,
             "name": settings.node_name,
@@ -149,6 +151,10 @@ class MQTTManager:
             "lon": settings.node_lon,
             "discord_connected": radio_bot.is_connected,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "node_type": config.node_type,
+            "is_overridden": config.override_system_id is not None and config.node_type != "portable",
+            "override_system_id": config.override_system_id,
+            "enforce_override_timeout": config.enforce_override_timeout,
         }
         self._publish(self._t_checkin, payload, qos=1)
 
