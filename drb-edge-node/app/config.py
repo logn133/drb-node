@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     config_path: str = "/configs"
     recordings_path: str = "/recordings"
 
+    # Offline call buffer — how many call_end events to keep while disconnected
+    offline_call_buffer_size: int = 35
+
     class Config:
         env_file = ".env"
 

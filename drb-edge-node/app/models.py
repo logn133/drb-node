@@ -37,6 +37,7 @@ class NodeConfig(BaseModel):
     enforce_override_timeout: bool = True
     override_system_id: Optional[str] = None
     override_config: Optional[SystemConfig] = None
+    offline_call_buffer_size: int = 35  # max call_end events to buffer while MQTT is offline
 
 
 class CallEvent(BaseModel):

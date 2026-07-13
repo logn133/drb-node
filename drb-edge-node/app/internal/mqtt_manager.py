@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timezone
+from collections import deque
 from typing import Optional, Callable, Awaitable, Dict, Any
 import paho.mqtt.client as mqtt
 from app.config import settings
@@ -22,6 +23,8 @@ class MQTTManager:
         self.on_command: Optional[CommandCallback] = None
         self.on_config_push: Optional[ConfigCallback] = None
         self.on_api_key: Optional[ApiKeyCallback] = None
+
+        self._offline_buffer = deque(maxlen=settings.offline_call_buffer_size)
 
         nid = settings.node_id
         self._t_checkin = f"nodes/{nid}/checkin"
@@ -64,6 +67,7 @@ class MQTTManager:
             logger.info("MQTT connected.")
             asyncio.run_coroutine_threadsafe(self._publish_checkin(), self._loop)
             asyncio.run_coroutine_threadsafe(self._maybe_request_key(), self._loop)
+            asyncio.run_coroutine_threadsafe(self._flush_offline_buffer(), self._loop)
         else:
             logger.error(f"MQTT connect refused: {reason_code}")
 
@@ -130,7 +134,23 @@ class MQTTManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             **data,
         }
-        self._publish(self._t_metadata, payload, qos=1)
+        if not self._connected:
+            if event_type == "call_end":
+                self._offline_buffer.append((self._t_metadata, payload))
+                logger.warning(f"MQTT offline. Buffered call_end event for {data.get('call_id')}")
+            else:
+                logger.debug(f"MQTT offline. Dropping metadata event: {event_type}")
+        else:
+            self._publish(self._t_metadata, payload, qos=1)
+
+    async def _flush_offline_buffer(self):
+        if not self._offline_buffer:
+            return
+        count = len(self._offline_buffer)
+        logger.info(f"Relaying {count} buffered call_end events from offline queue.")
+        while self._offline_buffer:
+            topic, payload = self._offline_buffer.popleft()
+            self._publish(topic, payload, qos=1)
 
     async def _maybe_request_key(self):
         """After connecting, wait for any retained api_key message to arrive.
