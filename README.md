@@ -217,14 +217,9 @@ Once a radio bot is in a voice channel, mention it in any text channel:
 
 ## Local Web Dashboard
 
-The edge node serves a dashboard at `http://<node-ip>:8080`. It shows:
+The edge node serves a dynamic dual-mode dashboard at `http://<node-ip>/`.
 
-- **Status**: Node state (online / recording / unconfigured), MQTT connection, Discord connection, recording state
-- **Current call**: Talkgroup name + ID, call ID, system name, OP25 status
-- **Node info**: Coordinates, assigned system, configured flag, live Icecast listen button
-- **Unconfigured banner**: Displayed if the node has not yet been assigned a radio system
-
-Auto-refreshes every 3 seconds by polling `/api/status`.
+For complete details on both the Network Configuration Dashboard and the offline/portable Scanner UI (including hardware button mapping), please read the [UI & Hardware Guide](docs/UI_GUIDE.md).
 
 ## Volume Mounts
 

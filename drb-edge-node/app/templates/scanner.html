@@ -37,7 +37,20 @@
       font-weight: bold;
       border-bottom: 2px solid #333;
       background-color: #111;
+      align-items: center;
     }
+    .legend-btn {
+      background: #333; color: #fff; border: 1px solid #555; padding: 2px 6px; font-size: 10px; cursor: pointer; border-radius: 4px;
+    }
+    .legend-modal {
+      display: none; position: absolute; top: 10%; left: 10%; right: 10%; bottom: 10%;
+      background: rgba(10,10,10,0.95); border: 2px solid #555; z-index: 200; padding: 20px; overflow-y: auto;
+    }
+    .legend-modal h2 { margin-bottom: 15px; color: var(--sys-color); }
+    .legend-modal ul { list-style: none; line-height: 1.8; margin-bottom: 20px; }
+    .legend-modal li { font-size: 14px; }
+    .legend-modal li span { display: inline-block; width: 100px; font-weight: bold; color: #fff; }
+    .close-legend { padding: 10px; background: #c00; color: #fff; border: none; cursor: pointer; width: 100%; font-weight: bold; border-radius: 4px;}
 
     /* Main Display Area */
     .main-display {
@@ -130,8 +143,20 @@
 <body>
   <div class="status-bar">
     <div id="status-icon">▶ RUNNING</div>
+    <div><button class="legend-btn" onclick="document.getElementById('legend-modal').style.display='block'">KEY LEGEND</button></div>
     <div id="clock">12:00:00</div>
     <div id="vol-indicator">VOL: 100%</div>
+  </div>
+
+  <div class="legend-modal" id="legend-modal">
+    <h2>Hardware Key Legend</h2>
+    <ul>
+      <li><span>Up Arrow</span> Volume Up</li>
+      <li><span>Down Arrow</span> Volume Down</li>
+      <li><span>Enter / H</span> Toggle Hold (UI mock)</li>
+      <li><span>P</span> Play/Pause Stream</li>
+    </ul>
+    <button class="close-legend" onclick="document.getElementById('legend-modal').style.display='none'">CLOSE</button>
   </div>
 
   <div class="main-display" id="main-display">
@@ -207,11 +232,15 @@
           elTgid.textContent = '---';
         }
         
-        if (data.icecast_url && currentIcecastUrl !== data.icecast_url) {
-            currentIcecastUrl = data.icecast_url;
-            audioPlayer.src = currentIcecastUrl;
-            // Modern browsers might block autoplay without interaction
-            audioPlayer.play().catch(e => console.log('Autoplay blocked', e));
+        if (data.icecast_url) {
+            // Replace localhost with actual hostname for network access
+            const dynamicUrl = data.icecast_url.replace('localhost', window.location.hostname);
+            if (currentIcecastUrl !== dynamicUrl) {
+                currentIcecastUrl = dynamicUrl;
+                audioPlayer.src = currentIcecastUrl;
+                // Modern browsers might block autoplay without interaction
+                audioPlayer.play().catch(e => console.log('Autoplay blocked', e));
+            }
         }
       } catch (err) {
         console.error('Failed to fetch status', err);

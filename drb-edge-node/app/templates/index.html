@@ -409,10 +409,13 @@
         document.getElementById('system-id').textContent = d.assigned_system_id ?? '—';
 
         // Audio Player
-        if (d.icecast_url && d.icecast_url !== currentIcecastUrl) {
-          currentIcecastUrl = d.icecast_url;
-          player.src = currentIcecastUrl;
-          document.getElementById('icecast-link').href = currentIcecastUrl;
+        if (d.icecast_url) {
+          const dynamicUrl = d.icecast_url.replace('localhost', window.location.hostname);
+          if (dynamicUrl !== currentIcecastUrl) {
+            currentIcecastUrl = dynamicUrl;
+            player.src = currentIcecastUrl;
+            document.getElementById('icecast-link').href = currentIcecastUrl;
+          }
         }
 
         document.getElementById('unconfigured-banner').style.display = d.configured ? 'none' : 'flex';
