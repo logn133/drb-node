@@ -1,55 +1,100 @@
+"""
+Continuous PulseAudio ring buffer + per-call slicing.
+
+The ring-buffer design is deliberate and load-bearing: a persistent capture
+process runs for the lifetime of the node and every call is cut out of the
+buffer after the fact. Spawning FFmpeg per call used to lose the first 1-2 s to
+process startup, which meant short transmissions produced empty files. Nothing
+about that changes here — only the INPUT changes, from an HTTP GET on Icecast to
+a PulseAudio monitor capture.
+
+Why not Icecast: it lags ~1 s at connect and drifts progressively to 100 s+, so
+slice timestamps and audio content diverge without bound. Icecast stays in the
+stack for frontend/mobile live listening; it is not an accuracy path.
+
+CLOCK DOMAIN: chunks are stamped with time.time(), the host wall clock. OP25's
+call_log timestamps are time.time() from inside the op25 container. All client
+containers run network_mode: host and share the host kernel clock, so the two are
+the same clock and the pre-roll arithmetic below is a direct subtraction with no
+offset mapping. (A wall-clock STEP — e.g. a large NTP correction — would corrupt
+at most the calls in flight at that instant; the buffer self-heals within
+RING_BUFFER_SECONDS.)
+"""
 import asyncio
 import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import httpx
 from app.config import settings
-from app.internal import credentials
+from app.internal import credentials, pulse
 from app.internal.logger import logger
 
-MAX_RECORDING_SECONDS = 600  # safety cap; drop call if it runs this long
-PRE_BUFFER_SECONDS = 1.0  # seconds of audio to include before call_start
-RING_BUFFER_SECONDS = 60  # how much history to keep when no call is active
-READ_CHUNK_BYTES = 4096  # bytes per httpx read
+# Safety cap on a single recording; mirrors MAX_SEGMENT_SECONDS in metadata_watcher.
+MAX_RECORDING_SECONDS = 600
+
+# Audio included ahead of OP25's call_log timestamp. The grant is logged when the
+# channel is granted, so the first syllable can land marginally before it.
+PRE_ROLL_SECONDS = 0.25
+
+# Rolling history kept when no call is active. Budget for the worst realistic
+# detection latency: 0.5 s poll interval + ~0.2 s http_server blocking floor +
+# up to 3 s httpx timeout on a stalled poll + callback work ≈ 4 s from grant to
+# start_recording(). 30 s is ~7x that margin, and at 16 kbps costs only ~60 KB of
+# RAM, so there is no reason to trim it closer. The buffer is what makes
+# detection latency harmless: however late we notice, we seek back to OP25's
+# exact timestamp.
+RING_BUFFER_SECONDS = 30
+
+# ~128 ms of audio per chunk at 16 kbps. Chunk size IS the timestamp resolution of
+# the ring buffer, so it must stay well under PRE_ROLL_SECONDS — the old 4096-byte
+# reads were ~2 s per chunk, which made sub-second slicing meaningless.
+READ_CHUNK_BYTES = 256
+
+# Encoder settings, matched on purpose to what Liquidsoap already pushes to
+# Icecast — %mp3(bitrate=16, samplerate=22050, stereo=false) — so the C2 /upload
+# endpoint keeps receiving exactly the kind of MP3 it has always received
+# (multipart "audio/mpeg", stored to GCS as .mp3, then fed to Whisper).
+# Change both of these together if you ever want higher-fidelity uploads.
+MP3_BITRATE = "16k"
+MP3_SAMPLE_RATE = "22050"
+
+# Backoff bounds for restarting a dead capture process.
+RESTART_BACKOFF_MIN = 1.0
+RESTART_BACKOFF_MAX = 15.0
 
 
 class CallRecorder:
-    """
-    Maintains a persistent HTTP connection to the Icecast stream and buffers
-    the raw MP3 bytes in a ring buffer.  When a call starts we note the
-    monotonic clock; when it ends we slice the buffer and write the file.
-
-    This approach eliminates per-call FFmpeg startup latency, which was
-    causing empty recordings for calls shorter than ~1–2 s.
-    """
+    """Continuous PulseAudio capture into a ring buffer, sliced per call."""
 
     def __init__(self):
         self._recordings_dir = Path(settings.recordings_path)
 
-        # Ring buffer: deque of (monotonic_time, bytes_chunk)
-        self._buffer: deque[tuple[float, bytes]] = deque()
+        # Ring buffer: deque of (wall_clock_epoch_at_arrival, mp3_bytes)
+        self._buffer: deque[Tuple[float, bytes]] = deque()
         self._buffer_bytes: int = 0
 
         self._stream_task: Optional[asyncio.Task] = None
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._capturing: bool = False
 
-        # Active call state
+        # Active recording state
         self._call_id: Optional[str] = None
-        self._call_start_mono: Optional[float] = None
+        self._call_start: Optional[float] = None   # OP25 grant epoch
+        self._slice_start: Optional[float] = None  # _call_start - PRE_ROLL_SECONDS
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the persistent stream buffer.  Call once from app lifespan."""
-        self._stream_task = asyncio.create_task(self._stream_loop())
-        logger.info("Stream ring-buffer started.")
+        """Start the persistent capture. Call once from app lifespan."""
+        self._stream_task = asyncio.create_task(self._capture_loop())
+        logger.info("PulseAudio ring-buffer starting.")
 
     async def stop(self) -> None:
-        """Cancel the stream reader."""
         if self._stream_task:
             self._stream_task.cancel()
             try:
@@ -57,93 +102,202 @@ class CallRecorder:
             except asyncio.CancelledError:
                 pass
             self._stream_task = None
+        await self._terminate_proc()
 
     # ------------------------------------------------------------------
-    # Stream reader
+    # Capture
     # ------------------------------------------------------------------
 
-    async def _stream_loop(self) -> None:
-        stream_url = (
-            f"http://{settings.icecast_host}:{settings.icecast_port}"
-            f"{settings.icecast_mount}"
-        )
-        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+    def _ffmpeg_command(self) -> List[str]:
+        return [
+            "ffmpeg",
+            "-hide_banner", "-nostdin", "-nostats",
+            "-loglevel", "warning",
+            "-f", "pulse", "-i", settings.pulse_source,
+            "-ac", "1",
+            "-ar", MP3_SAMPLE_RATE,
+            "-b:a", MP3_BITRATE,
+            # Without this, the MP3 muxer fills its 32 KB AVIO buffer before
+            # writing anything — 16 s of audio per burst at 16 kbps, which would
+            # destroy the arrival timestamps the slicing depends on.
+            "-flush_packets", "1",
+            "-f", "mp3", "-",
+        ]
+
+    async def _capture_loop(self) -> None:
+        backoff = RESTART_BACKOFF_MIN
         while True:
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream("GET", stream_url) as response:
-                        response.raise_for_status()
-                        logger.info(f"Stream buffer connected to {stream_url}")
-                        async for chunk in response.aiter_bytes(READ_CHUNK_BYTES):
-                            self._ingest(chunk)
+                # The original bug this path was abandoned for: FFmpeg was launched
+                # with -f pulse before the shared socket existed, failed instantly,
+                # and never recovered. Wait for it, bounded, every time.
+                if not await pulse.wait_until_ready():
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, RESTART_BACKOFF_MAX)
+                    continue
+
+                await self._run_capture()
+                logger.warning("PulseAudio capture process exited — restarting.")
             except asyncio.CancelledError:
+                await self._terminate_proc()
                 raise
             except Exception as e:
-                logger.warning(f"Stream buffer disconnected ({e}) — retrying in 3 s")
-                await asyncio.sleep(3)
+                logger.warning(f"PulseAudio capture error ({e}) — restarting.")
+
+            self._capturing = False
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RESTART_BACKOFF_MAX)
+
+    async def _run_capture(self) -> None:
+        cmd = self._ffmpeg_command()
+        logger.info(f"Starting capture: ffmpeg -f pulse -i {settings.pulse_source}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._proc = proc
+        stderr_task = asyncio.create_task(self._drain_stderr(proc))
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    break  # EOF — FFmpeg died or the source went away
+                if not self._capturing:
+                    self._capturing = True
+                    logger.info("PulseAudio capture is producing audio.")
+                self._ingest(chunk)
+        finally:
+            self._capturing = False
+            # _drain_stderr swallows its own CancelledError, so it finishes cleanly
+            # and never needs awaiting here.
+            stderr_task.cancel()
+            await self._terminate_proc()
+
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        """Surface FFmpeg's diagnostics instead of letting the pipe fill and block."""
+        if proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                logger.warning(f"ffmpeg(pulse): {line.decode(errors='replace').strip()}")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+
+    async def _terminate_proc(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            # Synchronous, so the signal lands even if we are being cancelled and
+            # the reap below never gets to run.
+            proc.terminate()
+        except Exception:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     def _ingest(self, chunk: bytes) -> None:
-        """Append a chunk and trim stale data from the front of the buffer."""
-        now = time.monotonic()
+        """Append a chunk and trim stale audio off the front of the buffer."""
+        now = time.time()
         self._buffer.append((now, chunk))
         self._buffer_bytes += len(chunk)
 
-        # During a call, never trim data newer than (call_start - pre_buffer).
-        # Between calls, keep a rolling RING_BUFFER_SECONDS window.
-        if self._call_start_mono is not None:
-            keep_from = self._call_start_mono - PRE_BUFFER_SECONDS
+        # While recording, never trim anything the current slice still needs — but
+        # keep a hard ceiling so a recording that somehow never closes can't grow
+        # the buffer without bound.
+        if self._slice_start is not None:
+            keep_from = max(
+                self._slice_start,
+                now - (MAX_RECORDING_SECONDS + RING_BUFFER_SECONDS),
+            )
         else:
             keep_from = now - RING_BUFFER_SECONDS
 
-        while self._buffer:
-            ts, old = self._buffer[0]
-            if ts >= keep_from:
-                break
-            self._buffer.popleft()
+        while self._buffer and self._buffer[0][0] < keep_from:
+            _, old = self._buffer.popleft()
             self._buffer_bytes -= len(old)
 
     # ------------------------------------------------------------------
-    # Call recording API (same interface as before)
+    # Recording API
     # ------------------------------------------------------------------
 
-    async def start_recording(self, call_id: str) -> bool:
+    async def start_recording(self, call_id: str, start_epoch: Optional[float] = None) -> bool:
+        """
+        Open a recording. `start_epoch` is OP25's call_log timestamp (host wall
+        clock); the slice begins PRE_ROLL_SECONDS before it. Omit it only when no
+        OP25 timestamp is available — then we fall back to "now", losing precision.
+        """
         if self._call_id:
-            logger.warning("Recording already active — ignoring start.")
+            logger.warning(f"Recording already active ({self._call_id}) — ignoring start for {call_id}.")
             return False
+
         self._call_id = call_id
-        self._call_start_mono = time.monotonic()
-        logger.info(f"Recording started (ring-buffer): {call_id}")
+        self._call_start = start_epoch if start_epoch else time.time()
+        self._slice_start = self._call_start - PRE_ROLL_SECONDS
+
+        if not self._capturing:
+            logger.warning(f"Recording {call_id} opened while PulseAudio capture is down — audio may be missing.")
+
+        oldest = self._buffer[0][0] if self._buffer else None
+        if oldest is not None and self._slice_start < oldest:
+            # Pre-roll predates the buffer: node just started, capture restarted,
+            # or OP25's timestamp is far in the past. Clamp and say so.
+            logger.warning(
+                f"Pre-roll for call {call_id} predates buffered audio by "
+                f"{oldest - self._slice_start:.2f}s — recording starts at the buffer head."
+            )
+
+        logger.info(f"Recording started: {call_id} (slice from {self._slice_start:.3f})")
         return True
 
-    async def stop_recording(self) -> Optional[Path]:
+    async def stop_recording(self, end_epoch: Optional[float] = None) -> Optional[Path]:
+        """Close the recording and write the slice. `end_epoch` is host wall clock."""
         if not self._call_id:
             return None
 
         call_id = self._call_id
-        call_start = self._call_start_mono
+        call_start = self._call_start
+        slice_start = self._slice_start
         self._call_id = None
-        self._call_start_mono = None
+        self._call_start = None
+        self._slice_start = None
 
-        # Slice: everything from (call_start - pre_buffer) to now
-        cutoff = (call_start - PRE_BUFFER_SECONDS) if call_start else 0.0
-        chunks = [chunk for ts, chunk in self._buffer if ts >= cutoff]
-
-        # Safety cap: if the call ran very long, truncate to MAX_RECORDING_SECONDS
+        end = end_epoch if end_epoch else time.time()
         if call_start is not None:
-            cap_cutoff = call_start + MAX_RECORDING_SECONDS
-            now = time.monotonic()
-            if now > cap_cutoff:
-                # Approximate: trim chunks that arrived after the cap
-                cap_keep_until = call_start + MAX_RECORDING_SECONDS
-                chunks = [
-                    chunk for ts, chunk in self._buffer
-                    if cutoff <= ts <= cap_keep_until
-                ]
+            end = min(end, call_start + MAX_RECORDING_SECONDS)
+        if slice_start is None:
+            return None
+
+        chunks: List[bytes] = []
+        for ts, chunk in self._buffer:
+            if ts < slice_start:
+                continue
+            chunks.append(chunk)
+            if ts >= end:
+                # Include the chunk straddling `end` so the tail is never clipped,
+                # then stop.
+                break
 
         if not chunks:
             logger.warning(
-                f"No buffered audio for call {call_id} — "
-                "stream may not have been connected yet."
+                f"No buffered audio for call {call_id} "
+                f"(window {slice_start:.3f}–{end:.3f}) — PulseAudio capture may be down."
             )
             return None
 
@@ -151,12 +305,11 @@ class CallRecorder:
         ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_path = self._recordings_dir / f"{ts_str}_{call_id}.mp3"
 
-        data = b"".join(chunks)
-        output_path.write_bytes(data)
+        output_path.write_bytes(b"".join(chunks))
 
         size = output_path.stat().st_size
         if size > 0:
-            logger.info(f"Recording saved: {output_path.name} ({size} bytes)")
+            logger.info(f"Recording saved: {output_path.name} ({size} bytes, {end - slice_start:.2f}s window)")
             return output_path
 
         output_path.unlink(missing_ok=True)
@@ -213,9 +366,24 @@ class CallRecorder:
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
+
     @property
     def is_recording(self) -> bool:
         return self._call_id is not None
+
+    @property
+    def is_capturing(self) -> bool:
+        """True when FFmpeg is alive and audio is actually arriving."""
+        return self._capturing
+
+    @property
+    def buffered_seconds(self) -> float:
+        if len(self._buffer) < 2:
+            return 0.0
+        return self._buffer[-1][0] - self._buffer[0][0]
 
 
 call_recorder = CallRecorder()

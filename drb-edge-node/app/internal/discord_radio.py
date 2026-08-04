@@ -2,11 +2,14 @@ import asyncio
 from typing import Optional
 import discord
 from discord.ext import commands
+from app.config import settings
+from app.internal import pulse
 from app.internal.logger import logger
 
 BOT_READY_TIMEOUT = 15   # seconds to wait for Discord bot to become ready
 WATCHDOG_INTERVAL = 30   # seconds between voice-connection health checks
 REJOIN_DELAY = 5  # seconds to wait before attempting a rejoin
+STREAM_RETRY_DELAY = 5   # seconds to back off before re-arming the audio source
 
 
 class RadioBot:
@@ -47,6 +50,10 @@ class RadioBot:
             # Remember where we are so the watchdog can rejoin if we drop
             self._guild_id = guild_id
             self._channel_id = channel_id
+            # Bounded wait for the shared PulseAudio socket. Historically FFmpeg was
+            # launched before the op25 container had created it, failed instantly,
+            # and the bot sat silently connected forever.
+            await pulse.wait_until_ready()
             self._play_stream()
             if system_name:
                 await self._bot.change_presence(
@@ -108,18 +115,47 @@ class RadioBot:
         self._ready_event = None
 
     def _play_stream(self):
+        """
+        Feed Discord voice straight from the PulseAudio monitor.
+
+        Icecast is NOT used here: it lags ~1 s at connect and drifts to 100 s+,
+        which is unusable for live listening. Icecast remains the frontend/mobile
+        listening path only.
+        """
         if not self._voice_client:
             return
-        from app.config import settings
-        stream_url = f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
+
+        if not pulse.is_ready():
+            logger.error(
+                f"PulseAudio socket {pulse.socket_path()} missing — "
+                f"cannot start Discord audio; retrying in {STREAM_RETRY_DELAY}s."
+            )
+            self._schedule_restart()
+            return
+
+        # before_options land ahead of -i, so this becomes:
+        #   ffmpeg -f pulse -i drb_sink.monitor …
         source = discord.FFmpegPCMAudio(
-            stream_url,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            settings.pulse_source,
+            before_options="-f pulse",
         )
         self._voice_client.play(
             discord.PCMVolumeTransformer(source, volume=1.0),
             after=self._on_stream_end,
         )
+
+    def _schedule_restart(self, delay: float = STREAM_RETRY_DELAY):
+        """Re-arm the audio source after a delay — safe to call from any thread."""
+        if not self._loop:
+            return
+
+        async def _delayed_restart():
+            await asyncio.sleep(delay)
+            vc = self._voice_client
+            if vc and vc.is_connected() and not vc.is_playing():
+                self._play_stream()
+
+        self._loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_delayed_restart()))
 
     def _on_stream_end(self, error):
         if error:
@@ -128,12 +164,9 @@ class RadioBot:
         if not (self._loop and vc and vc.is_connected() and not vc.is_playing()):
             return
         if error:
-            # Back off before retrying — prevents tight loop when PulseAudio is unavailable
-            async def _delayed_restart():
-                await asyncio.sleep(5)
-                if self._voice_client and self._voice_client.is_connected() and not self._voice_client.is_playing():
-                    self._play_stream()
-            self._loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_delayed_restart()))
+            # Back off before retrying — prevents a tight loop when PulseAudio is
+            # unavailable (FFmpeg exits immediately in that case).
+            self._schedule_restart()
         else:
             self._loop.call_soon_threadsafe(self._play_stream)
 
@@ -232,6 +265,9 @@ class RadioBot:
                     else:
                         self._voice_client = await vc.connect()
                     self._channel_id = vc.id
+                    # A fresh connect() has no audio source attached yet.
+                    if not self._voice_client.is_playing():
+                        self._play_stream()
                     await message.reply(f"Joined {vc.name}.")
                 except Exception as e:
                     logger.error(f"joinme failed: {e}")

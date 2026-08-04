@@ -48,6 +48,10 @@ async def get_status():
         "assigned_system_id": node_cfg.assigned_system_id,
         "system_name": system_name,
         "is_recording": call_recorder.is_recording,
+        # Health of the PulseAudio capture that feeds every recording — the single
+        # most useful signal when recordings come back empty.
+        "audio_capture": call_recorder.is_capturing,
+        "buffered_seconds": round(call_recorder.buffered_seconds, 1),
         "active_tgid": active_tgid,
         "active_tgid_name": active_tgid_name,
         "active_call_id": metadata_watcher.active_call_id,

@@ -24,12 +24,18 @@ async def on_call_start(data: dict):
     radio_bot.start_stream()
     await mqtt_manager.publish_status("recording")
     await mqtt_manager.publish_metadata("call_start", data)
-    await call_recorder.start_recording(data["call_id"])
+    # started_at_epoch is OP25's own call_log timestamp — the recorder slices the
+    # ring buffer back to it (minus pre-roll), so however late we detected the
+    # grant, the audio still starts in the right place.
+    await call_recorder.start_recording(
+        data["call_id"],
+        start_epoch=data.get("started_at_epoch"),
+    )
 
 
 async def on_call_end(data: dict):
     radio_bot.stop_stream()
-    file_path = await call_recorder.stop_recording()
+    file_path = await call_recorder.stop_recording(end_epoch=data.get("ended_at_epoch"))
     if file_path:
         node_cfg = load_node_config()
         audio_url = await call_recorder.upload_recording(
@@ -46,7 +52,8 @@ async def on_call_end(data: dict):
     else:
         logger.warning(
             f"No recording file generated for call {data['call_id']} "
-            "— call may have been too short or Icecast unreachable."
+            "— PulseAudio capture may be down (check the op25 container and "
+            f"the {settings.pulse_source} source)."
         )
     await mqtt_manager.publish_metadata("call_end", data)
     await mqtt_manager.publish_status("online")
@@ -191,7 +198,7 @@ async def lifespan(app: FastAPI):
     # Start services (radio_bot starts on-demand when a discord_join command arrives)
     await mqtt_manager.connect()
     await metadata_watcher.start()
-    await call_recorder.start()  # persistent Icecast stream buffer
+    await call_recorder.start()  # persistent PulseAudio ring buffer
 
     # Start system caching in background
     from app.internal.system_cacher import fetch_and_cache_systems

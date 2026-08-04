@@ -1,7 +1,33 @@
 import httpx
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
 from app.config import settings
 from app.internal.logger import logger
+
+# The OP25 HTTP terminal answers a single "update" command with a LIST of
+# messages, each tagged with a `json_type`. We care about two of them:
+#
+#   channel_update — current receiver state. `channels` holds the channel ids and
+#                    each id is also a top-level key holding that channel's dict
+#                    (freq/tgid/tag/srcaddr/svcopts/hold_tgid/…).
+#
+#   call_log       — an EVENT QUEUE, not a snapshot. `log` holds entries appended
+#                    by tk_p25.log_call() at channel-grant time, each stamped with
+#                    OP25's own time.time(). get_call_log() DRAINS the deque, so
+#                    every entry is delivered exactly once and a missed poll loses
+#                    it forever. The deque is capped at CALL_LOG_MAX_LEN = 10, so
+#                    the consumer must keep up.
+#
+# Everything else (trunk_update, rx_update, terminal_config, …) is ignored.
+TERMINAL_UPDATE_COMMAND = [{"command": "update", "arg1": 0, "arg2": 0}]
+
+
+@dataclass
+class TerminalUpdate:
+    """One decoded poll of the OP25 HTTP terminal."""
+
+    channels: List[Dict[str, Any]] = field(default_factory=list)
+    call_log: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class OP25Client:
@@ -49,24 +75,67 @@ class OP25Client:
             logger.error(f"OP25 generate-config failed: {e}")
             return False
 
-    async def get_terminal_status(self) -> Optional[Any]:
-        """Poll the OP25 HTTP terminal for current call metadata."""
+    async def poll_terminal(self) -> Optional[TerminalUpdate]:
+        """
+        Poll the OP25 HTTP terminal once and decode every message we understand.
+
+        Returns None only when OP25 is unreachable / returned garbage — callers
+        use that to distinguish "no traffic" from "no OP25".
+        """
         try:
             async with httpx.AsyncClient(timeout=3) as client:
-                r = await client.post(
-                    self.terminal_url,
-                    json=[{"command": "update", "arg1": 0, "arg2": 0}],
-                )
+                r = await client.post(self.terminal_url, json=TERMINAL_UPDATE_COMMAND)
                 r.raise_for_status()
-                messages = r.json()
-                for msg in messages:
-                    if msg.get("json_type") == "channel_update":
-                        channels = msg.get("channels", [])
-                        if channels:
-                            return msg.get(str(channels[0]), {})
-                return None
+                return parse_terminal_messages(r.json())
         except Exception:
             return None
+
+    async def get_terminal_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Compatibility shim: the first channel's state dict, as this used to return.
+
+        Prefer poll_terminal() — this discards the call_log, which is the only
+        source of exact call-start timestamps.
+        """
+        update = await self.poll_terminal()
+        if not update or not update.channels:
+            return None
+        return update.channels[0]
+
+
+def parse_terminal_messages(messages: Any) -> TerminalUpdate:
+    """
+    Decode an OP25 terminal response into channel state + call-log events.
+
+    Deliberately permissive: the response may be a bare dict instead of a list,
+    may contain json_type values we have never seen, and individual entries may
+    be malformed. Anything unrecognised is skipped rather than raising, because
+    dropping a whole poll would drop call_log events that are never re-sent.
+    """
+    update = TerminalUpdate()
+
+    if isinstance(messages, dict):
+        messages = [messages]
+    if not isinstance(messages, list):
+        return update
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        json_type = msg.get("json_type")
+
+        if json_type == "channel_update":
+            for chan_id in msg.get("channels") or []:
+                channel = msg.get(str(chan_id))
+                if isinstance(channel, dict):
+                    update.channels.append(channel)
+
+        elif json_type == "call_log":
+            for entry in msg.get("log") or []:
+                if isinstance(entry, dict):
+                    update.call_log.append(entry)
+
+    return update
 
 
 op25_client = OP25Client()
