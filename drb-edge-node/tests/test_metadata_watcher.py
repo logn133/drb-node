@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, patch
 from app.config import settings
 from app.internal.metadata_watcher import (
     MetadataWatcher,
-    TAIL_PAD_SECONDS,
     OP25_OFFLINE_GRACE,
 )
 from app.internal.op25_client import TerminalUpdate, parse_terminal_messages
@@ -229,8 +228,57 @@ async def test_srcaddr_edge_then_idle_timeout_ends_call(watcher, clock):
     assert payload["end_reason"] == "idle_timeout"
     # The audio ends at the last transmission plus a short pad, NOT at "now" —
     # otherwise every recording carries call_idle_timeout seconds of silence.
-    assert payload["ended_at_epoch"] == pytest.approx(edge_time + TAIL_PAD_SECONDS)
+    assert payload["ended_at_epoch"] == pytest.approx(edge_time + settings.call_tail_pad_seconds)
     assert payload["tgid"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_tail_pad_is_configurable_and_defaults_to_one_second(watcher, clock, monkeypatch):
+    """
+    0.5s left only ~0.3s of real trailing margin in field measurement and one
+    recording ended mid-word, so the default moved to 1.0 — and it has to be a
+    setting, not a magic number, so it can be tuned per node.
+    """
+    assert settings.call_tail_pad_seconds == 1.0
+
+    monkeypatch.setattr(settings, "call_tail_pad_seconds", 2.5)
+
+    await tick(watcher, update(
+        call_log=[grant(1234, clock.now)],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+    clock.advance(0.5)
+    edge_time = clock.now
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+
+    clock.advance(settings.call_idle_timeout + 1.0)
+    await tick(watcher, update(channels=[channel()]))
+
+    payload = watcher.on_call_end.call_args[0][0]
+    assert payload["ended_at_epoch"] == pytest.approx(edge_time + 2.5)
+
+
+@pytest.mark.asyncio
+async def test_idle_close_logs_the_measured_control_channel_idle(watcher, clock, caplog):
+    """
+    The correct idle timeout can only be tuned from the CONTROL-CHANNEL idle, not
+    from silence measured in the audio (which also contains the ~1.9s P25
+    grant→speech delay). So the real measured value has to reach the log.
+    """
+    await tick(watcher, update(
+        call_log=[grant(1234, clock.now)],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+    clock.advance(0.5)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+
+    with caplog.at_level("INFO", logger="drb-edge-node"):
+        clock.advance(settings.call_idle_timeout + 0.25)
+        await tick(watcher, update(channels=[channel()]))
+
+    idle_lines = [r.message for r in caplog.records if "measured control-channel idle" in r.message]
+    assert idle_lines, "idle-timeout closes must log the measured idle for later tuning"
+    assert "3.25s" in idle_lines[0]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
+
 from fastapi import FastAPI
 from app.config import settings
 from app.models import SystemConfig
@@ -20,6 +23,13 @@ from app.routers import api, ui
 # Event handlers wired up at startup
 # ---------------------------------------------------------------------------
 
+def _iso(epoch: Optional[float]) -> Optional[str]:
+    """Epoch → UTC ISO-8601, matching metadata_watcher's timestamp format."""
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
 async def on_call_start(data: dict):
     radio_bot.start_stream()
     await mqtt_manager.publish_status("recording")
@@ -35,20 +45,44 @@ async def on_call_start(data: dict):
 
 async def on_call_end(data: dict):
     radio_bot.stop_stream()
-    file_path = await call_recorder.stop_recording(end_epoch=data.get("ended_at_epoch"))
-    if file_path:
+    recording = await call_recorder.stop_recording(end_epoch=data.get("ended_at_epoch"))
+
+    if recording is not None and recording.path is not None:
+        # Silence trimming shortens the audio, so the audio's own bounds no
+        # longer equal the call's. `started_at`/`ended_at` keep meaning the CALL
+        # (what OP25 observed on the control channel) — these extra fields carry
+        # the AUDIO's wall-clock bounds so playback, correlation and incident
+        # timelines can still map an audio offset back to real time:
+        #     wall_clock_of(audio_offset_t) == audio_start_epoch + t
+        data["audio_start_at"] = _iso(recording.audio_start_epoch)
+        data["audio_end_at"] = _iso(recording.audio_end_epoch)
+        data["audio_start_epoch"] = recording.audio_start_epoch
+        data["audio_end_epoch"] = recording.audio_end_epoch
+        data["audio_lead_trimmed"] = round(recording.lead_trimmed, 3)
+        data["audio_tail_trimmed"] = round(recording.tail_trimmed, 3)
+        if recording.clamped_seconds:
+            data["audio_clamped_seconds"] = round(recording.clamped_seconds, 3)
+
+    if recording is not None and recording.path is not None:
         node_cfg = load_node_config()
         audio_url = await call_recorder.upload_recording(
-            file_path,
+            recording.path,
             data["call_id"],
             talkgroup_id=data.get("tgid"),
             talkgroup_name=data.get("tgid_name"),
             system_id=node_cfg.assigned_system_id,
+            audio_start_epoch=recording.audio_start_epoch,
+            audio_end_epoch=recording.audio_end_epoch,
         )
         if audio_url:
             data["audio_url"] = audio_url
         else:
             logger.error(f"Audio upload failed for call {data['call_id']}. Verify C2_URL and Node API Key.")
+    elif recording is not None and recording.all_silence:
+        # Explicit policy: an all-silence recording is not uploaded. It has no
+        # transcript value and silence is what makes Whisper invent text.
+        data["audio_skipped"] = "all_silence"
+        logger.warning(f"Call {data['call_id']} was pure silence — no upload. Investigate the audio path.")
     else:
         logger.warning(
             f"No recording file generated for call {data['call_id']} "

@@ -37,7 +37,30 @@ class Settings(BaseSettings):
     # Call segmentation — seconds with no active transmission before the current
     # recording is closed out. Consecutive grants on the SAME talkgroup inside this
     # window are kept in one recording so back-and-forth traffic stays together.
+    #
+    # Do NOT tune this against measured *audio* silence: audio gaps also contain
+    # the ~1.9 s P25 grant→speech delay, so they are always longer than the
+    # control-channel idle this timer measures. metadata_watcher logs the real
+    # measured idle on every idle-timeout close — tune from that.
     call_idle_timeout: float = 3.0
+
+    # Audio kept after the observed end of the last transmission. The srcaddr
+    # 1→0 edge can be up to one poll (0.5 s) late and the encoder adds its own
+    # latency, so this is the only headroom protecting the last word of a
+    # transmission — which is usually the disposition or the address. Field
+    # measurement at 0.5 s left only 0.29–0.37 s of real trailing margin and one
+    # recording ended mid-word, hence 1.0 s.
+    call_tail_pad_seconds: float = 1.0
+
+    # Strip leading/trailing dead air before upload. ~63% of a typical recording
+    # is silence (the grant→speech delay plus the tail pad), which inflates
+    # Whisper cost and is a well-documented trigger for hallucinated transcript
+    # text. Trimming is conservative — see internal/audio_trim.py.
+    trim_silence: bool = True
+    # Anything quieter than this counts as silence for detection purposes.
+    trim_silence_threshold_db: float = -40.0
+    # Guard margin kept around detected speech so no syllable is clipped.
+    trim_silence_guard_seconds: float = 0.25
 
     # OP25 container
     op25_api_url: str = "http://localhost:8001"

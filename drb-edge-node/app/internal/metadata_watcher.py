@@ -47,13 +47,21 @@ POLL_INTERVAL = 0.5
 # Seconds of unreachable OP25 before an open segment is force-closed.
 OP25_OFFLINE_GRACE = 3.0
 
-# Audio kept after the observed end of the last transmission, so the srcaddr edge
-# (up to one poll late) never clips the tail.
-TAIL_PAD_SECONDS = 0.5
-
 # Hard ceiling on a single segment; mirrors MAX_RECORDING_SECONDS in call_recorder
 # so a talkgroup that never goes quiet cannot produce an unbounded recording.
 MAX_SEGMENT_SECONDS = 600
+
+
+def _tail_pad() -> float:
+    """
+    Audio kept after the observed end of the last transmission, so the srcaddr
+    edge (up to one poll late) plus encoder latency never clips the tail.
+
+    Read live from settings (env CALL_TAIL_PAD_SECONDS) rather than frozen into a
+    module constant, so it is tunable per node. See the setting for why the
+    default moved 0.5 → 1.0.
+    """
+    return settings.call_tail_pad_seconds
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -235,7 +243,25 @@ class MetadataWatcher:
             # STOP: quiet for long enough. End the audio at the last transmission
             # plus a short pad, not at "now" — otherwise every recording carries
             # call_idle_timeout seconds of silence.
-            end = (self._last_tx_end + TAIL_PAD_SECONDS) if self._last_tx_end is not None else now
+            #
+            # The measured idle below is the CONTROL-CHANNEL idle (srcaddr 1→0
+            # edge → now). It is NOT comparable to silence measured in the audio,
+            # which additionally contains the ~1.9 s P25 grant→speech delay.
+            # Tune settings.call_idle_timeout from THIS number and nothing else.
+            if self._last_tx_end is not None:
+                measured_idle = now - self._last_tx_end
+                end = self._last_tx_end + _tail_pad()
+                logger.info(
+                    f"Idle timeout for tgid {self._current_tgid}: measured control-channel idle "
+                    f"{measured_idle:.2f}s (threshold {settings.call_idle_timeout:.2f}s, "
+                    f"tail pad {_tail_pad():.2f}s)."
+                )
+            else:
+                end = now
+                logger.info(
+                    f"Idle timeout for tgid {self._current_tgid}: no srcaddr end edge observed, "
+                    f"idle {now - self._last_activity:.2f}s measured from last activity."
+                )
             await self._close_segment(min(end, now), reason="idle_timeout")
             return
 
