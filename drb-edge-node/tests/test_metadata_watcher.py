@@ -452,9 +452,11 @@ async def test_different_tgid_grant_splits_recording(watcher, clock):
     assert ended["call_id"] == first_id
     assert ended["tgid"] == 1111
     assert ended["end_reason"] == "tgid_change"
-    # The outgoing segment ends exactly where the new one begins — no tail pad,
-    # or it would swallow the first moments of the new talkgroup.
-    assert ended["ended_at_epoch"] == split_time
+    # The outgoing segment is padded PAST where the new one begins. The buffered
+    # audio lags control-channel timestamps by ~1.5s, so ending exactly at the
+    # split cut the outgoing call's last words. The overlap is correct — the
+    # audio stream really does hold one call's tail then the next call's start.
+    assert ended["ended_at_epoch"] == split_time + settings.call_tail_pad_seconds
     assert watcher.on_call_start.call_args[0][0]["started_at_epoch"] == split_time
 
 
@@ -482,7 +484,8 @@ async def test_multiple_call_log_entries_in_one_poll(watcher, clock):
     assert ended["tgid"] == 1111
     assert ended["transmissions"] == 2
     assert ended["started_at_epoch"] == t0
-    assert ended["ended_at_epoch"] == t0 + 0.9
+    # Split close is padded past the new grant — see the tgid_change test above.
+    assert ended["ended_at_epoch"] == t0 + 0.9 + settings.call_tail_pad_seconds
 
 
 @pytest.mark.asyncio

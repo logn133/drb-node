@@ -17,6 +17,8 @@ is proven at the layer that matters.
 import subprocess
 from unittest.mock import Mock
 
+import pytest
+
 from app.internal import pulse
 
 
@@ -53,6 +55,7 @@ def test_is_ready_false_when_daemon_does_not_respond(monkeypatch):
     assert pulse.is_ready() is False
 
 
+@pytest.mark.asyncio
 async def test_wait_until_ready_short_circuits_when_already_live(monkeypatch):
     calls = Mock(return_value=True)
     monkeypatch.setattr(pulse, "_daemon_responds", calls)
@@ -60,6 +63,7 @@ async def test_wait_until_ready_short_circuits_when_already_live(monkeypatch):
     assert calls.call_count == 1
 
 
+@pytest.mark.asyncio
 async def test_wait_until_ready_polls_until_daemon_comes_up(monkeypatch):
     monkeypatch.setattr(pulse, "POLL_INTERVAL", 0.01)
     responses = iter([False, False, True])
@@ -67,12 +71,14 @@ async def test_wait_until_ready_polls_until_daemon_comes_up(monkeypatch):
     assert await pulse.wait_until_ready(timeout=5) is True
 
 
+@pytest.mark.asyncio
 async def test_wait_until_ready_times_out_when_daemon_never_responds(monkeypatch):
     monkeypatch.setattr(pulse, "POLL_INTERVAL", 0.01)
     monkeypatch.setattr(pulse, "_daemon_responds", lambda: False)
     assert await pulse.wait_until_ready(timeout=0.05) is False
 
 
+@pytest.mark.asyncio
 async def test_wait_until_ready_uses_settings_default_when_timeout_omitted(monkeypatch):
     monkeypatch.setattr(pulse.settings, "pulse_wait_timeout", 0.05)
     monkeypatch.setattr(pulse, "POLL_INTERVAL", 0.01)
