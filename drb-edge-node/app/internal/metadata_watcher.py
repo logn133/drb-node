@@ -62,9 +62,20 @@ def _tail_pad() -> float:
     why the default moved 1.0 → 3.0 (short calls' recording window was closing
     before the ~1.5s grant→speech offset let voice audio even start).
 
-    Only the idle-timeout close path below uses this pad — the tgid_change and
-    tgid_change_unlogged paths close at an exact, already-known boundary (the
-    new grant's timestamp, or the same poll tick) and intentionally add none.
+    All three close paths use this pad: idle_timeout, tgid_change, and
+    tgid_change_unlogged. An earlier version of this docstring claimed the
+    latter two close at "an exact, already-known boundary" (the new grant's
+    timestamp, or the same poll tick) and so intentionally added no pad — THAT
+    REASONING WAS WRONG and produced real truncated recordings. The boundary is
+    exact only in CONTROL-CHANNEL time; the buffered AUDIO lags control-channel
+    timestamps by ~1.5s (measured: 0.84-1.62s of lead trimmed across 7 field
+    calls), so slicing the outgoing call at the new grant's exact timestamp cut
+    roughly the last 1.5s of its real speech — calls ending mid-word with ~0s
+    trailing silence. Do not reintroduce a zero-pad close for tgid_change or
+    tgid_change_unlogged; if the outgoing and incoming recordings end up
+    overlapping in the underlying audio because of this pad, that is correct —
+    the audio genuinely contains both. See _handle_call_log and
+    _handle_channels for how each path sources the timestamp this gets added to.
     """
     return settings.call_tail_pad_seconds
 
@@ -194,9 +205,16 @@ class MetadataWatcher:
             return
 
         # SPLIT: different talkgroup. The new grant's OP25 timestamp is the most
-        # precise end available for the outgoing segment — the new call's audio
-        # starts exactly there, so no tail pad.
-        await self._close_segment(started_at, reason="tgid_change")
+        # precise CONTROL-CHANNEL end for the outgoing segment, but the buffered
+        # audio lags control by ~1.5s, so slicing exactly there cut the outgoing
+        # call's last words. Pad past it and let the recorder's bounded tail wait
+        # block until that audio has actually been captured.
+        #
+        # The incoming call's pre-roll comes from the ring buffer, so the delay
+        # costs it nothing, and the two slices overlapping in the underlying
+        # audio is correct — the stream genuinely contains one call's tail and
+        # then the next call's start.
+        await self._close_segment(started_at + _tail_pad(), reason="tgid_change")
         await self._open_segment(entry, tgid, started_at, now)
 
     async def _handle_channels(self, channels: List[Dict[str, Any]], now: float) -> None:
@@ -241,7 +259,7 @@ class MetadataWatcher:
                 f"tgid {foreign_active_tgid} active without a call_log entry — "
                 f"closing segment for tgid {self._current_tgid} (call_log event likely dropped)."
             )
-            await self._close_segment(now, reason="tgid_change_unlogged")
+            await self._close_segment(now + _tail_pad(), reason="tgid_change_unlogged")
             return
 
         if (now - self._last_activity) >= settings.call_idle_timeout:

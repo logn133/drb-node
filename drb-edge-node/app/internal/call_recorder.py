@@ -89,7 +89,11 @@ MAX_RECORDING_BYTES = MAX_RECORDING_SECONDS * _MP3_BYTES_PER_SECOND * 4
 # immediately therefore cuts the tail short — which costs the last word of the
 # transmission, usually the disposition or the address. Bounded so a dead capture
 # can never hang the upload path.
-TAIL_WAIT_TIMEOUT_SECONDS = 2.0
+#
+# Must exceed settings.call_tail_pad_seconds (default 3.0), otherwise a
+# tgid_change close — which pads past a timestamp that is still ~now — gives up
+# before the padded audio has been captured and warns on every talkgroup switch.
+TAIL_WAIT_TIMEOUT_SECONDS = 4.0
 TAIL_WAIT_POLL_SECONDS = 0.05
 
 # Backoff bounds for restarting a dead capture process.
