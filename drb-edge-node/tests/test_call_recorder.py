@@ -421,4 +421,64 @@ def test_memory_ceiling_covers_the_longest_allowed_call():
     """The cap must bound RAM without ever being able to truncate a legal call."""
     bytes_per_second = 16_000 // 8
     assert MAX_RECORDING_BYTES >= MAX_RECORDING_SECONDS * bytes_per_second
+
+
+# ---------------------------------------------------------------------------
+# Capture-exit classification — the two failure modes must be told apart
+# instead of both logging the same generic "restarting" line. This is what
+# let a wrong PULSE_SOURCE hide behind normal-looking startup retries before.
+# ---------------------------------------------------------------------------
+
+def _log_levels(caplog, logger_name="drb-edge-node"):
+    return [r.levelname for r in caplog.records if r.name == logger_name]
+
+
+def test_capture_exit_logs_error_when_source_missing(recorder, caplog):
+    """FFmpeg's pulse input prints 'No such process' when the daemon is up
+    but the configured source name does not exist — a real misconfiguration,
+    not a startup race, so this must stand out as an error naming the source."""
+    recorder._last_stderr_lines.append(
+        "[pulse @ 0x...] pa_stream_connect_record failed: No such process"
+    )
+    with caplog.at_level("INFO", logger="drb-edge-node"):
+        recorder._log_capture_exit()
+
+    assert "ERROR" in _log_levels(caplog)
+    error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
+    assert any(settings.pulse_source in m for m in error_messages)
+
+
+def test_capture_exit_logs_info_when_no_daemon(recorder, caplog):
+    """Connection refused means nothing is listening yet — expected during
+    startup, so it must NOT be logged at the same severity as a real
+    misconfiguration."""
+    recorder._last_stderr_lines.append(
+        "[pulse @ 0x...] pa_context_connect() failed: Connection refused"
+    )
+    with caplog.at_level("INFO", logger="drb-edge-node"):
+        recorder._log_capture_exit()
+
+    levels = _log_levels(caplog)
+    assert "ERROR" not in levels
+    assert "INFO" in levels
+
+
+def test_capture_exit_falls_back_to_generic_warning(recorder, caplog):
+    """An FFmpeg failure that matches neither known marker keeps the original
+    generic behavior rather than guessing."""
+    recorder._last_stderr_lines.append("[pulse @ 0x...] some other unexpected failure")
+    with caplog.at_level("INFO", logger="drb-edge-node"):
+        recorder._log_capture_exit()
+
+    assert _log_levels(caplog) == ["WARNING"]
+
+
+def test_capture_exit_with_no_stderr_captured_is_generic_warning(recorder, caplog):
+    """No stderr at all (e.g. FFmpeg killed before printing anything) must not
+    crash the classifier and must fall back to the generic message."""
+    assert list(recorder._last_stderr_lines) == []
+    with caplog.at_level("INFO", logger="drb-edge-node"):
+        recorder._log_capture_exit()
+
+    assert _log_levels(caplog) == ["WARNING"]
     assert MAX_RECORDING_BYTES <= 8 * 1024 * 1024, "must stay small enough for a Pi"

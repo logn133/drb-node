@@ -96,6 +96,19 @@ TAIL_WAIT_POLL_SECONDS = 0.05
 RESTART_BACKOFF_MIN = 1.0
 RESTART_BACKOFF_MAX = 15.0
 
+# Substrings looked for in FFmpeg's stderr to classify why capture exited.
+# "No such process" is what FFmpeg's pulse input prints when the daemon is up
+# but the named source does not exist — a real PULSE_SOURCE misconfiguration,
+# not a startup race. This is exactly the failure mode that hid unnoticed
+# behind a generic "restarting" log in the April outage: silently retrying
+# forever against a wrong source name looks identical to a normal startup
+# wait unless it is logged differently.
+_SOURCE_MISSING_MARKERS = ("no such process", "no such device")
+# "Connection refused"/"Connection failure" is what the pulse client library
+# prints when nothing is listening on the socket at all — expected while the
+# op25 container's daemon is still coming up.
+_NO_DAEMON_MARKERS = ("connection refused", "connection failure")
+
 
 @dataclass
 class _ActiveRecording:
@@ -154,6 +167,10 @@ class CallRecorder:
         # Active recording state (None when idle)
         self._active: Optional[_ActiveRecording] = None
 
+        # Last few lines of the most recent FFmpeg stderr, used to classify
+        # why a capture process exited (see _classify_capture_exit).
+        self._last_stderr_lines: deque[str] = deque(maxlen=10)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -206,7 +223,7 @@ class CallRecorder:
                     continue
 
                 await self._run_capture()
-                logger.warning("PulseAudio capture process exited — restarting.")
+                self._log_capture_exit()
             except asyncio.CancelledError:
                 await self._terminate_proc()
                 raise
@@ -220,6 +237,7 @@ class CallRecorder:
     async def _run_capture(self) -> None:
         cmd = self._ffmpeg_command()
         logger.info(f"Starting capture: ffmpeg -f pulse -i {settings.pulse_source}")
+        self._last_stderr_lines.clear()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -253,11 +271,47 @@ class CallRecorder:
                 line = await proc.stderr.readline()
                 if not line:
                     return
-                logger.warning(f"ffmpeg(pulse): {line.decode(errors='replace').strip()}")
+                text = line.decode(errors="replace").strip()
+                self._last_stderr_lines.append(text)
+                logger.warning(f"ffmpeg(pulse): {text}")
         except asyncio.CancelledError:
             return
         except Exception:
             return
+
+    def _log_capture_exit(self) -> None:
+        """
+        Log why the just-finished capture process exited, distinguishing the
+        two failure modes that matter operationally instead of one generic
+        "restarting" line for both:
+
+          - no daemon / connection refused: infrastructure isn't up yet. This
+            is expected during startup/op25 restarts, so it stays at INFO —
+            the retry loop above already handles it.
+          - daemon up but the named source is missing: almost always a real
+            PULSE_SOURCE misconfiguration. This gets a loud, distinct ERROR
+            naming the configured source, because silently retrying forever
+            against a wrong source name is exactly how this hid in the past.
+        """
+        text = " ".join(self._last_stderr_lines).lower()
+
+        if any(marker in text for marker in _SOURCE_MISSING_MARKERS):
+            logger.error(
+                f"PulseAudio capture exited: source '{settings.pulse_source}' does not exist on the "
+                "daemon (FFmpeg reported 'No such process'). This looks like a real PULSE_SOURCE "
+                "misconfiguration or a missing drb_sink — retrying will not fix it by itself. "
+                "Restarting anyway."
+            )
+            return
+
+        if any(marker in text for marker in _NO_DAEMON_MARKERS):
+            logger.info(
+                "PulseAudio capture exited: daemon not accepting connections — "
+                "infrastructure still coming up, restarting."
+            )
+            return
+
+        logger.warning("PulseAudio capture process exited — restarting.")
 
     async def _terminate_proc(self) -> None:
         proc, self._proc = self._proc, None
