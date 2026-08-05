@@ -233,15 +233,17 @@ async def test_srcaddr_edge_then_idle_timeout_ends_call(watcher, clock):
 
 
 @pytest.mark.asyncio
-async def test_tail_pad_is_configurable_and_defaults_to_one_second(watcher, clock, monkeypatch):
+async def test_tail_pad_is_configurable_and_defaults_to_three_seconds(watcher, clock, monkeypatch):
     """
-    0.5s left only ~0.3s of real trailing margin in field measurement and one
-    recording ended mid-word, so the default moved to 1.0 — and it has to be a
-    setting, not a magic number, so it can be tuned per node.
+    Field measurement showed the grant->speech offset runs ~0.84-1.62s, so a
+    1.0s pad let short calls' windows close before voice audio even started
+    (clipping mid-word). The default moved to 3.0 — and it has to be a
+    setting, not a magic number, so it can be tuned per node without a code
+    change (and so tests can prove it isn't hardcoded anywhere downstream).
     """
-    assert settings.call_tail_pad_seconds == 1.0
+    assert settings.call_tail_pad_seconds == 3.0
 
-    monkeypatch.setattr(settings, "call_tail_pad_seconds", 2.5)
+    monkeypatch.setattr(settings, "call_tail_pad_seconds", 5.0)
 
     await tick(watcher, update(
         call_log=[grant(1234, clock.now)],
@@ -251,11 +253,51 @@ async def test_tail_pad_is_configurable_and_defaults_to_one_second(watcher, cloc
     edge_time = clock.now
     await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
 
-    clock.advance(settings.call_idle_timeout + 1.0)
+    # Advance well past both the idle timeout AND the monkeypatched 5.0s pad so
+    # the "now" cap in _handle_channels never masks the pad value under test.
+    clock.advance(settings.call_idle_timeout + 6.0)
     await tick(watcher, update(channels=[channel()]))
 
     payload = watcher.on_call_end.call_args[0][0]
-    assert payload["ended_at_epoch"] == pytest.approx(edge_time + 2.5)
+    assert payload["ended_at_epoch"] == pytest.approx(edge_time + 5.0)
+
+
+@pytest.mark.asyncio
+async def test_short_call_window_now_covers_delayed_voice_arrival(watcher, clock):
+    """
+    Regression test for the truncation bug: a ~0.97s control-channel call
+    (grant to srcaddr-drop) previously closed its window at
+    last_tx_end + 1.0s pad, i.e. ~1.97s after the grant — but field
+    measurement shows voice audio doesn't start until ~1.5s after the grant
+    (0.84-1.62s measured), so the old window left as little as ~0.4s of
+    captured speech and clipped it mid-word.
+
+    With the 3.0s default pad, the same short call's window must extend well
+    past the ~1.5s point where voice actually starts.
+    """
+    call_start = clock.now
+    await tick(watcher, update(
+        call_log=[grant(1234, call_start)],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+
+    # The control-channel call itself is short — under 1 second.
+    clock.advance(0.97)
+    edge_time = clock.now
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+
+    clock.advance(settings.call_idle_timeout + 0.5)
+    await tick(watcher, update(channels=[channel()]))
+
+    payload = watcher.on_call_end.call_args[0][0]
+    assert payload["end_reason"] == "idle_timeout"
+
+    voice_arrival = call_start + 1.5  # measured grant->speech offset, typical case
+    assert payload["ended_at_epoch"] == pytest.approx(edge_time + settings.call_tail_pad_seconds)
+    assert payload["ended_at_epoch"] > voice_arrival, (
+        "recording window must extend past the point voice audio actually arrives, "
+        "not just past the control-channel call_log timestamps"
+    )
 
 
 @pytest.mark.asyncio

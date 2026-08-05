@@ -47,10 +47,29 @@ class Settings(BaseSettings):
     # Audio kept after the observed end of the last transmission. The srcaddr
     # 1→0 edge can be up to one poll (0.5 s) late and the encoder adds its own
     # latency, so this is the only headroom protecting the last word of a
-    # transmission — which is usually the disposition or the address. Field
-    # measurement at 0.5 s left only 0.29–0.37 s of real trailing margin and one
-    # recording ended mid-word, hence 1.0 s.
-    call_tail_pad_seconds: float = 1.0
+    # transmission — which is usually the disposition or the address.
+    #
+    # Raised 1.0 -> 3.0 after field measurement showed the recording WINDOW
+    # (anchored to OP25 control-channel timestamps) closing well before the
+    # actual voice audio arrives: grant->speech offset measured 0.84-1.62s
+    # across 7 calls (~1.5s typical). At the old 1.0s pad, a short
+    # transmission (e.g. a 0.97s control-channel call) had its window close
+    # at T+1.97 while voice didn't start until ~T+1.5 — leaving ~0.4s of
+    # captured speech, clipped mid-word. Confirmed by a 0.57s output file
+    # whose final 0.10s measured -12.2dB, louder than its own -18.2dB
+    # average (i.e. clipped speech, not trailing silence), and by two short
+    # calls that produced no "Trimmed" log line at all because there was no
+    # trailing silence left to trim.
+    #
+    # Safe to be generous here: trim_silence already strips trailing silence
+    # back to trim_silence_guard_seconds before upload, so a larger pad costs
+    # long calls nothing (the extra is trimmed away) while giving short
+    # transmissions enough window to actually capture the voice. Over-capture
+    # is free; under-capture loses words permanently. Do not tune this back
+    # down without new field data showing the grant->speech offset has
+    # shrunk — see DEFERRED.md for the call_idle_timeout coupling this value
+    # now sits at.
+    call_tail_pad_seconds: float = 3.0
 
     # Strip leading/trailing dead air before upload. ~63% of a typical recording
     # is silence (the grant→speech delay plus the tail pad), which inflates

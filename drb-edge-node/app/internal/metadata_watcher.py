@@ -58,8 +58,13 @@ def _tail_pad() -> float:
     edge (up to one poll late) plus encoder latency never clips the tail.
 
     Read live from settings (env CALL_TAIL_PAD_SECONDS) rather than frozen into a
-    module constant, so it is tunable per node. See the setting for why the
-    default moved 0.5 → 1.0.
+    module constant, so it is tunable per node. See the setting in config.py for
+    why the default moved 1.0 → 3.0 (short calls' recording window was closing
+    before the ~1.5s grant→speech offset let voice audio even start).
+
+    Only the idle-timeout close path below uses this pad — the tgid_change and
+    tgid_change_unlogged paths close at an exact, already-known boundary (the
+    new grant's timestamp, or the same poll tick) and intentionally add none.
     """
     return settings.call_tail_pad_seconds
 
