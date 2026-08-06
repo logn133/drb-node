@@ -1,160 +1,218 @@
 """
-Unit tests for silence-trim decision logic.
+Unit tests for silence trimming, now a byte-offset slice of raw PCM.
 
-`speech_bounds` is pure on purpose so the "what do we keep" decision — the part
-that can destroy a transmission if it is wrong — is testable without FFmpeg.
-The numbers below come from ffmpeg silencedetect run against six real recordings
-off a live P25 node: 1.71–2.45 s of leading silence and 0.00–1.11 s trailing.
+`keep_window` is pure on purpose so the "what do we keep" decision — the part
+that can destroy a transmission if it is wrong — stays testable without any
+audio at all. The rest of the file drives the real detector over synthesised
+buffers shaped like the six real recordings measured off a live P25 node:
+1.71-2.45 s of leading silence and 0.00-1.11 s trailing.
+
+The old implementation shelled out to FFmpeg twice (silencedetect, then a
+re-encode) and these tests parsed its stderr. Both passes are gone; the recorder
+buffers PCM, so detection is arithmetic and the cut is a slice.
 """
+from array import array
+
 import pytest
 
+from app.config import settings
+from app.internal import audio_trim, pcm
 from app.internal.audio_trim import (
     TrimResult,
-    _parse_duration,
-    _parse_silences,
-    speech_bounds,
+    first_signal_offset,
+    keep_window,
+    last_signal_offset,
+    trim_pcm,
 )
 
 GUARD = 0.25
+SPEECH_LEVEL = 4096   # -18 dBFS, the measured field average
+FLOOR_LEVEL = 1       # -90.3 dBFS, the measured digital-silence floor
 
 
-def test_leading_silence_is_trimmed_with_a_guard_margin():
-    # Real shape of file f4bfaa1f: 1.85s lead, 0.34s trail, 4.54s total.
-    regions = [(0.0, 1.85), (4.20, None)]
-    start, end, all_silence = speech_bounds(regions, duration=4.54, guard=GUARD)
-
-    assert not all_silence
-    assert start == pytest.approx(1.85 - GUARD)
-    assert end == pytest.approx(4.20 + GUARD)
-    # The guard must never eat into detected speech.
-    assert start < 1.85 and end > 4.20
+def speech(seconds: float) -> bytes:
+    count = int(pcm.SAMPLE_RATE * seconds)
+    return array("h", [SPEECH_LEVEL, -SPEECH_LEVEL] * (count // 2)).tobytes()
 
 
-def test_guard_margin_never_runs_past_the_file_bounds():
-    regions = [(0.0, 0.10), (3.95, None)]
-    start, end, _ = speech_bounds(regions, duration=4.0, guard=1.0)
-
-    assert start == 0.0
-    assert end == 4.0
-
-
-def test_trailing_silence_is_trimmed_when_ffmpeg_closes_the_region_at_eof():
-    """
-    FFmpeg 6.x flushes a `silence_end` at EOF, so a trailing region looks closed.
-    Treating "no silence_end" as the only trailing signal silently disabled tail
-    trimming entirely — verified against ffmpeg 6.1.1.
-    """
-    # Real ffmpeg 6.1.1 output for a 2s-silence + 1.5s-tone + 1s-silence file.
-    regions = [(0.0, 2.05361), (3.56367, 4.63102)]
-    start, end, all_silence = speech_bounds(regions, duration=4.65, guard=GUARD)
-
-    assert not all_silence
-    assert start == pytest.approx(2.05361 - GUARD)
-    assert end == pytest.approx(3.56367 + GUARD), "the trailing second must be trimmed"
-
-
-def test_all_silence_survives_ffmpeg_closing_the_region_at_eof():
-    # Real ffmpeg 6.1.1 output for a 4s file of pure silence.
-    _, _, all_silence = speech_bounds([(0.0, 4.0)], duration=4.03, guard=GUARD)
-    assert all_silence
-
-
-def test_trailing_silence_that_does_not_reach_eof_is_left_alone():
-    """
-    A silence region with a closing silence_end is an internal pause between
-    transmissions, not dead air at the tail. Trimming it would cut the middle
-    out of a conversation.
-    """
-    regions = [(0.0, 1.9), (5.0, 7.5)]
-    start, end, _ = speech_bounds(regions, duration=12.0, guard=GUARD)
-
-    assert start == pytest.approx(1.9 - GUARD)
-    assert end == 12.0, "an internal pause must not shorten the file"
-
-
-def test_no_silence_detected_keeps_the_whole_file():
-    start, end, all_silence = speech_bounds([], duration=6.0, guard=GUARD)
-
-    assert (start, end) == (0.0, 6.0)
-    assert not all_silence
-
-
-def test_silence_starting_late_is_not_treated_as_leading():
-    """Only a region at the very head counts as leading silence."""
-    regions = [(1.20, 2.00)]
-    start, end, _ = speech_bounds(regions, duration=5.0, guard=GUARD)
-
-    assert start == 0.0, "speech before 1.20s must not be trimmed away"
-    assert end == 5.0
-
-
-def test_all_silence_is_reported_not_trimmed_to_nothing():
-    # One region covering the whole file and running to EOF.
-    regions = [(0.0, None)]
-    start, end, all_silence = speech_bounds(regions, duration=4.0, guard=GUARD)
-
-    assert all_silence
-    assert (start, end) == (0.0, 4.0), "an all-silence file must not become zero-length"
-
-
-def test_all_silence_when_head_and_tail_regions_overlap():
-    regions = [(0.0, 3.2), (3.0, None)]
-    _, _, all_silence = speech_bounds(regions, duration=4.0, guard=GUARD)
-
-    assert all_silence
+def silence(seconds: float, level: int = FLOOR_LEVEL) -> bytes:
+    count = int(pcm.SAMPLE_RATE * seconds)
+    return array("h", [level, -level] * (count // 2)).tobytes()
 
 
 # ---------------------------------------------------------------------------
-# FFmpeg output parsing
+# keep_window — the pure decision
 # ---------------------------------------------------------------------------
 
-# Verbatim shape of ffmpeg 6.1.1 output.
-FFMPEG_STDERR = """
-Input #0, mp3, from '/recordings/x.mp3':
-  Duration: 00:00:04.70, start: 0.050113, bitrate: 16 kb/s
-[silencedetect @ 0000029160e63f40] silence_start: 0
-[silencedetect @ 0000029160e63f40] silence_end: 2.05361 | silence_duration: 2.05361
-[silencedetect @ 0000029160e63f40] silence_start: 3.56367
-[silencedetect @ 0000029160e63f40] silence_end: 4.63102 | silence_duration: 1.06735
-[out#0/null @ 0x2] video:0kB audio:97kB
-"""
-
-FFMPEG_STDERR_OPEN_TAIL = """
-  Duration: 00:00:04.54, start: 0.000000, bitrate: 16 kb/s
-[silencedetect @ 0x1] silence_start: 0
-[silencedetect @ 0x1] silence_end: 1.85042 | silence_duration: 1.85042
-[silencedetect @ 0x1] silence_start: 4.20134
-"""
+def test_guard_margin_is_kept_around_detected_speech():
+    guard = pcm.byte_offset(GUARD)
+    start, end = keep_window(
+        first_signal=pcm.byte_offset(1.85),
+        last_signal=pcm.byte_offset(4.20),
+        total_bytes=pcm.byte_offset(4.54),
+        guard_bytes=guard,
+    )
+    assert pcm.seconds(start) == pytest.approx(1.85 - GUARD, abs=0.001)
+    assert pcm.seconds(end) == pytest.approx(4.20 + GUARD, abs=0.001)
 
 
-def test_duration_is_corrected_for_the_mp3_container_start_offset():
+def test_guard_margin_never_runs_past_the_buffer_bounds():
+    total = pcm.byte_offset(4.0)
+    start, end = keep_window(
+        first_signal=pcm.byte_offset(0.10),
+        last_signal=pcm.byte_offset(3.95),
+        total_bytes=total,
+        guard_bytes=pcm.byte_offset(1.0),
+    )
+    assert (start, end) == (0, total)
+
+
+def test_keep_window_offsets_are_sample_aligned():
+    start, end = keep_window(3, 9, 21, 1)
+    assert start % pcm.FRAME_BYTES == 0
+    assert end % pcm.FRAME_BYTES == 0
+
+
+def test_no_signal_found_keeps_everything():
+    total = pcm.byte_offset(6.0)
+    assert keep_window(None, None, total, pcm.byte_offset(GUARD)) == (0, total)
+
+
+def test_an_inverted_window_degrades_to_keeping_everything():
+    """Never return an empty slice, whatever the inputs say."""
+    total = pcm.byte_offset(4.0)
+    assert keep_window(pcm.byte_offset(3.0), pcm.byte_offset(0.5), total, 0) == (0, total)
+
+
+# ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
+
+def test_first_and_last_signal_are_found_in_a_realistic_recording():
+    audio = silence(1.85) + speech(2.35) + silence(0.34)
+    threshold = -40.0
+
+    first = first_signal_offset(audio, threshold)
+    last = last_signal_offset(audio, threshold)
+
+    assert pcm.seconds(first) == pytest.approx(1.85, abs=audio_trim.ANALYSIS_WINDOW_SECONDS)
+    assert pcm.seconds(last) == pytest.approx(4.20, abs=audio_trim.ANALYSIS_WINDOW_SECONDS)
+
+
+def test_internal_pauses_are_not_treated_as_the_tail():
+    """Trimming the middle out of a conversation would be unrecoverable."""
+    audio = silence(1.9) + speech(3.1) + silence(2.5) + speech(4.5)
+    last = last_signal_offset(audio, -40.0)
+    assert pcm.seconds(last) == pytest.approx(12.0, abs=audio_trim.ANALYSIS_WINDOW_SECONDS)
+
+
+def test_all_silence_returns_no_signal_offset():
+    assert first_signal_offset(silence(4.0), -40.0) is None
+    assert last_signal_offset(silence(4.0), -40.0) is None
+
+
+def test_the_scan_is_bounded_so_a_long_buffer_cannot_stall_the_upload():
+    """The per-sample loop is the only unbounded cost; it must have a ceiling."""
+    audio = silence(2.0)
+    assert first_signal_offset(audio, -40.0, limit_seconds=0.5) is None
+    assert first_signal_offset(speech(0.1) + silence(1.9), -40.0, limit_seconds=0.5) == 0
+
+
+# ---------------------------------------------------------------------------
+# trim_pcm — end to end over synthesised audio
+# ---------------------------------------------------------------------------
+
+def test_leading_and_trailing_silence_are_trimmed_to_the_guard_margin():
+    audio = silence(1.85) + speech(2.35) + silence(0.34)
+    kept, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+
+    assert result.applied and not result.all_silence
+    assert result.lead == pytest.approx(1.85 - GUARD, abs=0.05)
+    assert result.tail == pytest.approx(0.34 - GUARD, abs=0.05)
+    assert pcm.seconds(len(kept)) == pytest.approx(result.duration_after, abs=0.001)
+    assert result.duration_after < result.duration_before
+
+
+def test_the_guard_margin_never_eats_into_speech():
+    audio = silence(2.0) + speech(1.0) + silence(2.0)
+    kept, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+
+    # Everything removed from the head must be silence, and the first sample of
+    # real speech must survive.
+    assert result.lead < 2.0
+    assert pcm.seconds(len(kept)) > 1.0
+
+
+def test_measured_trailing_silence_is_reported_for_field_tuning():
     """
-    MP3 encoder delay makes the container duration longer than the audio
-    silencedetect timestamps. Without this correction the trailing-region test
-    needs a slack epsilon big enough to clip real speech.
+    The recorder deliberately over-captures the tail (it closes only after the
+    silence timeout has actually elapsed in the audio), so `tail` is how the
+    real silence run reaches the logs.
     """
-    assert _parse_duration(FFMPEG_STDERR) == pytest.approx(4.70 - 0.050113)
+    audio = silence(0.5) + speech(2.0) + silence(3.0)
+    _, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+    assert result.tail == pytest.approx(3.0 - GUARD, abs=0.05)
+    assert result.trimmed_seconds == pytest.approx(result.lead + result.tail)
 
 
-def test_duration_is_none_when_absent():
-    assert _parse_duration("no duration here") is None
+def test_an_all_silence_buffer_is_reported_not_truncated_to_nothing():
+    audio = silence(4.0)
+    kept, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+
+    assert result.all_silence
+    assert not result.applied
+    assert kept == audio, "an all-silence recording must not become zero-length"
 
 
-def test_silence_regions_are_parsed():
-    regions = _parse_silences(FFMPEG_STDERR)
+def test_digital_silence_at_the_measured_field_floor_is_detected():
+    """
+    The -91 dBFS floor is the whole reason this needs no field calibration.
+    Detection must not depend on the threshold being tuned to a noise floor.
+    """
+    audio = silence(1.0, level=1) + speech(1.0) + silence(1.0, level=1)
+    for threshold in (-70.0, -60.0, -50.0, -40.0):
+        _, result = trim_pcm(audio, threshold_db=threshold, guard=GUARD)
+        assert result.applied, f"threshold {threshold} should still find the speech"
+        assert result.lead == pytest.approx(0.75, abs=0.05)
 
-    assert len(regions) == 2
-    assert regions[0] == (pytest.approx(0.0), pytest.approx(2.05361))
-    assert regions[1] == (pytest.approx(3.56367), pytest.approx(4.63102))
+
+def test_audio_with_no_silence_at_either_end_is_left_alone():
+    audio = speech(3.0)
+    kept, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+
+    assert not result.applied
+    assert kept == audio
+    assert result.duration_before == pytest.approx(result.duration_after)
 
 
-def test_a_region_with_no_silence_end_is_still_parsed():
-    """Older FFmpeg simply stopped reporting at EOF — keep handling that."""
-    regions = _parse_silences(FFMPEG_STDERR_OPEN_TAIL)
+def test_an_empty_buffer_is_handled():
+    kept, result = trim_pcm(b"", threshold_db=-40.0, guard=GUARD)
+    assert kept == b"" and not result.applied and not result.all_silence
 
-    assert regions[-1][1] is None
+
+def test_thresholds_default_to_settings():
+    audio = silence(1.0) + speech(1.0) + silence(1.0)
+    _, result = trim_pcm(audio)
+    assert result.applied
+    assert settings.trim_silence_threshold_db == -40.0
+    assert settings.trim_silence_guard_seconds == 0.25
+    assert result.lead == pytest.approx(1.0 - settings.trim_silence_guard_seconds, abs=0.05)
+
+
+def test_a_scan_that_gives_up_leaves_the_audio_untouched_and_says_so():
+    """
+    Refusing to guess is the point: an untrimmed upload is always better than a
+    wrongly-truncated one, and better than dropping a call as "all silence"
+    without having actually looked at all of it.
+    """
+    long_silence = silence(audio_trim.MAX_SCAN_SECONDS + 5.0)
+    kept, result = trim_pcm(long_silence, threshold_db=-40.0, guard=GUARD)
+
+    assert result.scan_truncated
+    assert not result.all_silence
+    assert not result.applied
+    assert kept == long_silence
 
 
 def test_trim_result_reports_total_trimmed():
-    result = TrimResult(path=None, lead=1.9, tail=0.35)
-    assert result.trimmed_seconds == pytest.approx(2.25)
+    assert TrimResult(lead=1.9, tail=0.35).trimmed_seconds == pytest.approx(2.25)

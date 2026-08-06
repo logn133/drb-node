@@ -34,49 +34,80 @@ class Settings(BaseSettings):
     # Bounded wait for the shared PulseAudio socket before launching FFmpeg.
     pulse_wait_timeout: float = 30.0
 
-    # Call segmentation — seconds with no active transmission before the current
-    # recording is closed out. Consecutive grants on the SAME talkgroup inside this
-    # window are kept in one recording so back-and-forth traffic stays together.
+    # ------------------------------------------------------------------
+    # Call segmentation
     #
-    # Do NOT tune this against measured *audio* silence: audio gaps also contain
-    # the ~1.9 s P25 grant→speech delay, so they are always longer than the
-    # control-channel idle this timer measures. metadata_watcher logs the real
-    # measured idle on every idle-timeout close — tune from that.
+    # Boundaries come from the AUDIO, not the control channel. A recording
+    # starts at voice onset and ends after call_silence_timeout seconds of
+    # silence actually heard in the stream. See internal/metadata_watcher.py
+    # for why the control channel is no longer trusted for either edge.
+    # ------------------------------------------------------------------
+
+    # Seconds of continuous silence IN THE AUDIO before the current recording is
+    # closed. This is the primary segmentation control. Consecutive
+    # transmissions on the SAME talkgroup separated by less than this stay in
+    # one recording, so back-and-forth traffic is one file.
+    #
+    # Defaults to 3.0 to match the behaviour of the control-channel idle timer
+    # it replaces, but it is NOT the same clock: this one measures real silence
+    # in the audio, with no grant->speech delay mixed in. metadata_watcher logs
+    # the measured trailing silence on every close — tune from that number.
+    call_silence_timeout: float = 3.0
+
+    # dBFS (RMS, measured over one ~46ms capture chunk) below which audio counts
+    # as silence for the purpose of ending a recording.
+    #
+    # This does NOT need field calibration against radio noise. Between
+    # transmissions the capture is the monitor of a PulseAudio *null sink*,
+    # which emits digital silence, not an analog noise floor: measured on a live
+    # node the gap sits at about -91 dBFS, i.e. one least-significant bit of a
+    # 16-bit sample. Speech on the same node averages about -18 dBFS. Anything
+    # between roughly -70 and -40 therefore behaves identically; -50 is chosen
+    # to sit far below even quiet speech while staying far above the floor.
+    call_silence_threshold_db: float = -50.0
+
+    # DEPRECATED as a primary control — used ONLY in console fallback mode, i.e.
+    # when PulseAudio capture is not producing audio and there is nothing to
+    # segment on. Then, and only then, the old control-channel state machine
+    # runs and closes a segment this many seconds after the last observed
+    # transmission. Those segments carry no audio; they exist so the node keeps
+    # reporting real radio activity to C2 while its audio path is broken.
+    #
+    # Do NOT tune this against measured *audio* silence — use
+    # call_silence_timeout for that.
     call_idle_timeout: float = 3.0
 
-    # Audio kept after the observed end of the last transmission. The srcaddr
-    # 1→0 edge can be up to one poll (0.5 s) late and the encoder adds its own
-    # latency, so this is the only headroom protecting the last word of a
-    # transmission — which is usually the disposition or the address.
+    # Audio kept past a CONSOLE-DERIVED segment boundary, covering the fact that
+    # buffered audio lags control-channel timestamps by ~1.5s (grant->speech
+    # offset measured 0.84-1.62s across 7 field calls).
     #
-    # Raised 1.0 -> 3.0 after field measurement showed the recording WINDOW
-    # (anchored to OP25 control-channel timestamps) closing well before the
-    # actual voice audio arrives: grant->speech offset measured 0.84-1.62s
-    # across 7 calls (~1.5s typical). At the old 1.0s pad, a short
-    # transmission (e.g. a 0.97s control-channel call) had its window close
-    # at T+1.97 while voice didn't start until ~T+1.5 — leaving ~0.4s of
-    # captured speech, clipped mid-word. Confirmed by a 0.57s output file
-    # whose final 0.10s measured -12.2dB, louder than its own -18.2dB
-    # average (i.e. clipped speech, not trailing silence), and by two short
-    # calls that produced no "Trimmed" log line at all because there was no
-    # trailing silence left to trim.
+    # Still needed, with a narrower job than before. It no longer pads the
+    # normal end of a call — that boundary now comes from the audio itself and
+    # needs no pad at all. It applies to the three boundaries that are still
+    # control-channel timestamps:
     #
-    # Safe to be generous here: trim_silence already strips trailing silence
-    # back to trim_silence_guard_seconds before upload, so a larger pad costs
-    # long calls nothing (the extra is trimmed away) while giving short
-    # transmissions enough window to actually capture the voice. Over-capture
-    # is free; under-capture loses words permanently. Do not tune this back
-    # down without new field data showing the grant->speech offset has
-    # shrunk — see DEFERRED.md for the call_idle_timeout coupling this value
-    # now sits at.
+    #   tgid_change            close the outgoing call at the new grant + pad
+    #   tgid_change_unlogged   close at the observing poll + pad
+    #   idle_timeout           console fallback mode only
+    #
+    # Safe to be generous: trim_silence strips trailing silence back to
+    # trim_silence_guard_seconds before upload, so a larger pad costs long calls
+    # nothing. Over-capture is free; under-capture loses words permanently. If
+    # the outgoing and incoming recordings overlap in the underlying audio
+    # because of this pad, that is correct — the audio contains both.
     call_tail_pad_seconds: float = 3.0
 
-    # Strip leading/trailing dead air before upload. ~63% of a typical recording
-    # is silence (the grant→speech delay plus the tail pad), which inflates
-    # Whisper cost and is a well-documented trigger for hallucinated transcript
-    # text. Trimming is conservative — see internal/audio_trim.py.
+    # Strip leading/trailing dead air before upload. A recording deliberately
+    # over-captures at both ends (pre-roll at the head, the whole measured
+    # silence run at the tail), which inflates Whisper cost and is a
+    # well-documented trigger for hallucinated transcript text. Trimming is a
+    # sample-offset slice of the buffered PCM — no re-encode — and only ever
+    # touches the head and tail. See internal/audio_trim.py.
     trim_silence: bool = True
-    # Anything quieter than this counts as silence for detection purposes.
+    # dBFS (RMS) below which audio counts as silence when trimming the ends.
+    # Kept above call_silence_threshold_db on purpose: the closer must not miss
+    # speech (permissive), the trimmer must not leave dead air (stricter), and
+    # trim_silence_guard_seconds protects the syllable either way.
     trim_silence_threshold_db: float = -40.0
     # Guard margin kept around detected speech so no syllable is clipped.
     trim_silence_guard_seconds: float = 0.25

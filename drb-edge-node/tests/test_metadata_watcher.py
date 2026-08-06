@@ -1,15 +1,30 @@
 """
-Unit tests for the event-driven MetadataWatcher state machine.
+Unit tests for the MetadataWatcher segmentation state machine.
 
-Call START comes from OP25 `call_log` entries (stamped with OP25's own
-time.time()); call END comes from the srcaddr != 0 -> srcaddr == 0 transition in
-`channel_update`.  All OP25 HTTP calls are mocked — no running services required.
+TWO MODES, both covered here:
+
+  AUDIO MODE (production) — a recording STARTS at voice onset heard in the
+  captured audio and STOPS after settings.call_silence_timeout seconds of
+  silence heard in the same audio. The OP25 console supplies only the LABEL
+  (talkgroup/alias/rid), resolved at CLOSE time from a rolling history, and the
+  forced SPLIT when the talkgroup changes with no silence between calls.
+
+  CONSOLE FALLBACK (capture down) — the older state machine: `call_log` grants
+  start segments, the srcaddr != 0 -> 0 edge plus call_idle_timeout ends them.
+  Tests that wire no audio provider exercise this path, which is exactly the
+  behaviour a node falls back to when PulseAudio is not producing audio.
+
+All OP25 HTTP calls are mocked — no running services required.
 """
 import pytest
 from unittest.mock import AsyncMock, patch
 
 from app.config import settings
+from app.internal.call_recorder import AudioActivity
 from app.internal.metadata_watcher import (
+    ATTRIBUTION_LOOKAHEAD_SECONDS,
+    ATTRIBUTION_LOOKBACK_SECONDS,
+    MAX_SEGMENT_SECONDS,
     MetadataWatcher,
     OP25_OFFLINE_GRACE,
 )
@@ -37,10 +52,63 @@ def clock():
 
 @pytest.fixture
 def watcher(clock):
+    """Console fallback mode: no audio provider wired, capture assumed down."""
     w = MetadataWatcher()
     w._clock = clock
     w.on_call_start = AsyncMock()
     w.on_call_end = AsyncMock()
+    return w
+
+
+class FakeAudio:
+    """
+    Stands in for CallRecorder.audio_activity.
+
+    Mirrors the recorder's own rule for what starts a new voice RUN: a
+    non-silent chunk more than settings.call_silence_timeout after the previous
+    one. Tests drive it with speak()/quiet() instead of synthesising PCM, so the
+    segmentation logic is tested independently of the detector.
+    """
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.capturing = True
+        self.recording = False
+        self.last_voice = None
+        self.onset = None
+
+    def speak(self, at=None):
+        """Mark voice heard now (or at `at`)."""
+        moment = self.clock.now if at is None else at
+        if self.last_voice is None or (moment - self.last_voice) >= settings.call_silence_timeout:
+            self.onset = moment
+        self.last_voice = moment
+        return moment
+
+    def __call__(self) -> AudioActivity:
+        silence = 0.0 if self.last_voice is None else max(0.0, self.clock.now - self.last_voice)
+        return AudioActivity(
+            capturing=self.capturing,
+            recording=self.recording,
+            last_voice_epoch=self.last_voice,
+            voice_onset_epoch=self.onset,
+            silence_seconds=silence,
+        )
+
+
+@pytest.fixture
+def audio(clock):
+    return FakeAudio(clock)
+
+
+@pytest.fixture
+def hearing(clock, audio):
+    """Audio mode: the production wiring, with a controllable audio stream."""
+    w = MetadataWatcher()
+    w._clock = clock
+    w.on_call_start = AsyncMock()
+    w.on_call_end = AsyncMock()
+    w.audio_activity = audio
     return w
 
 
@@ -195,7 +263,12 @@ async def test_op25_unreachable_does_not_start_call(watcher):
 
 
 # ---------------------------------------------------------------------------
-# Call end — srcaddr edge + idle timeout
+# Console fallback: call end — srcaddr edge + idle timeout
+#
+# This is the path a node uses ONLY when PulseAudio capture is not producing
+# audio. It is measurably wrong (the srcaddr edge fires mid-word) but it is all
+# there is when there is no audio to segment on, and it keeps the node
+# reporting radio activity to C2 while the audio path is broken.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -578,3 +651,499 @@ async def test_end_never_precedes_start(watcher, clock):
 
     payload = watcher.on_call_end.call_args[0][0]
     assert payload["ended_at_epoch"] >= payload["started_at_epoch"]
+
+
+# ---------------------------------------------------------------------------
+# AUDIO MODE — boundaries from the audio, label from the console
+#
+# This is the production path. Everything above this line is the fallback that
+# only runs when PulseAudio capture is down.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_audio_onset_starts_the_recording(hearing, clock, audio):
+    """Voice onset opens the segment, and the recorder is told to slice to it."""
+    onset = audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now, tgtag="Police Dispatch")],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+
+    assert hearing.is_active
+    hearing.on_call_start.assert_called_once()
+    payload = hearing.on_call_start.call_args[0][0]
+    assert payload["driver"] == "audio"
+    # The recorder slices the ring buffer back to THIS epoch, so it has to be
+    # the audio onset, not the grant and not our detection time.
+    assert payload["started_at_epoch"] == onset
+    assert payload["tgid"] == 1234
+    assert payload["tgid_name"] == "Police Dispatch"
+    assert payload["attributed"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_grant_with_no_audio_does_not_start_a_recording(hearing, clock):
+    """
+    The grant fires 0.84-1.62s before anyone speaks. Opening on it is what put
+    seconds of dead air at the head of every recording.
+    """
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now, tgtag="Fire")],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+
+    assert not hearing.is_active
+    hearing.on_call_start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recording_closes_after_the_configured_silence(hearing, clock, audio):
+    audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now)],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+
+    clock.advance(0.5)
+    last_voice = audio.speak()
+    await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=555)]))
+
+    # Quiet, but not for long enough yet.
+    clock.advance(settings.call_silence_timeout - 0.5)
+    await tick(hearing, update(channels=[channel()]))
+    assert hearing.is_active
+    hearing.on_call_end.assert_not_called()
+
+    clock.advance(0.6)
+    await tick(hearing, update(channels=[channel()]))
+
+    assert not hearing.is_active
+    payload = hearing.on_call_end.call_args[0][0]
+    assert payload["end_reason"] == "audio_silence"
+    assert payload["tgid"] == 1234
+    # The audio ends where the silence run began plus the threshold, so the
+    # trim can measure and strip exactly that run.
+    assert payload["ended_at_epoch"] == pytest.approx(last_voice + settings.call_silence_timeout)
+
+
+@pytest.mark.asyncio
+async def test_a_false_srcaddr_drop_mid_speech_does_not_end_the_recording(hearing, clock, audio):
+    """
+    THE BUG THIS REARCHITECTURE EXISTS FOR. srcaddr can reset to 0 while someone
+    is still talking; under the old design that started the idle timer and the
+    window closed on top of live speech (recording 0ff35b20: "-1.61s lead,
+    -0.00s tail" — nothing left to trim because the cut landed mid-word).
+    """
+    audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now)],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+    call_id = hearing.active_call_id
+
+    # The control channel now says the call is over. It is wrong; the audio
+    # keeps arriving. This runs well past call_idle_timeout, which is what
+    # would have closed the segment before.
+    for _ in range(10):
+        clock.advance(0.5)
+        audio.speak()
+        await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+        assert hearing.is_active, "a false srcaddr drop must never end a recording"
+
+    assert (clock.now - hearing._started_at) > settings.call_idle_timeout
+    assert hearing.active_call_id == call_id
+    hearing.on_call_end.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_silence_close_logs_the_measured_trailing_silence(hearing, clock, audio, caplog):
+    """
+    call_silence_timeout can only be tuned from the real trailing silence, so
+    the measured number has to reach the log — the audio-mode counterpart of
+    the "measured control-channel idle" line.
+    """
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+
+    with caplog.at_level("INFO", logger="drb-edge-node"):
+        clock.advance(settings.call_silence_timeout + 0.25)
+        await tick(hearing, update(channels=[channel()]))
+
+    lines = [r.message for r in caplog.records if "measured trailing silence" in r.message]
+    assert lines, "audio closes must log the measured silence for later tuning"
+    assert "3.25s" in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_same_tgid_grant_continues_one_audio_recording(hearing, clock, audio):
+    """Back-and-forth on one talkgroup must stay a single call/recording."""
+    onset = audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now)],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+    call_id = hearing.active_call_id
+
+    # The other party keys up on the SAME tgid while audio is still flowing.
+    clock.advance(1.0)
+    audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now)],
+        channels=[channel(tgid=1234, srcaddr=777)],
+    ))
+
+    assert hearing.active_call_id == call_id, "same tgid must not open a new call"
+    hearing.on_call_start.assert_called_once()
+    hearing.on_call_end.assert_not_called()
+
+    clock.advance(settings.call_silence_timeout + 0.5)
+    await tick(hearing, update(channels=[channel()]))
+
+    hearing.on_call_end.assert_called_once()
+    payload = hearing.on_call_end.call_args[0][0]
+    assert payload["call_id"] == call_id
+    assert payload["started_at_epoch"] == onset
+    assert payload["transmissions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_different_tgid_splits_even_with_no_silence_between(hearing, clock, audio):
+    """
+    Back-to-back calls on two talkgroups with no gap. Pure audio segmentation
+    would merge them into ONE file under ONE label, which corrupts correlation.
+    The console talkgroup change has to force the cut.
+    """
+    audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1111, clock.now, tgtag="Fire")],
+        channels=[channel(tgid=1111, srcaddr=1)],
+    ))
+    first_id = hearing.active_call_id
+
+    clock.advance(2.0)
+    audio.speak()  # still talking — no silence anywhere in this test
+    split = clock.now
+    await tick(hearing, update(
+        call_log=[grant(2222, split, tgtag="EMS")],
+        channels=[channel(tgid=2222, srcaddr=2)],
+    ))
+
+    hearing.on_call_end.assert_called_once()
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["call_id"] == first_id
+    assert ended["tgid"] == 1111
+    assert ended["end_reason"] == "tgid_change"
+    # Padded past the split: buffered audio lags the control channel, so cutting
+    # at the exact grant timestamp clipped the outgoing call's last words. The
+    # overlap between the two slices is correct.
+    assert ended["ended_at_epoch"] == split + settings.call_tail_pad_seconds
+
+    assert hearing.is_active and hearing.current_tgid == 2222
+    assert hearing.active_call_id != first_id
+    assert hearing.on_call_start.call_count == 2
+    assert hearing.on_call_start.call_args[0][0]["started_at_epoch"] == split
+
+
+@pytest.mark.asyncio
+async def test_an_unlogged_tgid_change_also_splits_and_reopens(hearing, clock, audio):
+    """
+    OP25's call_log deque is capped at 10, so grants get dropped. If our only
+    receiver is plainly on another talkgroup the segment is over — and in audio
+    mode a new one must open immediately or the audio would be dropped on the
+    floor until the next voice run.
+    """
+    audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1111, clock.now)],
+        channels=[channel(tgid=1111, srcaddr=1)],
+    ))
+    first_id = hearing.active_call_id
+
+    clock.advance(1.0)
+    audio.speak()
+    await tick(hearing, update(channels=[channel(tgid=3333, srcaddr=7)]))  # no call_log
+
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["call_id"] == first_id
+    assert ended["end_reason"] == "tgid_change_unlogged"
+    assert hearing.is_active and hearing.current_tgid == 3333
+
+
+@pytest.mark.asyncio
+async def test_max_length_backstop_closes_and_reopens(hearing, clock, audio):
+    """
+    A talkgroup that never goes quiet must not produce an unbounded recording —
+    but the audio must not be dropped either, so the segment is immediately
+    reopened rather than simply abandoned.
+    """
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+    first_id = hearing.active_call_id
+
+    clock.advance(MAX_SEGMENT_SECONDS / 2)
+    audio.speak()
+    await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=5)]))
+    assert hearing.active_call_id == first_id
+
+    clock.advance(MAX_SEGMENT_SECONDS / 2 + 1)
+    audio.speak()
+    await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=5)]))
+
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["call_id"] == first_id
+    assert ended["end_reason"] == "max_length"
+    assert hearing.is_active, "a still-live transmission must not be dropped at the cap"
+    assert hearing.active_call_id != first_id
+    assert hearing.on_call_start.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Attribution: resolved at close, from a bounded rolling console history
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_orphan_audio_is_discarded_flagged_and_counted(hearing, clock, audio, caplog):
+    """
+    Audio with no console talkgroup anywhere near it — Liquidsoap fallback, a
+    test tone, stray noise, a dropped call_log. It must be impossible to miss
+    and must never be uploaded: an untagged call poisons correlation.
+    """
+    audio.speak()
+    await tick(hearing, update())  # console says nothing at all
+
+    assert hearing.is_active
+    started = hearing.on_call_start.call_args[0][0]
+    assert started["tgid"] is None
+    assert started["attributed"] is False
+
+    with caplog.at_level("ERROR", logger="drb-edge-node"):
+        clock.advance(settings.call_silence_timeout + 0.5)
+        await tick(hearing, update())
+
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["attributed"] is False
+    assert ended["tgid"] is None
+    assert hearing.unattributed_segments == 1
+    assert any("ORPHAN AUDIO" in r.message for r in caplog.records), \
+        "unattributed audio must be loud in the logs, not silent"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_before_audio_onset_still_attributes_the_recording(hearing, clock, audio):
+    """
+    The common ordering: the console grants the channel, then 0.84-1.62s later
+    (plus pipeline lag) the audio shows up. The lookback has to cover it.
+    """
+    grant_time = clock.now
+    await tick(hearing, update(call_log=[grant(1234, grant_time, tgtag="Fire")]))
+    assert not hearing.is_active
+
+    clock.advance(2.0)
+    audio.speak()
+    await tick(hearing, update())  # console says nothing NOW
+
+    assert hearing.is_active
+    payload = hearing.on_call_start.call_args[0][0]
+    assert payload["tgid"] == 1234
+    assert payload["tgid_name"] == "Fire"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_after_audio_onset_attributes_the_recording_late(hearing, clock, audio):
+    """
+    There is no guaranteed ordering: the console is polled every 500ms, so the
+    grant can land after voice onset. The segment starts unattributed and picks
+    the talkgroup up part-way through — expected, and fine.
+    """
+    audio.speak()
+    await tick(hearing, update())
+
+    assert hearing.is_active
+    assert hearing.on_call_start.call_args[0][0]["attributed"] is False
+
+    clock.advance(0.5)
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now, tgtag="EMS")]))
+    assert hearing.current_tgid == 1234
+
+    clock.advance(settings.call_silence_timeout + 0.5)
+    await tick(hearing, update())
+
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["attributed"] is True
+    assert ended["tgid"] == 1234
+    assert ended["tgid_name"] == "EMS"
+    assert hearing.unattributed_segments == 0
+
+
+@pytest.mark.asyncio
+async def test_attribution_resolves_from_a_channel_row_when_the_grant_was_dropped(hearing, clock, audio):
+    """A dropped grant is survivable: an active channel row names the talkgroup."""
+    audio.speak()
+    await tick(hearing, update())
+    assert hearing.on_call_start.call_args[0][0]["tgid"] is None
+
+    clock.advance(0.5)
+    audio.speak()
+    await tick(hearing, update(channels=[channel(tgid=4321, srcaddr=99, tag="Sheriff")]))
+
+    clock.advance(settings.call_silence_timeout + 0.5)
+    await tick(hearing, update())
+
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["tgid"] == 4321
+    assert ended["attributed"] is True
+
+
+@pytest.mark.asyncio
+async def test_console_activity_outside_the_tolerance_does_not_attribute(hearing, clock, audio):
+    """
+    The tolerance is deliberately bounded. A grant from long before the audio is
+    not evidence about this audio, and borrowing it would be worse than
+    admitting the audio is unattributed.
+    """
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+
+    clock.advance(ATTRIBUTION_LOOKBACK_SECONDS + 5.0)
+    audio.speak()
+    await tick(hearing, update())
+
+    assert hearing.is_active
+    assert hearing.on_call_start.call_args[0][0]["tgid"] is None
+    assert ATTRIBUTION_LOOKAHEAD_SECONDS > 0
+
+
+@pytest.mark.asyncio
+async def test_a_directly_stated_talkgroup_is_not_overruled_at_close(hearing, clock, audio, caplog):
+    """
+    The attribution window extends past the audio on purpose, so a neighbouring
+    call's console activity can fall inside it. An inference over that window
+    must never overrule a talkgroup the console stated outright — but the
+    overlap does mean the split logic missed something, so it is logged.
+    """
+    audio.speak()
+    await tick(hearing, update(
+        call_log=[grant(1111, clock.now, tgtag="Fire")],
+        channels=[channel(tgid=1111, srcaddr=1)],
+    ))
+
+    # A second talkgroup is busy on ANOTHER receiver, so no split fires, and it
+    # produces more console observations than ours did.
+    for _ in range(4):
+        clock.advance(0.5)
+        audio.speak()
+        await tick(hearing, update(channels=[
+            channel(tgid=1111, srcaddr=0, hold_tgid=1111),
+            channel(tgid=2222, srcaddr=7),
+        ]))
+
+    with caplog.at_level("WARNING", logger="drb-edge-node"):
+        clock.advance(settings.call_silence_timeout + 0.5)
+        await tick(hearing, update())
+
+    ended = hearing.on_call_end.call_args[0][0]
+    assert ended["tgid"] == 1111, "the console said 1111 directly; inference must not overrule it"
+    assert any("split logic should have fired" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_the_same_voice_run_does_not_reopen_a_second_recording(hearing, clock, audio):
+    """A closed run must stay closed; only NEW audio opens the next segment."""
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+
+    clock.advance(settings.call_silence_timeout + 0.5)
+    await tick(hearing, update())
+    assert not hearing.is_active
+
+    # Several more quiet polls must not resurrect it.
+    for _ in range(3):
+        clock.advance(0.5)
+        await tick(hearing, update())
+    assert not hearing.is_active
+    assert hearing.on_call_start.call_count == 1
+
+    # ...but the next voice run does open a new segment.
+    clock.advance(1.0)
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+    assert hearing.is_active
+    assert hearing.on_call_start.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Mode changes: capture loss, console loss
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_losing_capture_closes_an_audio_segment(hearing, clock, audio):
+    """
+    An audio-driven segment must never hang open when the audio stops arriving:
+    with no chunks there is no silence to detect, so the mode change is the
+    thing that has to close it.
+    """
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+    assert hearing.is_active
+
+    audio.capturing = False
+    clock.advance(0.5)
+    await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=555)]))
+
+    assert not hearing.is_active
+    assert hearing.on_call_end.call_args[0][0]["end_reason"] == "capture_lost"
+
+
+@pytest.mark.asyncio
+async def test_console_segmentation_takes_over_while_capture_is_down(hearing, clock, audio):
+    """
+    No audio means no recordings, but the node must still report real radio
+    activity to C2 rather than going silent about it.
+    """
+    audio.capturing = False
+
+    await tick(hearing, update(
+        call_log=[grant(1234, clock.now, tgtag="Police")],
+        channels=[channel(tgid=1234, srcaddr=555)],
+    ))
+    assert hearing.is_active
+    assert hearing.on_call_start.call_args[0][0]["driver"] == "console"
+
+    clock.advance(0.5)
+    await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+    clock.advance(settings.call_idle_timeout + 0.5)
+    await tick(hearing, update(channels=[channel()]))
+
+    assert not hearing.is_active
+    assert hearing.on_call_end.call_args[0][0]["end_reason"] == "idle_timeout"
+
+
+@pytest.mark.asyncio
+async def test_op25_unreachable_still_closes_an_audio_segment(hearing, clock, audio):
+    """Without the console there is no attribution, so there is nothing to keep open."""
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now)]))
+
+    clock.advance(OP25_OFFLINE_GRACE + 0.5)
+    audio.speak()
+    await tick(hearing, None)
+
+    assert not hearing.is_active
+    assert hearing.on_call_end.call_args[0][0]["end_reason"] == "op25_unreachable"
+
+
+@pytest.mark.asyncio
+async def test_console_history_is_bounded(hearing, clock, audio):
+    """A rolling history that grows without limit would be a slow memory leak."""
+    from app.internal.metadata_watcher import CONSOLE_HISTORY_MAX, CONSOLE_HISTORY_SECONDS
+
+    for _ in range(CONSOLE_HISTORY_MAX + 200):
+        clock.advance(0.05)
+        await tick(hearing, update(channels=[channel(tgid=1234, srcaddr=5)]))
+
+    assert len(hearing._console) <= CONSOLE_HISTORY_MAX
+
+    # ...and old entries age out even when the count is low.
+    clock.advance(CONSOLE_HISTORY_SECONDS + 1)
+    await tick(hearing, update())
+    assert all(e.epoch >= clock.now - CONSOLE_HISTORY_SECONDS for e in hearing._console)

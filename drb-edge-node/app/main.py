@@ -30,21 +30,56 @@ def _iso(epoch: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
+# call_ids whose `call_start` has already gone out over MQTT. A segment can open
+# before its talkgroup is known (audio onset can precede the OP25 grant), and
+# C2's _on_call_start writes talkgroup_id straight into a new Firestore `calls`
+# doc — publishing early with tgid=None would create a permanently untagged call.
+# So the start is held back until attribution succeeds, and replayed just before
+# the end event if it resolved late.
+_published_starts: set = set()
+
+
 async def on_call_start(data: dict):
     radio_bot.start_stream()
     await mqtt_manager.publish_status("recording")
-    await mqtt_manager.publish_metadata("call_start", data)
-    # started_at_epoch is OP25's own call_log timestamp — the recorder slices the
-    # ring buffer back to it (minus pre-roll), so however late we detected the
-    # grant, the audio still starts in the right place.
+    # started_at_epoch is the detected voice onset (or, in console fallback mode,
+    # OP25's call_log timestamp). The recorder slices the ring buffer back to it
+    # minus the pre-roll, so however late the poll loop noticed, the audio still
+    # starts in the right place.
     await call_recorder.start_recording(
         data["call_id"],
         start_epoch=data.get("started_at_epoch"),
     )
 
+    if data.get("attributed", True):
+        _published_starts.add(data["call_id"])
+        await mqtt_manager.publish_metadata("call_start", data)
+    else:
+        logger.info(
+            f"Call {data['call_id']} started on audio onset with no talkgroup yet — holding the "
+            "call_start event until the console attributes it."
+        )
+
 
 async def on_call_end(data: dict):
     radio_bot.stop_stream()
+    call_id = data["call_id"]
+    published_start = call_id in _published_starts
+    _published_starts.discard(call_id)
+
+    if not data.get("attributed", True):
+        # ORPHAN AUDIO. metadata_watcher has already logged the details at ERROR.
+        # The audio is dropped rather than uploaded: a call with no talkgroup is
+        # worse than no call at all, because it silently poisons correlation.
+        await call_recorder.discard_recording()
+        if published_start:
+            # Should not happen (attribution only ever improves), but if a start
+            # did go out, the doc must not be left hanging in "active".
+            data["audio_skipped"] = "unattributed"
+            await mqtt_manager.publish_metadata("call_end", data)
+        await mqtt_manager.publish_status("online")
+        return
+
     recording = await call_recorder.stop_recording(end_epoch=data.get("ended_at_epoch"))
 
     if recording is not None and recording.path is not None:
@@ -89,6 +124,18 @@ async def on_call_end(data: dict):
             "— PulseAudio capture may be down (check the op25 container and "
             f"the {settings.pulse_source} source)."
         )
+
+    if not published_start:
+        # Attribution arrived after the segment opened. Replay the start so C2
+        # creates the `calls` doc with the right talkgroup before the end event
+        # updates it.
+        start_payload = {
+            key: data[key]
+            for key in ("call_id", "tgid", "tgid_name", "freq", "srcaddr",
+                        "started_at", "started_at_epoch", "attributed", "driver")
+            if key in data
+        }
+        await mqtt_manager.publish_metadata("call_start", start_payload)
     await mqtt_manager.publish_metadata("call_end", data)
     await mqtt_manager.publish_status("online")
 
@@ -225,6 +272,10 @@ async def lifespan(app: FastAPI):
     # Wire callbacks
     metadata_watcher.on_call_start = on_call_start
     metadata_watcher.on_call_end = on_call_end
+    # Segment boundaries come from the audio itself; this is how the watcher
+    # sees it. Without this the watcher falls back to control-channel
+    # segmentation, which is measurably wrong in both directions.
+    metadata_watcher.audio_activity = call_recorder.audio_activity
     mqtt_manager.on_command = on_command
     mqtt_manager.on_config_push = on_config_push
     mqtt_manager.on_api_key = on_api_key

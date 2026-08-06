@@ -1,16 +1,26 @@
 """
 Continuous PulseAudio capture: a ring buffer for PRE-ROLL, a per-call
-accumulator for the call itself.
+accumulator for the call itself, and the voice-activity signal that decides
+where calls begin and end.
 
 A persistent capture process runs for the lifetime of the node. Spawning FFmpeg
 per call used to lose the first 1-2 s to process startup, which meant short
 transmissions produced empty files, so capture never stops.
 
+RAW PCM, NOT MP3 — this is the change everything else hangs off. FFmpeg is
+asked for s16le/22050/mono on stdout instead of an MP3 stream, so:
+
+  * silence detection is integer arithmetic over each chunk as it arrives, with
+    no decode, which is what makes AUDIO-DRIVEN call boundaries possible;
+  * trimming is a byte-offset slice, not a second FFmpeg pass;
+  * MP3 encoding happens exactly ONCE, at save time, so uploads are no longer
+    double-encoded.
+
 TWO BUFFERS, TWO JOBS — this split is load-bearing:
 
   RING BUFFER   holds the last RING_BUFFER_SECONDS of audio at all times. Its
-                only job is PRE-ROLL: however late we notice a grant, we can
-                still seek back to OP25's exact timestamp. It is sized for
+                only job is PRE-ROLL: however late the segmenter notices voice
+                onset, we can still seek back before it. It is sized for
                 detection latency, nothing else.
 
   ACCUMULATOR   opened by start_recording(), fed by every subsequent chunk, and
@@ -19,6 +29,14 @@ TWO BUFFERS, TWO JOBS — this split is load-bearing:
                 old design sliced the finished call back out of the ring buffer,
                 which silently clamped the front of any call longer than
                 RING_BUFFER_SECONDS.
+
+VOICE ACTIVITY is tracked CONTINUOUSLY, not only while recording, because the
+segmenter starts a call from audio onset. `_last_voice_epoch` and
+`_voice_onset_epoch` are the whole interface: metadata_watcher polls them via
+audio_activity() and owns every decision about segment boundaries. This module
+deliberately does not open or close calls by itself — attribution (which
+talkgroup this audio belongs to) lives in the watcher, and audio alone cannot
+answer it.
 
 Why not Icecast: it lags ~1 s at connect and drifts progressively to 100 s+, so
 slice timestamps and audio content diverge without bound. Icecast stays in the
@@ -31,6 +49,12 @@ the same clock and the pre-roll arithmetic below is a direct subtraction with no
 offset mapping. (A wall-clock STEP — e.g. a large NTP correction — would corrupt
 at most the calls in flight at that instant; the buffer self-heals within
 RING_BUFFER_SECONDS.)
+
+NOTE on what a chunk timestamp means: it is the ARRIVAL time of that audio at
+this process, which lags the moment the words were spoken by the PulseAudio →
+FFmpeg → pipe latency. Every timestamp this module produces is in that same
+arrival clock, so differences between them are exact; only comparisons against
+OP25's control-channel timestamps carry the lag, and those are padded for it.
 """
 import asyncio
 import time
@@ -42,57 +66,72 @@ from typing import List, Optional, Tuple
 
 import httpx
 from app.config import settings
-from app.internal import audio_trim, credentials, pulse
+from app.internal import audio_trim, credentials, pcm, pulse
 from app.internal.logger import logger
 
 # Safety cap on a single recording; mirrors MAX_SEGMENT_SECONDS in metadata_watcher.
 MAX_RECORDING_SECONDS = 600
 
-# Audio included ahead of OP25's call_log timestamp. The grant is logged when the
-# channel is granted, so the first syllable can land marginally before it.
+# Audio included ahead of the detected voice onset.
 #
-# Kept small on purpose: measurement on a live node shows 1.71–2.45 s of real
-# grant→speech delay on every call, so there is no clipping risk at the head and
-# a larger pre-roll would only add dead air.
+# Under audio-driven segmentation this is no longer covering a variable
+# control-channel offset — it covers exactly two things: the analysis chunk
+# quantisation (~46 ms) and the possibility that the first syllable ramps up
+# through the silence threshold rather than crossing it instantly. 0.25 s is
+# generous for both, and anything it drags in that is genuinely silence gets
+# trimmed off again before upload.
 PRE_ROLL_SECONDS = 0.25
 
 # Rolling history kept for PRE-ROLL ONLY. Budget for the worst realistic
-# detection latency: 0.5 s poll interval + ~0.2 s http_server blocking floor +
-# up to 3 s httpx timeout on a stalled poll + callback work ≈ 4 s from grant to
-# start_recording(). 30 s is ~7x that margin, and at 16 kbps costs only ~60 KB of
-# RAM. This value does NOT bound call length — the accumulator does.
+# detection latency: the segmenter polls every 0.5 s and can stall for up to a
+# 3 s httpx timeout on a bad OP25 poll, so ~4 s from onset to start_recording().
+# 30 s is ~7x that margin. At 44.1 KB/s of PCM it costs ~1.3 MB of RAM. This
+# value does NOT bound call length — the accumulator does.
 RING_BUFFER_SECONDS = 30
 
-# ~128 ms of audio per chunk at 16 kbps. Chunk size IS the timestamp resolution of
-# the ring buffer, so it must stay well under PRE_ROLL_SECONDS — the old 4096-byte
-# reads were ~2 s per chunk, which made sub-second slicing meaningless.
-READ_CHUNK_BYTES = 256
+# ~46 ms of audio per chunk. Chunk size is BOTH the timestamp resolution of the
+# ring buffer AND the window silence detection runs over, so it has to stay well
+# under PRE_ROLL_SECONDS and well under the shortest utterance we care about.
+READ_CHUNK_BYTES = 2048
 
-# Encoder settings, matched on purpose to what Liquidsoap already pushes to
-# Icecast — %mp3(bitrate=16, samplerate=22050, stereo=false) — so the C2 /upload
-# endpoint keeps receiving exactly the kind of MP3 it has always received
-# (multipart "audio/mpeg", stored to GCS as .mp3, then fed to Whisper).
-# Change both of these together if you ever want higher-fidelity uploads.
+# Encoder settings for the single encode at save time, matched on purpose to
+# what Liquidsoap already pushes to Icecast — %mp3(bitrate=16, samplerate=22050,
+# stereo=false) — so the C2 /upload endpoint keeps receiving exactly the kind of
+# MP3 it has always received (multipart "audio/mpeg", stored to GCS as .mp3,
+# then fed to Whisper). MP3_SAMPLE_RATE MUST equal pcm.SAMPLE_RATE: the encode
+# is a straight pass with no resampling.
 MP3_BITRATE = "16k"
-MP3_SAMPLE_RATE = "22050"
+MP3_SAMPLE_RATE = str(pcm.SAMPLE_RATE)
 
-# Hard memory ceiling for one call's accumulator. 16 kbps is 2 KB/s, so 600 s of
-# call is ~1.2 MB; 4x that is the ceiling, which both leaves room for encoder
-# overshoot and guarantees a runaway call can never eat a Pi's RAM.
-_MP3_BYTES_PER_SECOND = 16_000 // 8
-MAX_RECORDING_BYTES = MAX_RECORDING_SECONDS * _MP3_BYTES_PER_SECOND * 4
+# Bounded so a wedged encoder can never stall the upload path.
+ENCODE_TIMEOUT_SECONDS = 60.0
+
+# Hard memory ceiling for one call's accumulator.
+#
+# PCM costs 44.1 KB/s where the old MP3 buffer cost 2 KB/s, so this had to be
+# re-derived rather than carried over. 600 s (the time cap) of PCM is 26.5 MB;
+# 32 MiB is ~761 s, which guarantees the TIME cap always bites first and a legal
+# call is never truncated by the byte cap. Peak resident audio is therefore
+# ~33.5 MB for the accumulator plus ~1.3 MB for the ring buffer.
+#
+# Rejected alternatives, for the record: spilling to disk (SD-card wear on a Pi,
+# and I/O in the close path); encoding incrementally into MP3 as chunks arrive
+# (puts a subprocess back in the hot path and makes the sample-accurate post-hoc
+# trim impossible); a lower capture sample rate (changes what Whisper receives).
+MAX_RECORDING_BYTES = 32 * 1024 * 1024
 
 # How long stop_recording() will wait for captured audio to actually reach the
-# call's end timestamp. PulseAudio → FFmpeg → MP3 encoder → muxer → our pipe read
-# is a pipeline with latency, so at the instant a call ends the newest buffered
-# chunk is typically a few hundred ms OLDER than the end epoch. Slicing
-# immediately therefore cuts the tail short — which costs the last word of the
-# transmission, usually the disposition or the address. Bounded so a dead capture
-# can never hang the upload path.
+# call's end timestamp. PulseAudio → FFmpeg → our pipe read is a pipeline with
+# latency, so at the instant a CONTROL-CHANNEL derived end is computed the
+# newest buffered chunk is typically a few hundred ms OLDER than that epoch.
+# Slicing immediately therefore cuts the tail short — which costs the last word
+# of the transmission, usually the disposition or the address.
 #
-# Must exceed settings.call_tail_pad_seconds (default 3.0), otherwise a
-# tgid_change close — which pads past a timestamp that is still ~now — gives up
-# before the padded audio has been captured and warns on every talkgroup switch.
+# An audio-driven close never needs this (its end epoch is derived from audio
+# that is already buffered, by construction), but a tgid_change close still
+# pads past a control-channel timestamp that is ~now, so the wait must exceed
+# settings.call_tail_pad_seconds (default 3.0) or it would warn on every
+# talkgroup switch. Bounded so a dead capture can never hang the upload path.
 TAIL_WAIT_TIMEOUT_SECONDS = 4.0
 TAIL_WAIT_POLL_SECONDS = 0.05
 
@@ -114,12 +153,38 @@ _SOURCE_MISSING_MARKERS = ("no such process", "no such device")
 _NO_DAEMON_MARKERS = ("connection refused", "connection failure")
 
 
+@dataclass(frozen=True)
+class AudioActivity:
+    """
+    What the capture stream is doing right now, as raw facts.
+
+    Deliberately carries no decision — no "should a call be open" boolean —
+    because every threshold comparison belongs to metadata_watcher, which owns
+    the segment state machine and (in tests) an injectable clock. This is a
+    snapshot of observations, nothing more.
+
+    `voice_onset_epoch` is the arrival timestamp of the first chunk of the most
+    recent run of voice. It is NOT cleared when that run ends, so a caller must
+    check `last_voice_epoch` against its own clock before treating the run as
+    live. That is intentional: the segmenter needs the onset of the run it just
+    finished recording in order to avoid re-opening on the same run.
+    """
+
+    capturing: bool
+    recording: bool
+    last_voice_epoch: Optional[float] = None
+    voice_onset_epoch: Optional[float] = None
+    # Convenience for /api/status only; the segmenter recomputes this against
+    # its own clock.
+    silence_seconds: float = 0.0
+
+
 @dataclass
 class _ActiveRecording:
     """Audio accumulating for the call currently being recorded."""
 
     call_id: str
-    call_start: float           # OP25 grant epoch
+    call_start: float           # detected voice onset (or a caller-supplied epoch)
     slice_start: float          # call_start - PRE_ROLL_SECONDS
     chunks: List[Tuple[float, bytes]] = field(default_factory=list)
     total_bytes: int = 0
@@ -140,7 +205,7 @@ class Recording:
 
         wall_clock_of(audio_offset_t) == audio_start_epoch + t
 
-    Bounds are accurate to ±one capture chunk (~128 ms).
+    Bounds are accurate to ±one capture chunk (~46 ms).
     """
 
     call_id: str
@@ -153,13 +218,66 @@ class Recording:
     all_silence: bool = False
 
 
+async def encode_mp3(audio: bytes, path: Path) -> bool:
+    """
+    The one and only encode in the pipeline: raw PCM in, MP3 file out.
+
+    Module-level rather than a method so tests can substitute it without
+    needing FFmpeg, and so the "exactly one encode per call" property is
+    trivially observable.
+    """
+    if not audio:
+        return False
+    cmd = [
+        "ffmpeg",
+        "-hide_banner", "-nostdin", "-nostats",
+        "-loglevel", "warning", "-y",
+        "-f", "s16le",
+        "-ar", MP3_SAMPLE_RATE,
+        "-ac", str(pcm.CHANNELS),
+        "-i", "pipe:0",
+        "-ar", MP3_SAMPLE_RATE,
+        "-ac", str(pcm.CHANNELS),
+        "-b:a", MP3_BITRATE,
+        "-f", "mp3", str(path),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as e:
+        logger.error(f"Could not launch the MP3 encoder ({e}) — recording not saved.")
+        return False
+
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(audio), timeout=ENCODE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        logger.error(f"MP3 encode timed out after {ENCODE_TIMEOUT_SECONDS:.0f}s — recording not saved.")
+        return False
+    except Exception as e:
+        logger.error(f"MP3 encode failed ({e}) — recording not saved.")
+        return False
+
+    if proc.returncode != 0:
+        logger.error(f"MP3 encode exited {proc.returncode}: {stderr.decode(errors='replace').strip()}")
+        return False
+    return True
+
+
 class CallRecorder:
     """Continuous PulseAudio capture: ring buffer for pre-roll, accumulator per call."""
 
     def __init__(self):
         self._recordings_dir = Path(settings.recordings_path)
 
-        # Ring buffer: deque of (wall_clock_epoch_at_arrival, mp3_bytes).
+        # Ring buffer: deque of (wall_clock_epoch_at_arrival, pcm_bytes).
         # Pre-roll only — see the module docstring.
         self._buffer: deque[Tuple[float, bytes]] = deque()
         self._buffer_bytes: int = 0
@@ -167,6 +285,10 @@ class CallRecorder:
         self._stream_task: Optional[asyncio.Task] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._capturing: bool = False
+
+        # Voice activity, tracked continuously — not only while recording.
+        self._last_voice_epoch: Optional[float] = None
+        self._voice_onset_epoch: Optional[float] = None
 
         # Active recording state (None when idle)
         self._active: Optional[_ActiveRecording] = None
@@ -204,14 +326,12 @@ class CallRecorder:
             "-hide_banner", "-nostdin", "-nostats",
             "-loglevel", "warning",
             "-f", "pulse", "-i", settings.pulse_source,
-            "-ac", "1",
+            "-ac", str(pcm.CHANNELS),
             "-ar", MP3_SAMPLE_RATE,
-            "-b:a", MP3_BITRATE,
-            # Without this, the MP3 muxer fills its 32 KB AVIO buffer before
-            # writing anything — 16 s of audio per burst at 16 kbps, which would
-            # destroy the arrival timestamps the slicing depends on.
-            "-flush_packets", "1",
-            "-f", "mp3", "-",
+            # Raw PCM on stdout. No muxer, so no -flush_packets games: s16le is
+            # a bare byte stream and every byte FFmpeg produces is immediately
+            # readable, which is what keeps arrival timestamps honest.
+            "-f", "s16le", "-",
         ]
 
     async def _capture_loop(self) -> None:
@@ -240,7 +360,7 @@ class CallRecorder:
 
     async def _run_capture(self) -> None:
         cmd = self._ffmpeg_command()
-        logger.info(f"Starting capture: ffmpeg -f pulse -i {settings.pulse_source}")
+        logger.info(f"Starting capture: ffmpeg -f pulse -i {settings.pulse_source} (s16le/{MP3_SAMPLE_RATE}/mono)")
         self._last_stderr_lines.clear()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -252,8 +372,14 @@ class CallRecorder:
         try:
             assert proc.stdout is not None
             while True:
-                chunk = await proc.stdout.read(READ_CHUNK_BYTES)
-                if not chunk:
+                # readexactly, not read: a fixed chunk keeps every analysis
+                # window the same length AND guarantees sample alignment, so a
+                # short read can never split a 16-bit sample across chunks.
+                try:
+                    chunk = await proc.stdout.readexactly(READ_CHUNK_BYTES)
+                except asyncio.IncompleteReadError as partial:
+                    if partial.partial:
+                        self._ingest(partial.partial)
                     break  # EOF — FFmpeg died or the source went away
                 if not self._capturing:
                     self._capturing = True
@@ -339,9 +465,44 @@ class CallRecorder:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Voice activity
+    # ------------------------------------------------------------------
+
+    def _note_voice(self, chunk: bytes, now: float) -> None:
+        """
+        Update the continuous voice-activity marks from one arriving chunk.
+
+        A chunk carrying signal starts a NEW run whenever the gap since the last
+        one is at least the configured silence timeout — i.e. runs are separated
+        by exactly the same threshold that ends a recording, so the segmenter's
+        "did a new run begin" and "did the recording end" questions can never
+        disagree with each other.
+        """
+        if pcm.is_silent(chunk, settings.call_silence_threshold_db):
+            return
+        gap = settings.call_silence_timeout
+        if self._last_voice_epoch is None or (now - self._last_voice_epoch) >= gap:
+            self._voice_onset_epoch = now
+        self._last_voice_epoch = now
+
+    def audio_activity(self) -> AudioActivity:
+        """Snapshot of the capture stream for metadata_watcher (and /api/status)."""
+        last = self._last_voice_epoch
+        silence = (time.time() - last) if last is not None else 0.0
+        return AudioActivity(
+            capturing=self._capturing,
+            recording=self._active is not None,
+            last_voice_epoch=last,
+            voice_onset_epoch=self._voice_onset_epoch,
+            silence_seconds=max(0.0, silence),
+        )
+
     def _ingest(self, chunk: bytes) -> None:
         """Append a chunk to the ring buffer and, if recording, the accumulator."""
         now = time.time()
+        self._note_voice(chunk, now)
+
         self._buffer.append((now, chunk))
         self._buffer_bytes += len(chunk)
 
@@ -375,9 +536,10 @@ class CallRecorder:
 
     async def start_recording(self, call_id: str, start_epoch: Optional[float] = None) -> bool:
         """
-        Open a recording. `start_epoch` is OP25's call_log timestamp (host wall
-        clock); the slice begins PRE_ROLL_SECONDS before it. Omit it only when no
-        OP25 timestamp is available — then we fall back to "now", losing precision.
+        Open a recording. `start_epoch` is the detected voice onset (host wall
+        clock, same clock as the chunk stamps); the slice begins
+        PRE_ROLL_SECONDS before it. Omit it only when no onset is available —
+        then we fall back to "now", losing the pre-roll's precision.
         """
         if self._active is not None:
             logger.warning(f"Recording already active ({self._active.call_id}) — ignoring start for {call_id}.")
@@ -396,8 +558,8 @@ class CallRecorder:
         oldest = self._buffer[0][0] if self._buffer else None
         if oldest is not None and slice_start < oldest:
             # Pre-roll predates the buffer: node just started, capture restarted,
-            # or OP25's timestamp is far in the past. Clamp and say so LOUDLY —
-            # this is silent audio loss otherwise.
+            # or the onset is far in the past. Clamp and say so LOUDLY — this is
+            # silent audio loss otherwise.
             clamped = oldest - slice_start
             logger.warning(
                 f"BUFFER CLAMP: pre-roll for call {call_id} predates buffered audio by "
@@ -417,13 +579,28 @@ class CallRecorder:
         logger.info(f"Recording started: {call_id} (slice from {slice_start:.3f})")
         return True
 
+    async def discard_recording(self) -> None:
+        """
+        Drop the open recording without writing anything.
+
+        Used when the segmenter decides the audio must not be kept — today only
+        the unattributed/orphan-audio path, where uploading would inject a call
+        with no talkgroup into correlation.
+        """
+        active, self._active = self._active, None
+        if active is not None:
+            logger.info(f"Discarded buffered audio for {active.call_id} ({active.total_bytes} bytes).")
+
     async def stop_recording(self, end_epoch: Optional[float] = None) -> Optional[Recording]:
         """
-        Close the recording and write the file. `end_epoch` is host wall clock.
+        Close the recording, trim it, encode it once and write the file.
+        `end_epoch` is host wall clock.
 
         Waits (bounded) for captured audio to actually cover `end_epoch` before
-        slicing — see TAIL_WAIT_TIMEOUT_SECONDS. Returns None only when there was
-        no recording open or no audio at all.
+        slicing — see TAIL_WAIT_TIMEOUT_SECONDS. An audio-driven close never
+        needs that wait, because its end epoch is derived from audio that is
+        already buffered; a control-channel-derived close (tgid_change) does.
+        Returns None only when there was no recording open or no audio at all.
         """
         active = self._active
         if active is None:
@@ -439,19 +616,21 @@ class CallRecorder:
         await self._await_tail(end, call_id)
         self._active = None
 
-        chunks: List[bytes] = []
+        parts: List[bytes] = []
+        total = 0
         last_ts = slice_start
         for ts, chunk in active.chunks:
             if ts < slice_start:
                 continue
-            chunks.append(chunk)
+            parts.append(chunk)
+            total += len(chunk)
             last_ts = ts
             if ts >= end:
                 # Include the chunk straddling `end` so the tail is never clipped,
                 # then stop.
                 break
 
-        if not chunks:
+        if not parts:
             logger.warning(
                 f"No buffered audio for call {call_id} "
                 f"(window {slice_start:.3f}–{end:.3f}) — PulseAudio capture may be down."
@@ -464,29 +643,55 @@ class CallRecorder:
                 "audio — the tail is short. Capture may be stalled or restarting."
             )
 
-        self._recordings_dir.mkdir(parents=True, exist_ok=True)
-        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        output_path = self._recordings_dir / f"{ts_str}_{call_id}.mp3"
-
-        output_path.write_bytes(b"".join(chunks))
-
-        size = output_path.stat().st_size
-        if size <= 0:
-            output_path.unlink(missing_ok=True)
-            logger.warning(f"Recording for call {call_id} produced an empty file.")
-            return None
-
-        audio_end = min(end, last_ts)
-        logger.info(f"Recording saved: {output_path.name} ({size} bytes, {audio_end - slice_start:.2f}s window)")
-
+        raw = b"".join(parts)
         recording = Recording(
             call_id=call_id,
-            path=output_path,
+            path=None,
             audio_start_epoch=slice_start,
-            audio_end_epoch=audio_end,
+            audio_end_epoch=slice_start + pcm.seconds(len(raw)),
             clamped_seconds=active.clamped_seconds,
         )
-        return await self._apply_trim(recording)
+        return await self._finish(recording, raw)
+
+    async def _finish(self, recording: Recording, raw: bytes) -> Optional[Recording]:
+        """Trim, encode exactly once, and write the MP3."""
+        audio = raw
+        if settings.trim_silence:
+            audio, result = audio_trim.trim_pcm(audio)
+            if result.all_silence:
+                logger.warning(
+                    f"Call {recording.call_id} contains no speech at all — skipping upload. "
+                    "Check squelch, the Liquidsoap output and the drb_sink monitor."
+                )
+                recording.all_silence = True
+                return recording
+            if result.applied:
+                recording.lead_trimmed = result.lead
+                recording.tail_trimmed = result.tail
+                # Wall clock of the trimmed audio's first and last sample.
+                recording.audio_start_epoch += result.lead
+                recording.audio_end_epoch -= result.tail
+
+        self._recordings_dir.mkdir(parents=True, exist_ok=True)
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        output_path = self._recordings_dir / f"{ts_str}_{recording.call_id}.mp3"
+
+        if not await encode_mp3(audio, output_path):
+            output_path.unlink(missing_ok=True)
+            return None
+
+        size = output_path.stat().st_size if output_path.exists() else 0
+        if size <= 0:
+            output_path.unlink(missing_ok=True)
+            logger.warning(f"Recording for call {recording.call_id} produced an empty file.")
+            return None
+
+        recording.path = output_path
+        logger.info(
+            f"Recording saved: {output_path.name} ({size} bytes, "
+            f"{pcm.seconds(len(audio)):.2f}s audio)"
+        )
+        return recording
 
     async def _await_tail(self, end: float, call_id: str) -> float:
         """
@@ -518,41 +723,6 @@ class CallRecorder:
             f"{max(0.0, end - newest):.2f}s short of the call end. Tail may be clipped."
         )
         return waited
-
-    async def _apply_trim(self, recording: Recording) -> Recording:
-        """
-        Strip leading/trailing dead air and keep the timing metadata honest.
-
-        An all-silence recording is NOT uploaded: it carries no information and
-        silence is exactly what makes Whisper hallucinate. It is logged instead,
-        because it also means something is wrong with the audio path.
-        """
-        if not settings.trim_silence or recording.path is None:
-            return recording
-
-        result = await audio_trim.trim_silence(
-            recording.path,
-            sample_rate=MP3_SAMPLE_RATE,
-            bitrate=MP3_BITRATE,
-        )
-
-        if result.all_silence:
-            logger.warning(
-                f"Call {recording.call_id} contains no speech at all — skipping upload. "
-                "Check squelch, the Liquidsoap output and the drb_sink monitor."
-            )
-            recording.path.unlink(missing_ok=True)
-            recording.path = None
-            recording.all_silence = True
-            return recording
-
-        if result.applied:
-            recording.lead_trimmed = result.lead
-            recording.tail_trimmed = result.tail
-            # Wall clock of the trimmed audio's first and last sample.
-            recording.audio_start_epoch += result.lead
-            recording.audio_end_epoch -= result.tail
-        return recording
 
     # ------------------------------------------------------------------
     # Upload (unchanged interface)

@@ -49,9 +49,16 @@ async def get_status():
         "system_name": system_name,
         "is_recording": call_recorder.is_recording,
         # Health of the PulseAudio capture that feeds every recording — the single
-        # most useful signal when recordings come back empty.
+        # most useful signal when recordings come back empty. Segment boundaries
+        # come from this stream, so audio_silence_seconds is also how far the
+        # node currently is from closing whatever it is recording.
         "audio_capture": call_recorder.is_capturing,
         "buffered_seconds": round(call_recorder.buffered_seconds, 1),
+        "audio_silence_seconds": round(call_recorder.audio_activity().silence_seconds, 1),
+        # Audio that was recorded but had no OP25 talkgroup anywhere near it, so
+        # it was discarded rather than uploaded. Non-zero means either the
+        # console is not decoding or something else is feeding drb_sink.
+        "unattributed_segments": metadata_watcher.unattributed_segments,
         "active_tgid": active_tgid,
         "active_tgid_name": active_tgid_name,
         "active_call_id": metadata_watcher.active_call_id,

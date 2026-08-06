@@ -1,13 +1,17 @@
 """
-Unit tests for the CallRecorder pre-roll ring buffer and per-call accumulator.
+Unit tests for the CallRecorder: PCM ring buffer, per-call accumulator, the
+continuous voice-activity signal the segmenter reads, and the single encode.
 
 No FFmpeg and no PulseAudio: chunks are pushed through _ingest() with a patched
-clock, which is exactly what the capture loop does at runtime. Silence trimming
-is disabled by default here and exercised separately with a stubbed trimmer.
+clock, which is exactly what the capture loop does at runtime, and the MP3
+encoder is replaced with a stub that writes the raw PCM it was handed. That stub
+is also how "exactly one encode per call" is asserted — the old design captured
+MP3 and then re-encoded it to trim, so every upload was double-encoded.
 """
 import asyncio
 import itertools
 import time
+from array import array
 from typing import List
 from unittest.mock import patch
 
@@ -15,7 +19,7 @@ import pytest
 
 from app.config import settings
 from app.internal import call_recorder as recorder_mod
-from app.internal.audio_trim import TrimResult
+from app.internal import pcm
 from app.internal.call_recorder import (
     CallRecorder,
     MAX_RECORDING_BYTES,
@@ -25,11 +29,42 @@ from app.internal.call_recorder import (
 )
 
 T0 = 1_700_000_000.0
-CHUNK_INTERVAL = 0.1  # seconds of audio per synthetic chunk
+
+# One synthetic chunk carries exactly CHUNK_INTERVAL seconds of audio AND
+# arrives CHUNK_INTERVAL apart, so arrival-timestamp arithmetic (slicing) and
+# byte-offset arithmetic (trimming) agree with each other.
+CHUNK_INTERVAL = 0.1
+CHUNK_SAMPLES = int(pcm.SAMPLE_RATE * CHUNK_INTERVAL)
+CHUNK_BYTES = CHUNK_SAMPLES * pcm.FRAME_BYTES
+
+SPEECH_LEVEL = 4096   # -18 dBFS, the measured field average
+FLOOR_LEVEL = 1       # -90.3 dBFS, the measured digital-silence floor
+
+
+def block(level: int, samples: int = CHUNK_SAMPLES) -> bytes:
+    return array("h", [level, -level] * (samples // 2)).tobytes()
+
+
+VOICE = block(SPEECH_LEVEL)
+QUIET = block(FLOOR_LEVEL)
 
 
 @pytest.fixture
-def recorder(tmp_path, monkeypatch):
+def encodes(monkeypatch):
+    """Replace the one encode with a stub that writes the PCM it was given."""
+    calls: List[tuple] = []
+
+    async def _encode(audio: bytes, path):
+        calls.append((audio, path))
+        path.write_bytes(audio)
+        return True
+
+    monkeypatch.setattr(recorder_mod, "encode_mp3", _encode)
+    return calls
+
+
+@pytest.fixture
+def recorder(tmp_path, monkeypatch, encodes):
     monkeypatch.setattr(settings, "trim_silence", False)
     r = CallRecorder()
     r._recordings_dir = tmp_path
@@ -37,38 +72,26 @@ def recorder(tmp_path, monkeypatch):
     return r
 
 
-def ingest(recorder, start: float, end: float, marker: bytes = b"A", index: int = 0) -> int:
-    """Feed one chunk every CHUNK_INTERVAL seconds over [start, end) through _ingest."""
+def ingest(recorder, start: float, end: float, chunk: bytes = VOICE) -> None:
+    """Feed one chunk every CHUNK_INTERVAL seconds over [start, end)."""
     stamps: List[float] = []
-    chunks: List[bytes] = []
     ts = start
     while ts < end:
         stamps.append(ts)
-        chunks.append(marker + str(index).encode() + b";")
-        index += 1
         ts = round(ts + CHUNK_INTERVAL, 6)
-
+    if not stamps:
+        return
     with patch("app.internal.call_recorder.time.time", side_effect=stamps):
-        for chunk in chunks:
+        for _ in stamps:
             recorder._ingest(chunk)
-    return index
 
 
-def fill(recorder, start: float, end: float, marker: bytes = b"A", index: int = 0) -> int:
-    """Alias kept for readability where the accumulator is not the point."""
-    return ingest(recorder, start, end, marker=marker, index=index)
+def duration_of(path) -> float:
+    return pcm.seconds(len(path.read_bytes()))
 
 
 def timestamps(recorder):
     return [ts for ts, _ in recorder._buffer]
-
-
-def markers(path) -> List[str]:
-    return path.read_bytes().decode().strip(";").split(";")
-
-
-def indices(path) -> List[int]:
-    return [int(m[1:]) for m in markers(path) if m[1:].isdigit()]
 
 
 # ---------------------------------------------------------------------------
@@ -76,25 +99,24 @@ def indices(path) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def test_idle_buffer_keeps_only_the_rolling_window(recorder):
-    for offset in range(0, int(RING_BUFFER_SECONDS) + 20):
-        with patch("app.internal.call_recorder.time.time", return_value=T0 + offset):
-            recorder._ingest(b"x" * 16)
+    ingest(recorder, T0, T0 + RING_BUFFER_SECONDS + 20)
 
-    assert len(recorder._buffer) <= RING_BUFFER_SECONDS + 1
-    assert min(timestamps(recorder)) >= (T0 + RING_BUFFER_SECONDS + 19) - RING_BUFFER_SECONDS
+    assert recorder.buffered_seconds <= RING_BUFFER_SECONDS + CHUNK_INTERVAL
+    newest = max(timestamps(recorder))
+    assert min(timestamps(recorder)) >= newest - RING_BUFFER_SECONDS
 
 
 @pytest.mark.asyncio
 async def test_ring_buffer_is_trimmed_even_while_recording(recorder):
     """
-    The ring buffer serves PRE-ROLL only. An open recording must no longer pin
-    it — that was the mechanism that made call length depend on buffer size.
+    The ring buffer serves PRE-ROLL only. An open recording must not pin it —
+    that was the mechanism that made call length depend on buffer size.
     """
-    index = ingest(recorder, T0, T0 + 2.0)
+    ingest(recorder, T0, T0 + 2.0)
     await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
-    ingest(recorder, T0 + 2.0, T0 + 2.0 + RING_BUFFER_SECONDS + 10, index=index)
+    ingest(recorder, T0 + 2.0, T0 + 2.0 + RING_BUFFER_SECONDS + 10)
 
-    assert recorder.buffered_seconds <= RING_BUFFER_SECONDS + 1
+    assert recorder.buffered_seconds <= RING_BUFFER_SECONDS + CHUNK_INTERVAL
     # ...and the audio the ring buffer dropped is safe in the accumulator.
     assert recorder._active is not None
     assert recorder._active.chunks[0][0] == pytest.approx(T0 + 1.0 - PRE_ROLL_SECONDS, abs=CHUNK_INTERVAL)
@@ -110,19 +132,16 @@ async def test_call_longer_than_the_ring_buffer_is_captured_whole(recorder):
     grant = T0 + 1.0
     end = grant + call_length
 
-    index = ingest(recorder, T0, grant)
+    ingest(recorder, T0, grant)
     await recorder.start_recording("call-long", start_epoch=grant)
-    ingest(recorder, grant, end + 1.0, index=index)
+    ingest(recorder, grant, end + 1.0)
 
     rec = await recorder.stop_recording(end_epoch=end)
     assert rec is not None and rec.path is not None
 
-    kept = indices(rec.path)
-    # Contiguous: no hole anywhere in the middle of a 65s call.
-    assert kept == list(range(kept[0], kept[-1] + 1))
-    span = (kept[-1] - kept[0]) * CHUNK_INTERVAL
-    assert span > RING_BUFFER_SECONDS, "call length must not be clamped by the ring buffer"
-    assert span == pytest.approx(call_length + PRE_ROLL_SECONDS, abs=2 * CHUNK_INTERVAL)
+    captured = duration_of(rec.path)
+    assert captured > RING_BUFFER_SECONDS, "call length must not be clamped by the ring buffer"
+    assert captured == pytest.approx(call_length + PRE_ROLL_SECONDS, abs=2 * CHUNK_INTERVAL)
 
 
 @pytest.mark.asyncio
@@ -130,8 +149,12 @@ async def test_accumulator_stops_growing_at_the_memory_ceiling(recorder, caplog)
     """A runaway call must not be able to exhaust RAM on a Pi."""
     await recorder.start_recording("call-runaway", start_epoch=T0)
 
-    big = b"z" * 64_000
+    # Silent blocks on purpose: this test is about bytes, not content, and the
+    # all-zero fast path keeps it from spending seconds in the RMS loop.
+    big = b"\x00" * 64_000
     needed = (MAX_RECORDING_BYTES // len(big)) + 5
+    # An unbounded clock: patching time.time patches it for everything running
+    # inside the block, not only for our calls.
     ticks = itertools.count()
     with caplog.at_level("WARNING", logger="drb-edge-node"):
         with patch("app.internal.call_recorder.time.time",
@@ -145,73 +168,133 @@ async def test_accumulator_stops_growing_at_the_memory_ceiling(recorder, caplog)
     assert any("memory ceiling" in r.message for r in caplog.records)
 
 
+def test_the_byte_ceiling_can_never_truncate_a_legal_call():
+    """
+    PCM costs 44.1 KB/s where MP3 cost 2 KB/s, so this had to be re-derived.
+    The TIME cap must always bite before the BYTE cap, or a long pursuit would
+    be silently cut short by a memory limit.
+    """
+    assert MAX_RECORDING_BYTES > MAX_RECORDING_SECONDS * pcm.BYTES_PER_SECOND
+    # ...and it still has to be a deliberate, bounded number on a Pi.
+    assert MAX_RECORDING_BYTES <= 48 * 1024 * 1024
+
+
+def test_the_ring_buffer_memory_cost_is_bounded():
+    assert RING_BUFFER_SECONDS * pcm.BYTES_PER_SECOND < 2 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Voice activity — the signal the segmenter starts and stops on
+# ---------------------------------------------------------------------------
+
+def test_digital_silence_produces_no_voice_marks(recorder):
+    ingest(recorder, T0, T0 + 5.0, chunk=QUIET)
+
+    activity = recorder.audio_activity()
+    assert activity.last_voice_epoch is None
+    assert activity.voice_onset_epoch is None
+
+
+def test_voice_onset_is_the_arrival_of_the_first_non_silent_chunk(recorder):
+    ingest(recorder, T0, T0 + 2.0, chunk=QUIET)
+    ingest(recorder, T0 + 2.0, T0 + 3.0, chunk=VOICE)
+
+    activity = recorder.audio_activity()
+    assert activity.voice_onset_epoch == pytest.approx(T0 + 2.0)
+    assert activity.last_voice_epoch == pytest.approx(T0 + 3.0 - CHUNK_INTERVAL)
+
+
+def test_a_gap_shorter_than_the_silence_timeout_does_not_start_a_new_run(recorder, monkeypatch):
+    """Back-and-forth inside the window is ONE run, hence one recording."""
+    monkeypatch.setattr(settings, "call_silence_timeout", 3.0)
+    ingest(recorder, T0, T0 + 1.0, chunk=VOICE)
+    ingest(recorder, T0 + 1.0, T0 + 2.5, chunk=QUIET)
+    ingest(recorder, T0 + 2.5, T0 + 3.5, chunk=VOICE)
+
+    assert recorder.audio_activity().voice_onset_epoch == pytest.approx(T0)
+
+
+def test_a_gap_longer_than_the_silence_timeout_starts_a_new_run(recorder, monkeypatch):
+    monkeypatch.setattr(settings, "call_silence_timeout", 3.0)
+    ingest(recorder, T0, T0 + 1.0, chunk=VOICE)
+    ingest(recorder, T0 + 1.0, T0 + 6.0, chunk=QUIET)
+    ingest(recorder, T0 + 6.0, T0 + 7.0, chunk=VOICE)
+
+    assert recorder.audio_activity().voice_onset_epoch == pytest.approx(T0 + 6.0)
+
+
+def test_activity_snapshot_reports_capture_and_recording_state(recorder):
+    activity = recorder.audio_activity()
+    assert activity.capturing is True
+    assert activity.recording is False
+
+    recorder._capturing = False
+    assert recorder.audio_activity().capturing is False
+
+
 # ---------------------------------------------------------------------------
 # Pre-roll and slicing
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_slice_starts_pre_roll_before_the_op25_timestamp(recorder):
-    fill(recorder, T0, T0 + 10.0)
-    grant_time = T0 + 5.0
+async def test_slice_starts_pre_roll_before_the_detected_onset(recorder):
+    ingest(recorder, T0, T0 + 10.0)
+    onset = T0 + 5.0
 
-    await recorder.start_recording("call-1", start_epoch=grant_time)
-    assert recorder._active.slice_start == pytest.approx(grant_time - PRE_ROLL_SECONDS)
+    await recorder.start_recording("call-1", start_epoch=onset)
+    assert recorder._active.slice_start == pytest.approx(onset - PRE_ROLL_SECONDS)
 
-    rec = await recorder.stop_recording(end_epoch=grant_time + 2.0)
+    rec = await recorder.stop_recording(end_epoch=onset + 2.0)
     assert rec is not None and rec.path is not None and rec.path.exists()
 
-    first_ts = T0 + indices(rec.path)[0] * CHUNK_INTERVAL
-
-    # A chunk stamped `ts` holds the audio that arrived over [ts - interval, ts],
-    # so the audio actually covered must begin at or before the requested slice
-    # start — erring early is the safe direction, erring late loses speech.
-    assert first_ts - CHUNK_INTERVAL <= grant_time - PRE_ROLL_SECONDS + 1e-6
-    # ...and no more than one chunk of extra pre-roll is dragged in.
-    assert first_ts >= grant_time - PRE_ROLL_SECONDS - 1e-6
+    first_ts = recorder._active.chunks[0][0] if recorder._active else None
+    assert first_ts is None  # recording closed
+    # The audio actually covered must begin at or before the requested slice
+    # start — erring early is safe, erring late loses speech.
+    assert rec.audio_start_epoch <= onset - PRE_ROLL_SECONDS + 1e-6
 
 
 @pytest.mark.asyncio
 async def test_tail_chunk_straddling_the_end_is_included(recorder):
-    fill(recorder, T0, T0 + 10.0)
+    ingest(recorder, T0, T0 + 10.0)
     await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
 
-    # End halfway through a chunk interval.
     rec = await recorder.stop_recording(end_epoch=T0 + 3.05)
-    last_ts = T0 + indices(rec.path)[-1] * CHUNK_INTERVAL
 
-    assert last_ts >= T0 + 3.05, "the chunk covering the end instant must be kept"
+    # The chunk covering the end instant must be kept, so the captured audio
+    # reaches past the requested end rather than stopping short of it.
+    assert rec.audio_end_epoch >= T0 + 3.05
 
 
 @pytest.mark.asyncio
 async def test_max_recording_seconds_caps_the_slice(recorder):
-    index = fill(recorder, T0, T0 + 1.0)
+    ingest(recorder, T0, T0 + 1.0)
     await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
-    ingest(recorder, T0 + 1.0, T0 + MAX_RECORDING_SECONDS + 60, index=index)
+    ingest(recorder, T0 + 1.0, T0 + MAX_RECORDING_SECONDS + 60)
 
     rec = await recorder.stop_recording(end_epoch=T0 + MAX_RECORDING_SECONDS + 50)
-    last_ts = T0 + indices(rec.path)[-1] * CHUNK_INTERVAL
 
-    assert last_ts <= T0 + 1.0 + MAX_RECORDING_SECONDS + CHUNK_INTERVAL
+    assert duration_of(rec.path) <= MAX_RECORDING_SECONDS + PRE_ROLL_SECONDS + CHUNK_INTERVAL
 
 
 # ---------------------------------------------------------------------------
-# Tail wait — the fix for recordings that ended mid-word
+# Tail wait — still needed for control-channel-derived ends (tgid splits)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_stop_waits_for_captured_audio_to_reach_the_call_end(recorder, caplog):
     """
-    PulseAudio → FFmpeg → encoder → muxer → our pipe read has latency, so at the
-    instant a call ends the newest captured chunk is OLDER than the end epoch.
-    Slicing immediately cuts the last word off. stop_recording must wait for it.
+    A tgid_change close pads past a control-channel timestamp that is ~now, so
+    the audio it asks for has not been captured yet. Slicing immediately would
+    cut the last word off.
     """
-    index = ingest(recorder, T0, T0 + 4.0)
+    ingest(recorder, T0, T0 + 4.0)
     await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
 
     async def late_tail():
         await asyncio.sleep(0.15)
         with patch("app.internal.call_recorder.time.time", return_value=T0 + 4.6):
-            recorder._ingest(b"TAIL;")
+            recorder._ingest(block(SPEECH_LEVEL))
 
     task = asyncio.create_task(late_tail())
     with caplog.at_level("INFO", logger="drb-edge-node"):
@@ -219,10 +302,14 @@ async def test_stop_waits_for_captured_audio_to_reach_the_call_end(recorder, cap
     await task
 
     assert rec is not None and rec.path is not None
-    assert b"TAIL" in rec.path.read_bytes(), "the late-arriving tail must be in the file"
+    # The slice covers the chunks stamped T0+0.8 .. T0+3.9 (32 of them) plus the
+    # one that arrived late — and that last one is where the final word of the
+    # transmission lives. Without the wait it would have been cut.
+    chunk_seconds = pcm.seconds(len(VOICE))
+    assert duration_of(rec.path) == pytest.approx(33 * chunk_seconds, abs=0.01)
+    assert duration_of(rec.path) > 32 * chunk_seconds
     assert any("Waited" in r.message and "tail" in r.message for r in caplog.records), \
         "a tail wait must be observable in the field logs"
-    assert index  # sanity: the pre-roll fill actually ran
 
 
 @pytest.mark.asyncio
@@ -245,6 +332,10 @@ async def test_tail_wait_is_bounded_and_warns_when_audio_never_arrives(recorder,
 
 @pytest.mark.asyncio
 async def test_no_wait_when_the_buffer_already_covers_the_end(recorder, caplog):
+    """
+    An audio-driven close derives its end epoch from audio that is already
+    buffered, so the common path must never pay the tail wait at all.
+    """
     ingest(recorder, T0, T0 + 10.0)
     await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
 
@@ -261,7 +352,7 @@ async def test_no_wait_when_the_buffer_already_covers_the_end(recorder, caplog):
 
 @pytest.mark.asyncio
 async def test_pre_roll_earlier_than_buffer_start_is_clamped_and_warned(recorder, caplog):
-    """A grant older than anything buffered must still produce a file, loudly."""
+    """An onset older than anything buffered must still produce a file, loudly."""
     ingest(recorder, T0 + 5.0, T0 + 10.0)  # buffer only covers T0+5 onwards
 
     with caplog.at_level("WARNING", logger="drb-edge-node"):
@@ -269,36 +360,87 @@ async def test_pre_roll_earlier_than_buffer_start_is_clamped_and_warned(recorder
     rec = await recorder.stop_recording(end_epoch=T0 + 8.0)
 
     assert rec is not None and rec.path is not None and rec.path.stat().st_size > 0
-    assert markers(rec.path)[0] == "A0", "slice should begin at the buffer head, not fail"
-    # Buffer head is T0+5.0, requested slice start is T0-PRE_ROLL: everything in
-    # between is audio we can never recover, and the number must be reported.
     assert rec.clamped_seconds == pytest.approx(5.0 + PRE_ROLL_SECONDS, abs=CHUNK_INTERVAL)
     assert any("BUFFER CLAMP" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_no_buffered_audio_returns_none(recorder):
+async def test_no_buffered_audio_returns_none(recorder, encodes):
     await recorder.start_recording("call-1", start_epoch=T0)
     assert await recorder.stop_recording(end_epoch=T0 + 2.0) is None
+    assert encodes == [], "nothing to encode means no encoder subprocess"
 
 
 @pytest.mark.asyncio
 async def test_start_epoch_omitted_falls_back_to_now(recorder):
     now = time.time()
-    fill(recorder, now - 5.0, now)
+    ingest(recorder, now - 5.0, now)
 
     await recorder.start_recording("call-1")
     assert recorder._active.slice_start == pytest.approx(now - PRE_ROLL_SECONDS, abs=1.0)
 
 
 # ---------------------------------------------------------------------------
+# Encode — exactly once, at save time
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_audio_is_encoded_exactly_once_per_call(recorder, encodes, monkeypatch):
+    """
+    The old pipeline captured MP3 and then re-encoded it to trim, so every
+    upload was double-encoded. Capture is PCM now and MP3 happens once, after
+    trimming, at save time.
+    """
+    monkeypatch.setattr(settings, "trim_silence", True)
+    ingest(recorder, T0, T0 + 1.0, chunk=QUIET)
+    ingest(recorder, T0 + 1.0, T0 + 3.0, chunk=VOICE)
+    ingest(recorder, T0 + 3.0, T0 + 6.0, chunk=QUIET)
+
+    await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
+    rec = await recorder.stop_recording(end_epoch=T0 + 6.0)
+
+    assert rec is not None and rec.path is not None
+    assert len(encodes) == 1, "exactly one encode per recording"
+    encoded_audio, encoded_path = encodes[0]
+    assert encoded_path == rec.path
+    # What was encoded is the TRIMMED audio, not the raw slice.
+    assert pcm.seconds(len(encoded_audio)) < 5.0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_encode_leaves_no_file_and_no_recording(recorder, monkeypatch):
+    async def _fail(audio, path):
+        return False
+
+    monkeypatch.setattr(recorder_mod, "encode_mp3", _fail)
+    ingest(recorder, T0, T0 + 5.0)
+    await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
+
+    assert await recorder.stop_recording(end_epoch=T0 + 3.0) is None
+    assert list(recorder._recordings_dir.glob("*.mp3")) == []
+
+
+def test_encoder_command_contract_matches_what_c2_expects():
+    """
+    /upload has always received mono MP3 at 22050 Hz / 16 kbps, and Whisper
+    consumes it downstream. The single encode must not quietly change that.
+    """
+    assert recorder_mod.MP3_SAMPLE_RATE == str(pcm.SAMPLE_RATE) == "22050"
+    assert recorder_mod.MP3_BITRATE == "16k"
+
+
+# ---------------------------------------------------------------------------
 # Silence trimming and timing metadata
 # ---------------------------------------------------------------------------
 
-async def _recorded(recorder, end_offset: float = 3.0):
-    ingest(recorder, T0, T0 + 10.0)
-    await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
-    return await recorder.stop_recording(end_epoch=T0 + end_offset)
+async def _recorded(recorder, lead_silence=1.0, voice=2.0, tail_silence=1.0):
+    start = T0
+    ingest(recorder, start, start + lead_silence, chunk=QUIET)
+    ingest(recorder, start + lead_silence, start + lead_silence + voice, chunk=VOICE)
+    ingest(recorder, start + lead_silence + voice,
+           start + lead_silence + voice + tail_silence, chunk=QUIET)
+    await recorder.start_recording("call-1", start_epoch=start + 0.5)
+    return await recorder.stop_recording(end_epoch=start + lead_silence + voice + tail_silence)
 
 
 @pytest.mark.asyncio
@@ -306,12 +448,12 @@ async def test_trimming_is_off_when_the_setting_is_off(recorder, monkeypatch):
     monkeypatch.setattr(settings, "trim_silence", False)
     called = False
 
-    async def _never(*args, **kwargs):
+    def _never(*args, **kwargs):
         nonlocal called
         called = True
-        return TrimResult(path=None)
+        return b"", None
 
-    monkeypatch.setattr(recorder_mod.audio_trim, "trim_silence", _never)
+    monkeypatch.setattr(recorder_mod.audio_trim, "trim_pcm", _never)
     rec = await _recorded(recorder)
     assert rec is not None and not called
 
@@ -325,41 +467,31 @@ async def test_trim_shifts_the_audio_bounds_but_not_the_call_bounds(recorder, mo
     """
     monkeypatch.setattr(settings, "trim_silence", True)
 
-    async def _trim(path, **kwargs):
-        return TrimResult(path=path, lead=1.9, tail=0.4, duration_before=3.3,
-                          duration_after=1.0, applied=True)
+    rec = await _recorded(recorder, lead_silence=1.0, voice=2.0, tail_silence=1.5)
 
-    monkeypatch.setattr(recorder_mod.audio_trim, "trim_silence", _trim)
-
-    rec = await _recorded(recorder)
     assert rec is not None and rec.path is not None
-    assert rec.lead_trimmed == pytest.approx(1.9)
-    assert rec.tail_trimmed == pytest.approx(0.4)
-    # Untrimmed slice was [T0+0.75, T0+3.0]; the audio now starts 1.9s later and
-    # ends 0.4s earlier, which is exactly what downstream needs to map an audio
-    # offset back to wall clock.
-    assert rec.audio_start_epoch == pytest.approx(T0 + 1.0 - PRE_ROLL_SECONDS + 1.9, abs=CHUNK_INTERVAL)
-    assert rec.audio_end_epoch == pytest.approx(T0 + 3.0 - 0.4, abs=CHUNK_INTERVAL)
+    assert rec.lead_trimmed > 0.0 and rec.tail_trimmed > 0.0
+    guard = settings.trim_silence_guard_seconds
+    # Slice began at T0+0.25; speech begins at T0+1.0, so the audio now starts
+    # one guard margin before the speech.
+    assert rec.audio_start_epoch == pytest.approx(T0 + 1.0 - guard, abs=3 * CHUNK_INTERVAL)
+    assert rec.audio_end_epoch == pytest.approx(T0 + 3.0 + guard, abs=3 * CHUNK_INTERVAL)
+    assert rec.audio_end_epoch > rec.audio_start_epoch
 
 
 @pytest.mark.asyncio
-async def test_all_silence_recording_is_dropped_and_logged(recorder, monkeypatch, caplog):
+async def test_all_silence_recording_is_dropped_and_logged(recorder, monkeypatch, caplog, encodes):
     monkeypatch.setattr(settings, "trim_silence", True)
-    seen = {}
-
-    async def _trim(path, **kwargs):
-        seen["path"] = path
-        return TrimResult(path=path, duration_before=4.0, duration_after=4.0, all_silence=True)
-
-    monkeypatch.setattr(recorder_mod.audio_trim, "trim_silence", _trim)
+    ingest(recorder, T0, T0 + 5.0, chunk=QUIET)
+    await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
 
     with caplog.at_level("WARNING", logger="drb-edge-node"):
-        rec = await _recorded(recorder)
+        rec = await recorder.stop_recording(end_epoch=T0 + 4.0)
 
     assert rec is not None
     assert rec.all_silence is True
     assert rec.path is None, "an all-silence recording must not be uploaded"
-    assert not seen["path"].exists(), "the file must be cleaned up, not left on disk"
+    assert encodes == [], "and must not be encoded either"
     assert any("no speech" in r.message for r in caplog.records)
 
 
@@ -369,7 +501,7 @@ async def test_all_silence_recording_is_dropped_and_logged(recorder, monkeypatch
 
 @pytest.mark.asyncio
 async def test_second_start_is_rejected_while_recording(recorder):
-    fill(recorder, T0, T0 + 5.0)
+    ingest(recorder, T0, T0 + 5.0)
     assert await recorder.start_recording("call-1", start_epoch=T0 + 1.0) is True
     assert await recorder.start_recording("call-2", start_epoch=T0 + 2.0) is False
     assert recorder.is_recording
@@ -379,6 +511,21 @@ async def test_second_start_is_rejected_while_recording(recorder):
 async def test_stop_without_start_is_a_noop(recorder):
     assert await recorder.stop_recording() is None
     assert not recorder.is_recording
+
+
+@pytest.mark.asyncio
+async def test_discard_drops_the_audio_without_writing_anything(recorder, encodes):
+    """The orphan-audio path: unattributed audio must never reach a file."""
+    ingest(recorder, T0, T0 + 5.0)
+    await recorder.start_recording("call-orphan", start_epoch=T0 + 1.0)
+
+    await recorder.discard_recording()
+
+    assert not recorder.is_recording
+    assert encodes == []
+    assert list(recorder._recordings_dir.glob("*.mp3")) == []
+    # ...and the recorder is immediately reusable.
+    assert await recorder.start_recording("call-next", start_epoch=T0 + 2.0) is True
 
 
 @pytest.mark.asyncio
@@ -405,22 +552,26 @@ async def test_split_then_immediate_restart_keeps_both_slices(recorder):
 # FFmpeg invocation
 # ---------------------------------------------------------------------------
 
-def test_ffmpeg_command_reads_pulse_and_flushes_packets(recorder):
+def test_capture_command_asks_for_raw_pcm_not_mp3(recorder):
     cmd = recorder._ffmpeg_command()
     joined = " ".join(cmd)
 
     assert "-f pulse" in joined
     assert "drb_sink.monitor" in joined, "must address the monitor explicitly, not 'default'"
-    # Without -flush_packets the mp3 muxer buffers 32 KB (~16 s at 16 kbps) before
-    # writing, which would destroy the ring buffer's timestamp resolution.
-    assert "-flush_packets" in cmd
-    assert cmd[-1] == "-" and cmd[-2] == "mp3", "must emit MP3 on stdout for /upload"
+    assert cmd[-1] == "-" and cmd[-2] == "s16le", "capture must emit raw PCM on stdout"
+    assert "mp3" not in joined, "MP3 now happens once at save time, not in the capture"
+    assert "-ar" in cmd and str(pcm.SAMPLE_RATE) in cmd
+    assert "-ac" in cmd and str(pcm.CHANNELS) in cmd
 
 
-def test_memory_ceiling_covers_the_longest_allowed_call():
-    """The cap must bound RAM without ever being able to truncate a legal call."""
-    bytes_per_second = 16_000 // 8
-    assert MAX_RECORDING_BYTES >= MAX_RECORDING_SECONDS * bytes_per_second
+def test_read_chunk_is_finer_than_the_pre_roll(recorder):
+    """
+    Chunk size is both the ring buffer's timestamp resolution and the window
+    silence detection runs over, so it has to stay well under the pre-roll.
+    """
+    chunk_seconds = pcm.seconds(recorder_mod.READ_CHUNK_BYTES)
+    assert chunk_seconds < PRE_ROLL_SECONDS / 4
+    assert recorder_mod.READ_CHUNK_BYTES % pcm.FRAME_BYTES == 0
 
 
 # ---------------------------------------------------------------------------
@@ -481,4 +632,3 @@ def test_capture_exit_with_no_stderr_captured_is_generic_warning(recorder, caplo
         recorder._log_capture_exit()
 
     assert _log_levels(caplog) == ["WARNING"]
-    assert MAX_RECORDING_BYTES <= 8 * 1024 * 1024, "must stay small enough for a Pi"
