@@ -8,6 +8,11 @@ services:
       ICECAST_SOURCE_PASSWORD: ${ICECAST_SOURCE_PASSWORD:-hackme}
       ICECAST_ADMIN_PASSWORD: ${ICECAST_ADMIN_PASSWORD:-admin}
 
+  # No `ports:` here — network_mode: host makes it a no-op either way. The
+  # control API (:8001) and OP25's HTTP terminal (:8081) are unauthenticated,
+  # so they bind 127.0.0.1 by default (see OP25_DEBUG_EXPOSE in .env.example)
+  # rather than being exposed. edge-node still reaches both over localhost
+  # because it shares this host network namespace.
   op25:
     image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/op25-client:stable
     build: ./op25-container

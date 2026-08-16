@@ -50,5 +50,8 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && \
 # 2. Update ENTRYPOINT to use the wrapper script
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
-# 3. Use CMD to pass the uvicorn command as arguments to the ENTRYPOINT script
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+# 3. Use CMD to pass the launch command as arguments to the ENTRYPOINT script.
+# main.py starts uvicorn itself (see `if __name__ == "__main__"`) so the bind
+# address can be driven by OP25_DEBUG_EXPOSE at runtime instead of being baked
+# into this image at build time.
+CMD ["python", "main.py"]

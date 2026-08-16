@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from typing import List, Optional, Union
 from enum import Enum
+from config import bind_host
 
 # Preset device settings for common RTL-SDR hardware.
 # gains: OP25 gain string passed to the device block.
@@ -33,6 +34,20 @@ class DecodeMode(str, Enum):
 class TalkgroupTag(BaseModel):
     talkgroup: str
     tagDec: int
+
+# Defined before ConfigGenerator, which annotates a field with it. Under
+# Python 3.14 (PEP 649) annotations are evaluated lazily, so the original
+# order happened to work in the container; on 3.13 or earlier it is a hard
+# NameError at import. Keep the definition above its first use so this file
+# does not depend on the base image's Python version.
+class IcecastConfig(BaseModel):
+    icecast_host: str
+    icecast_port: int
+    icecast_mountpoint: str
+    icecast_password: str
+    icecast_description: Optional[str] = "OP25"
+    icecast_genre: Optional[str] = "Public Safety"
+
 
 class ConfigGenerator(BaseModel):
     type: DecodeMode
@@ -115,7 +130,9 @@ class MetadataConfig(BaseModel):
 
 class TerminalConfig(BaseModel):
     module: Optional[str] = "terminal.py"
-    terminal_type: Optional[str] = "http:0.0.0.0:8081"
+    # Bind address comes from OP25_DEBUG_EXPOSE (config.py) — 127.0.0.1 unless
+    # that flag is set. See config.py for why.
+    terminal_type: Optional[str] = f"http:{bind_host()}:8081"
     terminal_timeout: Optional[float] = 5.0
     curses_plot_interval: Optional[float] = 0.2
     http_plot_interval: Optional[float] = 1.0
@@ -127,10 +144,4 @@ class TerminalConfig(BaseModel):
 
 ### ======================================================
 # Icecast models
-class IcecastConfig(BaseModel):
-    icecast_host: str
-    icecast_port: int
-    icecast_mountpoint: str
-    icecast_password: str
-    icecast_description: Optional[str] = "OP25"
-    icecast_genre: Optional[str] = "Public Safety"
+# (IcecastConfig itself is defined above ConfigGenerator, which references it.)
