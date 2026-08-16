@@ -8,6 +8,7 @@ from app.internal import credentials
 
 _CACHE_FILE = Path(settings.config_path) / "systems_cache.json"
 
+
 async def fetch_and_cache_systems() -> bool:
     """Fetch all systems from the C2 server and cache them locally."""
     if not settings.c2_url:
@@ -23,7 +24,7 @@ async def fetch_and_cache_systems() -> bool:
             r = await client.get(url, headers=headers)
             r.raise_for_status()
             systems = r.json()
-            
+
             _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             _CACHE_FILE.write_text(json.dumps(systems, indent=2))
             logger.info(f"Cached {len(systems)} systems from C2.")
@@ -31,6 +32,7 @@ async def fetch_and_cache_systems() -> bool:
     except Exception as e:
         logger.warning(f"Failed to fetch systems from C2: {e}. Offline cache will be used.")
         return False
+
 
 def load_cached_systems() -> List[Dict[str, Any]]:
     """Load cached systems from disk."""
@@ -40,6 +42,7 @@ def load_cached_systems() -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"Failed to read systems cache: {e}")
     return []
+
 
 def get_cached_system(system_id: str) -> Optional[Dict[str, Any]]:
     """Retrieve a single system config from the cache."""

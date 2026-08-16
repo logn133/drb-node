@@ -25,12 +25,16 @@ router = APIRouter(prefix="/api", tags=["api"], dependencies=[Depends(auth.requi
 async def get_status():
     node_cfg = load_node_config()
     op25_status = await op25_client.status()
-    
+
     active_tgid = metadata_watcher.current_tgid
     active_tgid_name = metadata_watcher.current_tgid_name
     system_name = None
-    
-    active_config = node_cfg.override_config if (node_cfg.override_system_id and node_cfg.override_config) else node_cfg.system_config
+
+    active_config = (
+        node_cfg.override_config
+        if (node_cfg.override_system_id and node_cfg.override_config)
+        else node_cfg.system_config
+    )
     if active_config:
         system_name = active_config.name
         if active_tgid:
@@ -126,7 +130,7 @@ async def set_override(
 ):
     node_cfg = load_node_config()
     config = None
-    
+
     if system_id:
         from app.internal.system_cacher import get_cached_system
         cached = get_cached_system(system_id)
@@ -139,19 +143,19 @@ async def set_override(
         config = SystemConfig(**system_config)
     else:
         raise HTTPException(400, "Must specify system_id or system_config.")
-        
+
     node_cfg.override_system_id = config.system_id
     node_cfg.override_config = config
     save_node_config(node_cfg)
-    
+
     from app.main import _generate_op25_config
     if not await _generate_op25_config(config):
         raise HTTPException(500, f"Failed to generate OP25 config for override: {config.name}")
-        
+
     await op25_client.stop()
     await asyncio.sleep(2)
     await op25_client.start()
-    
+
     await mqtt_manager._publish_checkin()
     return {"ok": True}
 
@@ -161,20 +165,20 @@ async def revert_config():
     node_cfg = load_node_config()
     if not node_cfg.override_system_id:
         return {"ok": True, "message": "No override active."}
-        
+
     node_cfg.override_system_id = None
     node_cfg.override_config = None
     save_node_config(node_cfg)
-    
+
     if node_cfg.system_config:
         from app.main import _generate_op25_config
         if not await _generate_op25_config(node_cfg.system_config):
             raise HTTPException(500, "Failed to regenerate original OP25 config.")
-            
+
         await op25_client.stop()
         await asyncio.sleep(2)
         await op25_client.start()
-        
+
     await mqtt_manager._publish_checkin()
     return {"ok": True}
 
@@ -183,10 +187,10 @@ async def revert_config():
 async def ack_override(timeout_minutes: int = Body(1440)):
     if not settings.c2_url:
         raise HTTPException(400, "C2_URL not configured.")
-        
+
     api_key = credentials.get_api_key()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(

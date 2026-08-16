@@ -27,7 +27,8 @@ class RadioBot:
         self._channel_id: Optional[int] = None
         self._was_streaming: bool = False
 
-    async def join(self, guild_id: int, channel_id: int, token: str, call_active: bool = False, system_name: str = None) -> bool:
+    async def join(self, guild_id: int, channel_id: int, token: str,
+                   call_active: bool = False, system_name: str = None) -> bool:
         # (Re)start the bot if the token changed or the bot isn't running
         if self._current_token != token or not self._is_bot_running():
             if not await self._start_bot(token):

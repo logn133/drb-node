@@ -297,7 +297,11 @@ async def lifespan(app: FastAPI):
     initial_status = "online" if node_cfg.configured else "unconfigured"
     await mqtt_manager.publish_status(initial_status)
 
-    active_config = node_cfg.override_config if (node_cfg.override_system_id and node_cfg.override_config) else node_cfg.system_config
+    active_config = (
+        node_cfg.override_config
+        if (node_cfg.override_system_id and node_cfg.override_config)
+        else node_cfg.system_config
+    )
     if node_cfg.configured and active_config:
         from app.internal.op25_client import op25_client
         logger.info("Node is configured — waiting for OP25 API then generating config.")
