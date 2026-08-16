@@ -16,11 +16,7 @@ jobs:
     env:
       CONTAINER_NAME: icecast
     steps:
-      # Full fetch: Gitea fails to pack the default depth=1 shallow clone
-      # ("bad pack header"). Don't set this back to a shallow fetch.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: docker/setup-qemu-action@v3
 
