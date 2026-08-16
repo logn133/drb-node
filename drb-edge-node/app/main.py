@@ -266,8 +266,11 @@ async def on_config_push(payload: dict):
 async def lifespan(app: FastAPI):
     logger.info(f"Edge node starting — ID: {settings.node_id}")
 
-    # Load persisted credentials (API key provisioned by C2 after approval)
+    # Load persisted credentials (API key provisioned by C2 after approval;
+    # also generates/loads the local dashboard's auth salt + session secret)
     credentials.load()
+    from app.internal import auth
+    auth.warn_if_default_password()
 
     # Wire callbacks
     metadata_watcher.on_call_start = on_call_start

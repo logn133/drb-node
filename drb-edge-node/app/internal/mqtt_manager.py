@@ -32,6 +32,16 @@ class MQTTManager:
         self._t_metadata = f"nodes/{nid}/metadata"
         self._t_commands = f"nodes/{nid}/commands"
         self._t_config = f"nodes/{nid}/config"
+        # TODO(mqtt-cutover): dead once enrollment lands client-side. This
+        # was the pre-dynsec key-delivery path (server retain-publishes the
+        # api_key here after admin approval; node asks for redelivery via
+        # _t_key_request if none shows up). Under dynsec a node with no
+        # api_key can't authenticate to the broker at all — see
+        # _build_client() — so this subscribe is only ever reachable while
+        # still using the legacy mqtt_user/mqtt_pass fallback against a
+        # pre-cutover broker. Left in as the rollback path per
+        # MQTT-PUBLIC-AUTH-PLAN.md; remove together with the server's
+        # matching TODO(mqtt-cutover) markers once enrollment replaces it.
         self._t_api_key = f"nodes/{nid}/api_key"
         self._t_key_request = f"nodes/{nid}/key_request"
         self._t_discovery = "nodes/discovery/request"
@@ -41,8 +51,47 @@ class MQTTManager:
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=settings.node_id,
         )
-        if settings.mqtt_user:
+
+        api_key = credentials.get_api_key()
+        if api_key:
+            # Post-cutover auth: broker's dynsec plugin authenticates this
+            # exact (username, password) pair as this node's own client — see
+            # Server/drb-c2-core/app/internal/dynsec.py upsert_node_client()
+            # and MQTT-PUBLIC-AUTH-PLAN.md. node_id doubles as the dynsec
+            # username AND the %u substitution in the "node" role's
+            # nodes/%u/# ACL pattern, so it must match exactly what C2 has on
+            # file for this node (it always does — node_id is not operator
+            # editable post-provisioning).
+            client.username_pw_set(settings.node_id, api_key)
+        elif settings.mqtt_user:
+            # Legacy fallback — only valid against a pre-cutover broker still
+            # using mosquitto's old password_file auth. See config.py's
+            # mqtt_user/mqtt_pass docstring. Not accepted by a dynsec broker.
             client.username_pw_set(settings.mqtt_user, settings.mqtt_pass)
+        else:
+            # No api_key on disk and no legacy shared login configured. A
+            # dynsec broker (allow_anonymous false) refuses this outright —
+            # expected, not a bug to route around here: this node hasn't been
+            # enrolled/approved yet, and the enrollment flow that would fix
+            # that client-side is a later, separate pass (out of scope here;
+            # see MQTT-PUBLIC-AUTH-PLAN.md). paho's reconnect_delay_set()
+            # below bounds the retry rate (2..60s exponential backoff), so
+            # this degrades to a slow, clearly-logged refusal loop via
+            # _on_connect's "MQTT connect refused" line — not a hot spin.
+            logger.warning(
+                "No API key on disk and no legacy MQTT_USER configured — "
+                "connecting without credentials; the broker is expected to "
+                "refuse this until the node is enrolled/approved."
+            )
+
+        if settings.mqtt_tls:
+            # No arguments = system CA store + ssl.CERT_REQUIRED (verified
+            # against paho's tls_set() source/docstring — unverified by
+            # running anything, per instruction). The broker presents a real
+            # Let's Encrypt cert for mqtt.<domain>:8883, so default
+            # verification is exactly correct: do not pass ca_certs, do not
+            # call tls_insecure_set(True).
+            client.tls_set()
 
         lwt = json.dumps({
             "node_id": settings.node_id,
@@ -62,10 +111,11 @@ class MQTTManager:
             self._connected = True
             client.subscribe(self._t_commands, qos=1)
             client.subscribe(self._t_config, qos=1)
-            client.subscribe(self._t_api_key, qos=2)
+            client.subscribe(self._t_api_key, qos=2)  # TODO(mqtt-cutover): see _t_api_key comment above
             client.subscribe(self._t_discovery, qos=0)
             logger.info("MQTT connected.")
             asyncio.run_coroutine_threadsafe(self._publish_checkin(), self._loop)
+            # TODO(mqtt-cutover): see _t_api_key comment above
             asyncio.run_coroutine_threadsafe(self._maybe_request_key(), self._loop)
             asyncio.run_coroutine_threadsafe(self._flush_offline_buffer(), self._loop)
         else:

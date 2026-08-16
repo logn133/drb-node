@@ -10,8 +10,27 @@ class Settings(BaseSettings):
     node_lon: float = 0.0
 
     # MQTT
+    #
+    # Broker cutover (MQTT-PUBLIC-AUTH-PLAN.md, dynsec revision): the server no
+    # longer has a shared node login. Each node authenticates as
+    # username=NODE_ID, password=<its C2-issued api_key> (the same credential
+    # /upload already trusts via node_keys) — see mqtt_manager._build_client().
+    # For local dev against the old-style broker (localhost:1883, no TLS) set
+    # MQTT_BROKER=localhost and leave MQTT_TLS unset/false.
     mqtt_broker: str
     mqtt_port: int = 1883
+    # Set true for the public broker (mqtt.<domain>:8883, real Let's Encrypt
+    # cert) so client.tls_set() runs with default system-CA verification.
+    # False by default so local/dev against a plaintext :1883 broker still
+    # works unchanged. Do NOT pair with a self-signed/insecure cert setup —
+    # verification is never disabled (no tls_insecure_set(True) anywhere).
+    mqtt_tls: bool = False
+    # DEPRECATED / effectively dead post-cutover: the shared node login these
+    # backed no longer exists on the server (dynsec has no such client — see
+    # dynsec.py). Left in only as a legacy fallback for a pre-cutover broker
+    # that still uses mosquitto's old password_file auth; mqtt_manager only
+    # falls back to these when no api_key is on disk yet. Do not provision new
+    # nodes with these — see MQTT_USER/MQTT_PASS removal note in .env.example.
     mqtt_user: Optional[str] = None
     mqtt_pass: Optional[str] = None
 
@@ -122,6 +141,22 @@ class Settings(BaseSettings):
 
     # Offline call buffer — how many call_end events to keep while disconnected
     offline_call_buffer_size: int = 35
+
+    # ------------------------------------------------------------------
+    # Local dashboard / API authentication
+    #
+    # These nodes are deployed at arbitrary third-party locations, reachable by
+    # anyone on that site's LAN — there is no auth on this HTTP surface without
+    # these. The password below is a FIRST-BOOT DEFAULT ONLY: change it via
+    # DASHBOARD_PASSWORD in .env before a node leaves the bench. main.py logs a
+    # startup warning every boot the default is still active.
+    #
+    # See app/internal/auth.py — the password is never compared or stored in
+    # plaintext (scrypt-hashed, constant-time compare); this setting just holds
+    # the operator-facing plaintext the same way MQTT_PASS/ICECAST_* already do.
+    # ------------------------------------------------------------------
+    dashboard_username: str = "admin"
+    dashboard_password: str = "CHANGE-ME-drb-default"
 
     class Config:
         env_file = ".env"

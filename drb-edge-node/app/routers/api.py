@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Optional
 import asyncio
 import httpx
@@ -11,8 +11,14 @@ from app.internal.discord_radio import radio_bot
 from app.internal.metadata_watcher import metadata_watcher
 from app.internal import credentials
 from app.internal.mqtt_manager import mqtt_manager
+from app.internal import auth
 
-router = APIRouter(prefix="/api", tags=["api"])
+# Every route in this router requires auth — a valid dashboard session cookie
+# or HTTP Basic (see app/internal/auth.py). No exemption exists for any route
+# here: there is no health/liveness endpoint in this file or anywhere else in
+# the edge node (confirmed against source — no docker healthcheck references
+# one either), so nothing needs to stay open for a container healthcheck.
+router = APIRouter(prefix="/api", tags=["api"], dependencies=[Depends(auth.require_auth)])
 
 
 @router.get("/status")
