@@ -1,5 +1,10 @@
 # OP25 Core Container
-FROM python:slim-trixie
+# Pinned to a Python major version deliberately. The bare `slim-trixie` tag
+# carries no version at all, so a rebuild could move the interpreter across a
+# major release -- which this repo has already been bitten by once, when
+# app/models.py only ran because trixie happened to ship 3.14 and PEP 649
+# defers annotation evaluation. Matches drb-edge-node, which is already 3.14.
+FROM python:3.14-slim
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
