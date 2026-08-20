@@ -95,10 +95,26 @@ read -rp "MQTT username [drb-node]: " MQTT_USER; MQTT_USER="${MQTT_USER:-drb-nod
 read -rsp "MQTT password: " MQTT_PASS; echo ""; MQTT_PASS="${MQTT_PASS:-change-me-node}"
 
 # --- Icecast ---
+# Generated, not defaulted. Icecast binds all interfaces, and the SOURCE
+# password is what lets a caller push audio into the stream users listen to as
+# live radio -- so a shared default is worse here than a forgotten password.
+# Pressing Enter gives you a random one rather than a known one.
+gen_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 24 | tr -d '
+'
+  else
+    head -c 24 /dev/urandom | base64 | tr -d '
+'
+  fi
+}
+
 echo ""
-echo "Icecast passwords (local container)"
-read -rsp "Source password [hackme]: " ICECAST_SOURCE; echo ""; ICECAST_SOURCE="${ICECAST_SOURCE:-hackme}"
-read -rsp "Admin password [admin]: "  ICECAST_ADMIN;  echo ""; ICECAST_ADMIN="${ICECAST_ADMIN:-admin}"
+echo "Icecast passwords (local container). Press Enter to generate a random one."
+read -rsp "Source password [generate]: " ICECAST_SOURCE; echo ""
+if [ -z "$ICECAST_SOURCE" ]; then ICECAST_SOURCE="$(gen_password)"; echo "  generated a random source password"; fi
+read -rsp "Admin password [generate]: "  ICECAST_ADMIN;  echo ""
+if [ -z "$ICECAST_ADMIN" ];  then ICECAST_ADMIN="$(gen_password)";  echo "  generated a random admin password"; fi
 
 # --- Write .env ---
 cat > .env <<EOF

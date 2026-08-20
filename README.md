@@ -167,8 +167,8 @@ The node will appear as **pending** in the server admin dashboard. An admin must
 | `ICECAST_HOST` | No | `localhost` | Icecast hostname (leave as localhost — host network mode) |
 | `ICECAST_PORT` | No | `8000` | Icecast HTTP port |
 | `ICECAST_MOUNT` | No | `/radio` | Icecast mount point |
-| `ICECAST_SOURCE_PASSWORD` | No | `hackme` | Icecast source password — change this |
-| `ICECAST_ADMIN_PASSWORD` | No | `hackme` | Icecast admin password — change this |
+| `ICECAST_SOURCE_PASSWORD` | **Yes** | none | Icecast source password. No default — the container refuses to start without it. `setup.sh` generates one; otherwise `openssl rand -base64 24` |
+| `ICECAST_ADMIN_PASSWORD` | **Yes** | none | Icecast admin password. Same rules |
 | `OP25_API_URL` | No | `http://localhost:8001` | OP25 container HTTP API |
 | `OP25_TERMINAL_URL` | No | `http://localhost:8081` | OP25 HTTP terminal (live talkgroup metadata) |
 

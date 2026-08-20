@@ -5,8 +5,10 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      ICECAST_SOURCE_PASSWORD: ${ICECAST_SOURCE_PASSWORD:-hackme}
-      ICECAST_ADMIN_PASSWORD: ${ICECAST_ADMIN_PASSWORD:-admin}
+      # :? not :- — a missing password must stop the stack, not silently
+      # become a credential that is published in this file.
+      ICECAST_SOURCE_PASSWORD: ${ICECAST_SOURCE_PASSWORD:?set ICECAST_SOURCE_PASSWORD in .env (run setup.sh, or openssl rand -base64 24)}
+      ICECAST_ADMIN_PASSWORD: ${ICECAST_ADMIN_PASSWORD:?set ICECAST_ADMIN_PASSWORD in .env (run setup.sh, or openssl rand -base64 24)}
 
   # No `ports:` here — network_mode: host makes it a no-op either way. The
   # control API (:8001) and OP25's HTTP terminal (:8081) are unauthenticated,

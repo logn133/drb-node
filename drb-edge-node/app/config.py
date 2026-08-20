@@ -42,7 +42,8 @@ class Settings(BaseSettings):
     icecast_host: str = "localhost"
     icecast_port: int = 8000
     icecast_mount: str = "/radio"
-    icecast_source_password: str = "hackme"
+    # No default: see icecast/entrypoint.sh, which refuses to start without one.
+    icecast_source_password: str = ""
 
     # PulseAudio — the low-latency path used for call recording and Discord voice.
     # Liquidsoap (op25 container) writes into the `drb_sink` null sink; we capture

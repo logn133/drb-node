@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
             icecast_host=os.getenv("ICECAST_HOST", "localhost"),
             icecast_port=int(os.getenv("ICECAST_PORT", "8000")),
             icecast_mountpoint=os.getenv("ICECAST_MOUNT", "/radio"),
-            icecast_password=os.getenv("ICECAST_SOURCE_PASSWORD", "hackme"),
+            icecast_password=os.getenv("ICECAST_SOURCE_PASSWORD", ""),
         )
         generate_liquid_script(config)
         LOGGER.info("op25.liq generated from environment variables.")
