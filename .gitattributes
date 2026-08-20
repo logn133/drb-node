@@ -1,0 +1,4 @@
+# Shell scripts run inside Linux containers. A CRLF shebang there fails as
+# "bad interpreter: /bin/sh^M", which surfaces only as a container that will
+# not start. Windows checkouts have core.autocrlf=true, so pin these to LF.
+*.sh text eol=lf
