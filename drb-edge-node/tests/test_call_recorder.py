@@ -59,7 +59,7 @@ def encodes(monkeypatch):
         path.write_bytes(audio)
         return True
 
-    monkeypatch.setattr(recorder_mod, "encode_mp3", _encode)
+    monkeypatch.setattr(recorder_mod, "encode_recording", _encode)
     return calls
 
 
@@ -412,21 +412,31 @@ async def test_a_failed_encode_leaves_no_file_and_no_recording(recorder, monkeyp
     async def _fail(audio, path):
         return False
 
-    monkeypatch.setattr(recorder_mod, "encode_mp3", _fail)
+    monkeypatch.setattr(recorder_mod, "encode_recording", _fail)
     ingest(recorder, T0, T0 + 5.0)
     await recorder.start_recording("call-1", start_epoch=T0 + 1.0)
 
     assert await recorder.stop_recording(end_epoch=T0 + 3.0) is None
-    assert list(recorder._recordings_dir.glob("*.mp3")) == []
+    assert list(recorder._recordings_dir.glob("*.flac")) == []
 
 
 def test_encoder_command_contract_matches_what_c2_expects():
     """
-    /upload has always received mono MP3 at 22050 Hz / 16 kbps, and Whisper
-    consumes it downstream. The single encode must not quietly change that.
+    The saved file is what Whisper transcribes, so the encode must stay
+    LOSSLESS and must not resample. It was 16 kbps MP3 — a bitrate copied from
+    Icecast's live stream, i.e. the listening path's budget applied to the
+    accuracy path — which put a second lossy stage on top of the P25 vocoder.
+
+    The sample rate must equal pcm.SAMPLE_RATE or the encode stops being a
+    straight pass and the byte-offset trim arithmetic no longer lines up.
     """
-    assert recorder_mod.MP3_SAMPLE_RATE == str(pcm.SAMPLE_RATE) == "22050"
-    assert recorder_mod.MP3_BITRATE == "16k"
+    assert recorder_mod.AUDIO_SAMPLE_RATE == str(pcm.SAMPLE_RATE) == "22050"
+    assert recorder_mod.AUDIO_FORMAT == "flac"
+    assert recorder_mod.AUDIO_SUFFIX == ".flac"
+    assert recorder_mod.AUDIO_MIME == "audio/flac"
+    # No bitrate constant should exist: a bitrate on a lossless codec would mean
+    # someone reintroduced lossy encoding.
+    assert not hasattr(recorder_mod, "MP3_BITRATE")
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +533,7 @@ async def test_discard_drops_the_audio_without_writing_anything(recorder, encode
 
     assert not recorder.is_recording
     assert encodes == []
-    assert list(recorder._recordings_dir.glob("*.mp3")) == []
+    assert list(recorder._recordings_dir.glob("*.flac")) == []
     # ...and the recorder is immediately reusable.
     assert await recorder.start_recording("call-next", start_epoch=T0 + 2.0) is True
 

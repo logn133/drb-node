@@ -7,14 +7,16 @@ A persistent capture process runs for the lifetime of the node. Spawning FFmpeg
 per call used to lose the first 1-2 s to process startup, which meant short
 transmissions produced empty files, so capture never stops.
 
-RAW PCM, NOT MP3 — this is the change everything else hangs off. FFmpeg is
-asked for s16le/22050/mono on stdout instead of an MP3 stream, so:
+RAW PCM, NOT A COMPRESSED STREAM — this is the change everything else hangs
+off. FFmpeg is asked for s16le/22050/mono on stdout instead of an encoded
+stream, so:
 
   * silence detection is integer arithmetic over each chunk as it arrives, with
     no decode, which is what makes AUDIO-DRIVEN call boundaries possible;
   * trimming is a byte-offset slice, not a second FFmpeg pass;
-  * MP3 encoding happens exactly ONCE, at save time, so uploads are no longer
-    double-encoded.
+  * encoding happens exactly ONCE, at save time, so uploads are no longer
+    double-encoded. That encode is now FLAC (lossless) rather than 16 kbps MP3
+    — see the AUDIO_* constants below for why.
 
 TWO BUFFERS, TWO JOBS — this split is load-bearing:
 
@@ -94,14 +96,32 @@ RING_BUFFER_SECONDS = 30
 # under PRE_ROLL_SECONDS and well under the shortest utterance we care about.
 READ_CHUNK_BYTES = 2048
 
-# Encoder settings for the single encode at save time, matched on purpose to
-# what Liquidsoap already pushes to Icecast — %mp3(bitrate=16, samplerate=22050,
-# stereo=false) — so the C2 /upload endpoint keeps receiving exactly the kind of
-# MP3 it has always received (multipart "audio/mpeg", stored to GCS as .mp3,
-# then fed to Whisper). MP3_SAMPLE_RATE MUST equal pcm.SAMPLE_RATE: the encode
-# is a straight pass with no resampling.
-MP3_BITRATE = "16k"
-MP3_SAMPLE_RATE = str(pcm.SAMPLE_RATE)
+# Encoder settings for the single encode at save time.
+#
+# This used to be %mp3(bitrate=16) chosen to match what Liquidsoap pushes to
+# Icecast. That was the wrong thing to match: Icecast is the LISTENING path and
+# 16 kbps is a bandwidth budget for a live stream, while this file is the
+# ACCURACY path — it is what Whisper transcribes, and the transcript is what
+# every downstream stage is hostage to. P25 audio has already been through a
+# vocoder; 16 kbps MP3 stacked a second lossy stage on top of that, on the one
+# copy that had to stay faithful.
+#
+# FLAC instead: lossless, so the bytes Whisper receives are the bytes PulseAudio
+# captured. Roughly 1.3 MB/min against 120 KB/min for 16k MP3 — larger, but a
+# 600 s call is still ~13 MB, inside both Whisper's 25 MB request cap and the
+# C2 upload_max_bytes (100 MB). Icecast's own 16 kbps stream is untouched;
+# nothing about the listening path changes.
+#
+# AUDIO_SAMPLE_RATE MUST equal pcm.SAMPLE_RATE: the encode is a straight pass
+# with no resampling. Whisper resamples to 16 kHz itself, so handing it 22050
+# unresampled keeps the one resample in the pipeline inside the model.
+AUDIO_SAMPLE_RATE = str(pcm.SAMPLE_RATE)
+AUDIO_FORMAT = "flac"
+AUDIO_SUFFIX = ".flac"
+AUDIO_MIME = "audio/flac"
+# -compression_level 5 is ffmpeg's default: near-best ratio, and the encode is
+# off the hot path anyway (once per call, at save).
+FLAC_COMPRESSION_LEVEL = "5"
 
 # Bounded so a wedged encoder can never stall the upload path.
 ENCODE_TIMEOUT_SECONDS = 60.0
@@ -218,9 +238,12 @@ class Recording:
     all_silence: bool = False
 
 
-async def encode_mp3(audio: bytes, path: Path) -> bool:
+async def encode_recording(audio: bytes, path: Path) -> bool:
     """
-    The one and only encode in the pipeline: raw PCM in, MP3 file out.
+    The one and only encode in the pipeline: raw PCM in, FLAC file out.
+
+    Lossless on purpose — see the AUDIO_* constants above. This file is what
+    Whisper transcribes, so the encode must not throw anything away.
 
     Module-level rather than a method so tests can substitute it without
     needing FFmpeg, and so the "exactly one encode per call" property is
@@ -233,13 +256,13 @@ async def encode_mp3(audio: bytes, path: Path) -> bool:
         "-hide_banner", "-nostdin", "-nostats",
         "-loglevel", "warning", "-y",
         "-f", "s16le",
-        "-ar", MP3_SAMPLE_RATE,
+        "-ar", AUDIO_SAMPLE_RATE,
         "-ac", str(pcm.CHANNELS),
         "-i", "pipe:0",
-        "-ar", MP3_SAMPLE_RATE,
+        "-ar", AUDIO_SAMPLE_RATE,
         "-ac", str(pcm.CHANNELS),
-        "-b:a", MP3_BITRATE,
-        "-f", "mp3", str(path),
+        "-compression_level", FLAC_COMPRESSION_LEVEL,
+        "-f", AUDIO_FORMAT, str(path),
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -327,7 +350,7 @@ class CallRecorder:
             "-loglevel", "warning",
             "-f", "pulse", "-i", settings.pulse_source,
             "-ac", str(pcm.CHANNELS),
-            "-ar", MP3_SAMPLE_RATE,
+            "-ar", AUDIO_SAMPLE_RATE,
             # Raw PCM on stdout. No muxer, so no -flush_packets games: s16le is
             # a bare byte stream and every byte FFmpeg produces is immediately
             # readable, which is what keeps arrival timestamps honest.
@@ -360,7 +383,7 @@ class CallRecorder:
 
     async def _run_capture(self) -> None:
         cmd = self._ffmpeg_command()
-        logger.info(f"Starting capture: ffmpeg -f pulse -i {settings.pulse_source} (s16le/{MP3_SAMPLE_RATE}/mono)")
+        logger.info(f"Starting capture: ffmpeg -f pulse -i {settings.pulse_source} (s16le/{AUDIO_SAMPLE_RATE}/mono)")
         self._last_stderr_lines.clear()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -674,9 +697,9 @@ class CallRecorder:
 
         self._recordings_dir.mkdir(parents=True, exist_ok=True)
         ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        output_path = self._recordings_dir / f"{ts_str}_{recording.call_id}.mp3"
+        output_path = self._recordings_dir / f"{ts_str}_{recording.call_id}{AUDIO_SUFFIX}"
 
-        if not await encode_mp3(audio, output_path):
+        if not await encode_recording(audio, output_path):
             output_path.unlink(missing_ok=True)
             return None
 
@@ -766,7 +789,7 @@ class CallRecorder:
                 with open(file_path, "rb") as f:
                     r = await client.post(
                         upload_url,
-                        files={"file": (file_path.name, f, "audio/mpeg")},
+                        files={"file": (file_path.name, f, AUDIO_MIME)},
                         data=form,
                         headers=headers,
                     )
