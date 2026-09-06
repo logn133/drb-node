@@ -1,7 +1,12 @@
 .PHONY: setup test up up-prebuilt pull down logs
 
+# Local-dev only: seed .env from the example so `make up` has something to read.
+# A real edge node is provisioned with install.sh (one-shot bootstrap for a
+# clean Pi — clones, enrolls with C2, pulls prebuilt images):
+#   curl -fsSL https://git.vpn.cusano.net/logan/node-26/raw/tag/v1/install.sh | sudo bash -s -- --help
 setup:
-	@bash setup.sh
+	@test -f .env || cp .env.example .env
+	@echo ".env ready — edit it, then 'make up' (local build) or 'make up-prebuilt'"
 
 # Run pytest inside the running edge-node container.
 # Requires: docker compose up (or at least the edge-node image built).
