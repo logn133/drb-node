@@ -135,21 +135,32 @@ Client/
 
 ## Setup
 
+### Provision a real node — `install.sh`
+
+One-shot bootstrap for a clean Raspberry Pi OS (arm64). Installs Docker, clones
+this repo at the `v1` tag, enrols with C2, pulls the prebuilt images and starts:
+
 ```bash
-# 1. Copy env template
-cp .env.example .env
-
-# 2. Fill in at minimum: NODE_ID and MQTT_BROKER
-nano .env
-
-# 3. Build all images (op25 takes ~10-15 minutes first time)
-docker compose build
-
-# 4. Start
-docker compose up -d
+curl -fsSL https://git.vpn.cusano.net/logan/node-26/raw/tag/v1/install.sh \
+  | sudo bash -s -- --token DRB-xxxx --node-id node-003 \
+      --c2-url https://api.<domain> --mqtt-broker mqtt.<domain>
 ```
 
-The node will appear as **pending** in the server admin dashboard. An admin must approve it before it becomes operational. After approval, assign a radio system in the dashboard and the node will start decoding automatically.
+Mint the `--token` at **Settings → Nodes** in the web app (the panel prints the
+whole command). Run `install.sh --help` for every flag; each also has a
+`DRB_*` env var. `--build` compiles op25 on the Pi (~1h) instead of pulling.
+
+### Local dev / manual
+
+```bash
+make setup            # seeds .env from .env.example
+nano .env             # at minimum: NODE_ID, MQTT_BROKER, C2_URL
+make up               # build locally (op25 ~10-15 min first time)
+# or: make up-prebuilt # pull images, no local build
+```
+
+The node appears as **pending** in the admin dashboard. An admin approves it,
+then assigns a radio system, and the node starts decoding automatically.
 
 ## Environment Variables (`.env`)
 
@@ -167,7 +178,7 @@ The node will appear as **pending** in the server admin dashboard. An admin must
 | `ICECAST_HOST` | No | `localhost` | Icecast hostname (leave as localhost — host network mode) |
 | `ICECAST_PORT` | No | `8000` | Icecast HTTP port |
 | `ICECAST_MOUNT` | No | `/radio` | Icecast mount point |
-| `ICECAST_SOURCE_PASSWORD` | **Yes** | none | Icecast source password. No default — the container refuses to start without it. `setup.sh` generates one; otherwise `openssl rand -base64 24` |
+| `ICECAST_SOURCE_PASSWORD` | **Yes** | none | Icecast source password. No default — the container refuses to start without it. `install.sh` generates one; otherwise `openssl rand -base64 24` |
 | `ICECAST_ADMIN_PASSWORD` | **Yes** | none | Icecast admin password. Same rules |
 | `OP25_API_URL` | No | `http://localhost:8001` | OP25 container HTTP API |
 | `OP25_TERMINAL_URL` | No | `http://localhost:8081` | OP25 HTTP terminal (live talkgroup metadata) |
