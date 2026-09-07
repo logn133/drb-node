@@ -305,65 +305,182 @@ EOF
 fi
 
 # ── 5. Enrollment ───────────────────────────────────────────────────────────
-# This is the client half of Server/drb-c2-core/app/routers/enrollment.py.
-# It does NOT exist in the edge-node app today (mqtt_manager.py:73-85 says so
-# explicitly), so without this section a fresh node can never obtain an
-# api_key against a dynsec broker: MQTT needs the key, and the legacy
-# key-over-MQTT delivery needs MQTT. Doing it here breaks that loop.
+# Client half of Server/drb-c2-core/app/routers/enrollment.py. It does NOT
+# exist in the edge-node app today (mqtt_manager.py:73-85 says so explicitly),
+# so without this section a fresh node can never obtain an api_key against a
+# dynsec broker: MQTT needs the key, and the legacy key-over-MQTT delivery
+# needs MQTT. Doing it here breaks that loop.
+#
+# Two server endpoints, and the exact response shapes verified against
+# enrollment.py @ v1:
+#
+#   POST /nodes/enroll   (X-Enrollment-Token)
+#     200 -> {node_id, pickup_secret, approval_status}
+#     403 -> node_id is ALREADY APPROVED. The CRITICAL GUARD in enrollment.py
+#            refuses to mint a fresh pickup_secret off the shared fleet token.
+#            So we must only ever POST this for a node we have not enrolled
+#            from this machine before — i.e. when configs/pickup_secret is
+#            absent. Re-running the installer must NOT re-POST here.
+#     401 bad/revoked token · 400 missing node_id · 429 rate limited
+#
+#   GET /nodes/{id}/credentials   (X-Pickup-Secret)
+#     Always HTTP 200 with {approval_status, api_key} unless the secret or
+#     node is bad. api_key is null until an admin approves the node in the UI
+#     (nodes.py approve_node() mints node_keys/{id}.api_key synchronously in
+#     the same call — approve is enough; assigning a system is independent and
+#     NOT required for a key). This endpoint has NO already-approved guard, so
+#     it is the correct — and only working — re-run path after approval.
+#     401 -> missing/invalid/rotated pickup secret
+#     404 -> node unknown to C2 (deleted server-side, or never enrolled)
 CREDS="$INSTALL_DIR/configs/credentials.json"
-if [ -s "$CREDS" ] && jq -e '.api_key // empty' "$CREDS" >/dev/null 2>&1; then
-  say "Enrollment"
-  ok "api_key already on disk — skipping enrollment"
-elif [ -z "${C2_URL:-}" ]; then
-  warn "no C2_URL — skipping enrollment"
-else
-  say "Enrolling with $C2_URL"
+PICKUP_FILE="$INSTALL_DIR/configs/pickup_secret"
+
+# GET /nodes/{id}/credentials. Sets CRED_HTTP + CRED_BODY (no -f: we need the
+# body and status on a 4xx). One implementation so first-run and re-run agree.
+creds_pickup() {  # creds_pickup PICKUP_SECRET
+  local _tmp; _tmp="$(mktemp)"
+  CRED_HTTP="$(curl -sS -o "$_tmp" -w '%{http_code}' \
+      "$C2_URL/nodes/$NODE_ID/credentials" -H "X-Pickup-Secret: $1" 2>/dev/null || echo 000)"
+  CRED_BODY="$(cat "$_tmp" 2>/dev/null || true)"
+  rm -f "$_tmp"
+}
+cred_field() { printf '%s' "${CRED_BODY:-}" | jq -r "$1 // empty" 2>/dev/null || true; }
+
+write_creds() {  # write_creds API_KEY
+  umask 077; jq -n --arg k "$1" '{api_key:$k}' > "$CREDS"; umask 022
+  ok "api_key received and written to configs/credentials.json"
+}
+
+say_pending() {  # say_pending APPROVAL_STATUS  — not an error: node is enrolled, key not minted yet
+  warn "not approved yet — C2 reports approval_status=${1:-pending}, no api_key minted."
+  warn "an admin must, at  <app-url>/settings/nodes :  Approve '$NODE_ID'  (assigning a system is separate)."
+  warn "then re-run this installer — it reuses configs/pickup_secret — or fetch it directly:"
+  warn "  curl -fsS $C2_URL/nodes/$NODE_ID/credentials -H \"X-Pickup-Secret: \$(cat $PICKUP_FILE)\" | jq -r .api_key"
+}
+
+# Poll creds_pickup for up to ENROLL_WAIT seconds while still pending. Result
+# left in CRED_HTTP/CRED_BODY. --wait-approval is what would have avoided the
+# original prod bug; the default (0) does not block, so the re-run path below
+# must stand on its own.
+wait_for_key() {  # wait_for_key PICKUP_SECRET
+  [ "${ENROLL_WAIT:-0}" -gt 0 ] || return 0
+  local _end; _end=$(( $(date +%s) + ENROLL_WAIT ))
+  say "Waiting up to ${ENROLL_WAIT}s for an admin to approve '$NODE_ID'"
+  while [ "$(date +%s)" -lt "$_end" ]; do
+    sleep 10
+    creds_pickup "$1"
+    [ "$CRED_HTTP" = 200 ] || return 0
+    [ -z "$(cred_field '.api_key')" ] || return 0
+  done
+}
+
+do_fresh_enroll() {
+  say "Enrolling '$NODE_ID' with $C2_URL"
   [ -n "$ENROLLMENT_TOKEN" ] || ask_secret ENROLLMENT_TOKEN "Enrollment token"
   [ -n "$ENROLLMENT_TOKEN" ] || die "no enrollment token — mint one at Settings -> Nodes, then re-run with --token"
 
+  local BODY RESP PICKUP STATUS KEY
   BODY="$(jq -nc --arg id "$NODE_ID" --arg n "${NODE_NAME:-$NODE_ID}" \
             --argjson lat "${NODE_LAT:-0}" --argjson lon "${NODE_LON:-0}" \
             '{node_id:$id,name:$n,lat:$lat,lon:$lon}')"
-  # Token goes in a header from a shell variable — never on the command line
-  # of a long-lived process, never echoed.
-  RESP="$(curl -fsS -X POST "$C2_URL/nodes/enroll" \
+  # Token goes in a header from a shell variable — never on a process command
+  # line, never echoed.
+  if ! RESP="$(curl -fsS -X POST "$C2_URL/nodes/enroll" \
             -H "Content-Type: application/json" \
             -H "X-Enrollment-Token: $ENROLLMENT_TOKEN" \
-            --data "$BODY" 2>&1)" || die "enroll failed: $RESP
-  401 = bad/revoked token. 403 = this node_id is already approved; an admin
-  must use Reissue key instead. 429 = rate limited, wait a minute."
+            --data "$BODY" 2>&1)"; then
+    case "$RESP" in
+      *403*) die "enroll refused (403): node '$NODE_ID' is already approved on C2, and
+  this machine has no configs/pickup_secret to collect its key with. A token
+  alone cannot re-issue an approved node's key (enrollment.py CRITICAL GUARD).
+  Recover by restoring this node's original configs/pickup_secret and re-running,
+  or have an admin Reissue key (Settings -> Nodes) and write the key into
+  $CREDS by hand (see node-26#6)." ;;
+      *401*) die "enroll refused (401): enrollment token missing/invalid/revoked —
+  mint a fresh one at Settings -> Nodes and re-run with --token." ;;
+      *429*) die "enroll refused (429): rate limited. Wait ~1 minute, then re-run." ;;
+      *)     die "enroll failed: $RESP" ;;
+    esac
+  fi
   PICKUP="$(printf '%s' "$RESP" | jq -r '.pickup_secret')"
   STATUS="$(printf '%s' "$RESP" | jq -r '.approval_status')"
   [ -n "$PICKUP" ] && [ "$PICKUP" != null ] || die "enroll returned no pickup_secret: $RESP"
 
-  umask 077
-  printf '%s' "$PICKUP" > "$INSTALL_DIR/configs/pickup_secret"
-  umask 022
+  umask 077; printf '%s' "$PICKUP" > "$PICKUP_FILE"; umask 022
   ok "enrolled — approval_status=$STATUS (pickup secret saved to configs/pickup_secret)"
 
-  fetch_key() {
-    curl -fsS "$C2_URL/nodes/$NODE_ID/credentials" -H "X-Pickup-Secret: $PICKUP" 2>/dev/null \
-      | jq -r '.api_key // empty'
-  }
-  API_KEY="$(fetch_key || true)"
-  if [ -z "$API_KEY" ] && [ "${ENROLL_WAIT:-0}" -gt 0 ]; then
-    say "Waiting up to ${ENROLL_WAIT}s for an admin to approve '$NODE_ID'"
-    END=$(( $(date +%s) + ENROLL_WAIT ))
-    while [ -z "$API_KEY" ] && [ "$(date +%s)" -lt "$END" ]; do
-      sleep 10; API_KEY="$(fetch_key || true)"
-    done
+  creds_pickup "$PICKUP"
+  [ "$CRED_HTTP" = 200 ] || die "post-enroll credential fetch failed (HTTP $CRED_HTTP): ${CRED_BODY:-<no body>}"
+  KEY="$(cred_field '.api_key')"
+  if [ -z "$KEY" ]; then
+    wait_for_key "$PICKUP" || true
+    KEY="$(cred_field '.api_key')"
   fi
-
-  if [ -n "$API_KEY" ]; then
-    umask 077
-    jq -n --arg k "$API_KEY" '{api_key:$k}' > "$CREDS"
-    umask 022
-    ok "api_key received and written to configs/credentials.json"
+  if [ -n "$KEY" ]; then
+    write_creds "$KEY"
   else
-    warn "not approved yet — no api_key. The node will start but cannot reach MQTT until approved."
-    warn "after approval, re-run this installer (it is idempotent) or run:"
-    warn "  curl -fsS $C2_URL/nodes/$NODE_ID/credentials -H \"X-Pickup-Secret: \$(cat $INSTALL_DIR/configs/pickup_secret)\""
+    say_pending "$(cred_field '.approval_status')"
   fi
+}
+
+if [ -s "$CREDS" ] && jq -e '.api_key // empty' "$CREDS" >/dev/null 2>&1; then
+  say "Enrollment"
+  ok "api_key already on disk — skipping enrollment"
+elif [ -z "${C2_URL:-}" ]; then
+  say "Enrollment"
+  warn "no C2_URL — skipping enrollment"
+elif [ -s "$PICKUP_FILE" ]; then
+  # RE-RUN. This node already enrolled from this machine. Do NOT POST
+  # /nodes/enroll again — an approved node_id gets 403 there, and the v1
+  # installer's own "re-run to pick up the key" advice then dead-ends on
+  # "use Reissue key". The pickup endpoint has no such guard: use it.
+  say "Enrollment — collecting credentials for '$NODE_ID' (pickup secret from a previous run)"
+  PICKUP="$(cat "$PICKUP_FILE")"
+  creds_pickup "$PICKUP"
+  case "$CRED_HTTP" in
+    200)
+      API_KEY="$(cred_field '.api_key')"
+      if [ -z "$API_KEY" ]; then
+        wait_for_key "$PICKUP" || true
+        API_KEY="$(cred_field '.api_key')"
+      fi
+      if [ -n "$API_KEY" ]; then
+        write_creds "$API_KEY"
+      else
+        # Still pending. Enrolled and idempotent — next run collects the key.
+        # Clean exit, fall through to start the stack. NOT a failure.
+        say_pending "$(cred_field '.approval_status')"
+      fi
+      ;;
+    401)
+      if [ -n "$ENROLLMENT_TOKEN" ]; then
+        warn "saved pickup secret rejected (401) — likely rotated by a re-enroll elsewhere. Re-enrolling with --token."
+        rm -f "$PICKUP_FILE"
+        do_fresh_enroll
+      else
+        die "saved pickup secret is stale (401) and no --token was given. Re-run with
+  --token DRB-… to re-enroll (only works while the node is still pending), or
+  have an admin Reissue key for an approved node and write $CREDS by hand."
+      fi
+      ;;
+    404)
+      if [ -n "$ENROLLMENT_TOKEN" ]; then
+        warn "C2 does not know node '$NODE_ID' (404) — deleted server-side or never fully enrolled. Re-enrolling with --token."
+        rm -f "$PICKUP_FILE"
+        do_fresh_enroll
+      else
+        die "C2 does not know node '$NODE_ID' (404) and no --token was given.
+  Re-run with --token DRB-… to enroll it again."
+      fi
+      ;;
+    000)
+      die "could not reach $C2_URL/nodes/$NODE_ID/credentials — check --c2-url and connectivity." ;;
+    *)
+      die "credential pickup failed (HTTP $CRED_HTTP): ${CRED_BODY:-<no body>}" ;;
+  esac
+else
+  say "Enrollment"
+  do_fresh_enroll
 fi
 
 # ── 6. Images + start ───────────────────────────────────────────────────────
@@ -413,5 +530,9 @@ if [ "${GENERATED_DASH:-0}" = 1 ]; then
   printf "${Y}Generated dashboard password (shown once): %s${N}\n\n" "$DASHBOARD_PASS"
 fi
 if [ ! -s "$CREDS" ]; then
-  printf "${Y}This node has no api_key yet. After approving it, re-run the same install\ncommand — it is idempotent and will pick the key up.${N}\n\n"
+  if [ -s "$PICKUP_FILE" ]; then
+    printf "${Y}This node has no api_key yet. After an admin approves it, re-run the same\ninstall command — it reuses configs/pickup_secret and will collect the key\n(no --token needed for the re-run).${N}\n\n"
+  else
+    printf "${Y}This node has no api_key and no saved pickup secret, so a plain re-run cannot\nfix it. Re-run with --token DRB-… to enroll; or, if the node is already\napproved, have an admin Reissue key and write it into\n%s by hand.${N}\n\n" "$CREDS"
+  fi
 fi
