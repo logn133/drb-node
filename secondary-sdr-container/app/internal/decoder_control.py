@@ -2,12 +2,23 @@ import json
 import os
 import signal
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from internal.logger import create_logger
 
 LOGGER = create_logger(__name__)
+
+# AIS-catcher streams one JSON object per received message on stdout rather
+# than writing a periodic snapshot file (dump1090's approach above) — so the
+# current-vessel snapshot lives in memory, keyed by mmsi, kept warm by a
+# background reader thread for as long as the subprocess we started is
+# alive. Unlike the pgid-file state, this does NOT survive this API
+# process restarting independently of its subprocess — acceptable since
+# nothing here does that today.
+_ais_vessels: Dict[str, Dict[str, Any]] = {}
+_ais_lock = threading.Lock()
 
 # The node's SECOND SDR, addressed by RTL-SDR index — not serial. op25 always
 # claims index 0 (its DeviceConfig.args has no serial concept either, see
@@ -62,6 +73,58 @@ def _adsb_command() -> List[str]:
     ]
 
 
+def _ais_command() -> List[str]:
+    return [
+        "/opt/AIS-catcher/build/AIS-catcher",
+        "-d", str(SECONDARY_SDR_DEVICE_INDEX),
+        "-o", "JSON",
+    ]
+
+
+def _ais_reader(proc: subprocess.Popen) -> None:
+    """
+    Consume AIS-catcher's stdout, one JSON message per line, and keep the
+    latest report per mmsi. Field names (mmsi/lat/lon/speed/course or
+    heading/shipname or name) are believed correct from AIS-catcher's
+    published JSON output docs but UNVERIFIED against a real capture in
+    this session — same caveat as dump1090's aircraft.json mapping.
+    Malformed/partial lines (e.g. static-data-only messages with no
+    position) are skipped rather than raising, since dropping one line must
+    never kill the reader thread.
+    """
+    if not proc.stdout:
+        return
+    for line in proc.stdout:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        mmsi = msg.get("mmsi")
+        if not mmsi:
+            continue
+        # AIS-catcher emits separate message TYPES per mmsi — static data
+        # (name, no position) and position reports (lat/lon, no name) arrive
+        # as distinct lines. Merge onto the existing entry, only overwriting
+        # a field the new message actually carries, so a position-only
+        # report doesn't blank out a name learned from an earlier message.
+        name = (msg.get("shipname") or msg.get("name") or "").strip() or None
+        heading = msg.get("heading") if msg.get("heading") is not None else msg.get("course")
+        updates = {
+            "mmsi": str(mmsi),
+            "name": name,
+            "lat": msg.get("lat"),
+            "lon": msg.get("lon"),
+            "speed_kt": msg.get("speed"),
+            "heading_deg": heading,
+        }
+        with _ais_lock:
+            existing = _ais_vessels.get(str(mmsi), {})
+            for key, value in updates.items():
+                if value is not None:
+                    existing[key] = value
+            _ais_vessels[str(mmsi)] = existing
+
+
 def start(mode: str) -> bool:
     if is_running():
         stop()
@@ -69,12 +132,23 @@ def start(mode: str) -> bool:
     if mode == "adsb":
         cmd = _adsb_command()
     elif mode == "ais":
-        raise ValueError("AIS mode is not wired yet (node-26#9) — only 'adsb' runs today.")
+        cmd = _ais_command()
+        with _ais_lock:
+            _ais_vessels.clear()
     else:
         raise ValueError(f"Unknown secondary SDR mode: {mode!r}")
 
     try:
-        proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+        needs_stdout = mode == "ais"
+        proc = subprocess.Popen(
+            cmd,
+            preexec_fn=os.setsid,
+            stdout=subprocess.PIPE if needs_stdout else None,
+            text=True if needs_stdout else None,
+            bufsize=1 if needs_stdout else -1,
+        )
+        if needs_stdout:
+            threading.Thread(target=_ais_reader, args=(proc,), daemon=True).start()
         _save_state(proc.pid, mode)
         LOGGER.info(f"Started secondary SDR decoder mode={mode!r} pid={proc.pid}")
         return True
@@ -144,4 +218,8 @@ def data() -> Dict[str, Any]:
     mode = _read_mode()
     if mode == "adsb":
         return {"mode": mode, "aircraft": _read_adsb_snapshot()}
-    return {"mode": mode, "aircraft": []}
+    if mode == "ais":
+        with _ais_lock:
+            vessels = list(_ais_vessels.values())
+        return {"mode": mode, "vessels": vessels}
+    return {"mode": mode, "aircraft": [], "vessels": []}

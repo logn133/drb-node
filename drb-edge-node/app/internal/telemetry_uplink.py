@@ -33,9 +33,12 @@ async def telemetry_uplink_loop():
     while True:
         await asyncio.sleep(UPLINK_INTERVAL_SECONDS)
         config = load_node_config()
-        if config.secondary_sdr_mode != "adsb":
+        if config.secondary_sdr_mode not in ("adsb", "ais"):
             continue
         snapshot = await secondary_sdr_client.data()
-        if not snapshot or not snapshot.get("aircraft"):
+        if not snapshot:
             continue
-        await _post_snapshot("/telemetry/adsb", {"aircraft": snapshot["aircraft"]})
+        if config.secondary_sdr_mode == "adsb" and snapshot.get("aircraft"):
+            await _post_snapshot("/telemetry/adsb", {"aircraft": snapshot["aircraft"]})
+        elif config.secondary_sdr_mode == "ais" and snapshot.get("vessels"):
+            await _post_snapshot("/telemetry/ais", {"vessels": snapshot["vessels"]})
