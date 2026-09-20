@@ -136,6 +136,9 @@ class Settings(BaseSettings):
     op25_api_url: str = "http://localhost:8001"
     op25_terminal_url: str = "http://localhost:8081"
 
+    # Secondary SDR container (node-26#9) — ADS-B / AIS on a second SDR
+    secondary_sdr_api_url: str = "http://localhost:8002"
+
     # Paths (volume mounts)
     config_path: str = "/configs"
     recordings_path: str = "/recordings"

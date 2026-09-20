@@ -32,6 +32,21 @@ services:
     depends_on:
       - icecast
 
+  # Claims the node's SECOND physical SDR (op25 always claims the first).
+  # Only useful if secondary_sdr_mode is set to adsb|ais via the edge-node
+  # config; otherwise it just sits idle answering /secondary/status. See
+  # node-26#9. Same network/device access as op25 for the same reason: it
+  # needs the raw USB device, not a virtualized one.
+  secondary-sdr:
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/secondary-sdr:latest
+    build: ./secondary-sdr-container
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    env_file: .env
+    volumes:
+      - /dev:/dev
+
   edge-node:
     image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/edge-node:latest
     build: ./drb-edge-node
