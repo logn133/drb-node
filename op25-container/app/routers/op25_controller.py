@@ -1,6 +1,7 @@
 from fastapi import HTTPException, APIRouter
 import subprocess
 import os
+import re
 import signal
 import json
 from models import ConfigGenerator, DecodeMode, ChannelConfig, DeviceConfig, TrunkingConfig, TrunkingChannelConfig, TerminalConfig, MetadataConfig, MetadataStreamConfig, HARDWARE_PRESETS
@@ -68,6 +69,24 @@ def create_op25_router():
     @router.get("/status")
     async def get_status():
         return {"status": "running" if _is_running() else "stopped"}
+
+    @router.get("/devices")
+    async def list_sdr_devices():
+        """Enumerate connected SDR-looking USB devices via lsusb.
+
+        Same match heuristic as install.sh's one-shot host check — good enough
+        to answer "is a second SDR plugged in", not a serial-level device
+        binding (op25's DeviceConfig.args has no serial concept yet either).
+        """
+        devices = []
+        try:
+            out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5).stdout
+            for line in out.splitlines():
+                if re.search(r"rtl2838|realtek.*283[28]|sdr", line, re.IGNORECASE):
+                    devices.append(line.strip())
+        except Exception as e:
+            LOGGER.warning(f"SDR device enumeration failed: {e}")
+        return {"count": len(devices), "devices": devices}
 
     @router.post("/generate-config")
     async def generate_config(generator: ConfigGenerator):

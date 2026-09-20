@@ -224,6 +224,7 @@ async def on_config_push(payload: dict):
     hardware_preset = payload.pop("hardware_preset", None)
     ppm_override = payload.pop("ppm_override", None)
     node_type = payload.pop("node_type", None)
+    secondary_sdr_mode = payload.pop("secondary_sdr_mode", None)
     enforce_override_timeout = payload.pop("enforce_override_timeout", None)
     try:
         config = SystemConfig(**payload)
@@ -243,6 +244,8 @@ async def on_config_push(payload: dict):
         node_cfg.ppm_override = float(ppm_override)
     if node_type is not None:
         node_cfg.node_type = node_type
+    if secondary_sdr_mode is not None:
+        node_cfg.secondary_sdr_mode = secondary_sdr_mode
     if enforce_override_timeout is not None:
         node_cfg.enforce_override_timeout = bool(enforce_override_timeout)
     save_node_config(node_cfg)

@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install system dependencies
 RUN apt-get update && \
     apt-get upgrade -y && \
-    apt-get install git pulseaudio pulseaudio-utils liquidsoap -y
+    apt-get install git pulseaudio pulseaudio-utils liquidsoap usbutils -y
 
 # Install custom PulseAudio system config (enables anonymous access for edge-node)
 COPY system.pa /etc/pulse/system.pa
