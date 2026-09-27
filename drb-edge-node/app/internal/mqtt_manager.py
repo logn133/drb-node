@@ -237,11 +237,13 @@ class MQTTManager:
         secondary = await secondary_sdr_client.status()
         if secondary is not None:
             payload["secondary_sdr_running"] = [r["mode"] for r in secondary.get("running", [])]
-        # Best-effort hardware report — omit rather than guess. op25's :stable
-        # image has no lsusb, so fall back to the secondary-sdr container's count.
-        count = devices.get("count") if devices else None
-        if count is None and secondary is not None:
-            count = secondary.get("sdr_count")
+        # Best-effort hardware report — omit rather than guess. Prefer the
+        # secondary-sdr container's count: op25's :stable image has no lsusb and
+        # its /op25/devices answers 0 rather than "unknown" when that fails. A
+        # node running op25 has at least one SDR, so 0 is never a real reading.
+        count = secondary.get("sdr_count") if secondary is not None else None
+        if not count and devices:
+            count = devices.get("count") or None
         if count is not None:
             payload["sdr_count"] = count
         self._publish(self._t_checkin, payload, qos=1)
