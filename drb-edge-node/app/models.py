@@ -34,6 +34,7 @@ class NodeConfig(BaseModel):
     hardware_preset: str = "rtl-sdr-v3"
     ppm_override: Optional[float] = None
     node_type: str = "fixed"  # fixed or portable
+    secondary_sdr_mode: str = "none"  # none | adsb | ais | op25_2 — requires a second physical SDR
     enforce_override_timeout: bool = True
     override_system_id: Optional[str] = None
     override_config: Optional[SystemConfig] = None

@@ -65,6 +65,16 @@ class OP25Client:
             logger.error(f"OP25 status failed: {e}")
             return None
 
+    async def devices(self) -> Optional[Dict[str, Any]]:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{self.api_url}/op25/devices")
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            logger.error(f"OP25 device enumeration failed: {e}")
+            return None
+
     async def generate_config(self, config: Dict[str, Any]) -> bool:
         try:
             async with httpx.AsyncClient(timeout=10) as client:

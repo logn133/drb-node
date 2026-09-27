@@ -213,7 +213,9 @@ class MQTTManager:
     async def _publish_checkin(self):
         from app.internal.discord_radio import radio_bot
         from app.internal.config_manager import load_node_config
+        from app.internal.op25_client import op25_client
         config = load_node_config()
+        devices = await op25_client.devices()
         payload = {
             "node_id": settings.node_id,
             "name": settings.node_name,
@@ -225,7 +227,12 @@ class MQTTManager:
             "is_overridden": config.override_system_id is not None and config.node_type != "portable",
             "override_system_id": config.override_system_id,
             "enforce_override_timeout": config.enforce_override_timeout,
+            "secondary_sdr_mode": config.secondary_sdr_mode,
         }
+        # Best-effort — the first node-initiated hardware-report field. Omit
+        # rather than guess if op25's control API is unreachable.
+        if devices is not None:
+            payload["sdr_count"] = devices.get("count")
         self._publish(self._t_checkin, payload, qos=1)
 
     def _publish(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):

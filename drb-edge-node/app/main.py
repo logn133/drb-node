@@ -224,6 +224,7 @@ async def on_config_push(payload: dict):
     hardware_preset = payload.pop("hardware_preset", None)
     ppm_override = payload.pop("ppm_override", None)
     node_type = payload.pop("node_type", None)
+    secondary_sdr_mode = payload.pop("secondary_sdr_mode", None)
     enforce_override_timeout = payload.pop("enforce_override_timeout", None)
     try:
         config = SystemConfig(**payload)
@@ -243,6 +244,8 @@ async def on_config_push(payload: dict):
         node_cfg.ppm_override = float(ppm_override)
     if node_type is not None:
         node_cfg.node_type = node_type
+    if secondary_sdr_mode is not None:
+        node_cfg.secondary_sdr_mode = secondary_sdr_mode
     if enforce_override_timeout is not None:
         node_cfg.enforce_override_timeout = bool(enforce_override_timeout)
     save_node_config(node_cfg)
@@ -256,6 +259,13 @@ async def on_config_push(payload: dict):
     await asyncio.sleep(2)
     await op25_client.start()
     logger.info(f"Config push applied: {config.name}")
+
+    if secondary_sdr_mode is not None:
+        from app.internal.secondary_sdr_client import secondary_sdr_client
+        if secondary_sdr_mode in ("adsb", "ais"):
+            await secondary_sdr_client.start(secondary_sdr_mode)
+        else:
+            await secondary_sdr_client.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -312,12 +322,20 @@ async def lifespan(app: FastAPI):
             logger.warning(f"OP25 not ready yet (attempt {attempt + 1}/10), retrying in 3s…")
             await asyncio.sleep(3)
 
+    if node_cfg.secondary_sdr_mode in ("adsb", "ais"):
+        from app.internal.secondary_sdr_client import secondary_sdr_client
+        logger.info(f"Resuming secondary SDR (mode={node_cfg.secondary_sdr_mode!r}) after restart.")
+        await secondary_sdr_client.start(node_cfg.secondary_sdr_mode)
+
     heartbeat_task = asyncio.create_task(mqtt_manager.heartbeat_loop())
+    from app.internal.telemetry_uplink import telemetry_uplink_loop
+    telemetry_task = asyncio.create_task(telemetry_uplink_loop())
 
     yield  # --- app running ---
 
     logger.info("Edge node shutting down.")
     heartbeat_task.cancel()
+    telemetry_task.cancel()
     await metadata_watcher.stop()
     await call_recorder.stop()
     await radio_bot.stop()
