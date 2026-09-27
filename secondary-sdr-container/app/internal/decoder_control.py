@@ -86,7 +86,7 @@ def _ais_command(index: int) -> List[str]:
     return [
         "/opt/AIS-catcher/build/AIS-catcher",
         f"-d:{index}",  # "-d <x>" would select by serial, not index
-        "-o", "JSON",
+        "-o", "5",  # JSON Full: decoded fields (4 = sparse, "JSON" is rejected)
     ]
 
 
