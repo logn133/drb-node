@@ -236,6 +236,12 @@ class MQTTManager:
         }
         payload["sdr_pins"] = config.sdr_pins
         secondary = await secondary_sdr_client.status()
+        # Unreachable secondary-sdr: say so with explicit nulls. C2 only
+        # overwrites keys present in the checkin, so omitting them would leave
+        # a dead decoder showing "Running" forever.
+        payload["secondary_sdr_running"] = None
+        payload["sdr_devices"] = None
+        payload["op25_sdr_serial"] = None
         if secondary is not None:
             payload["secondary_sdr_running"] = [r["mode"] for r in secondary.get("running", [])]
             if secondary.get("devices") is not None:

@@ -568,7 +568,8 @@
       return `<option value="">${esc(autoLabel)}</option>` +
         devs.map(d => `<option value="${esc(d.serial)}" ${d.serial === selected ? 'selected' : ''}>` +
           `SDR ${d.index + 1} · serial ${esc(d.serial)}${d.duplicate_serial ? ' (shared serial!)' : ''}</option>`).join('') +
-        (selected && !known ? `<option value="${esc(selected)}" selected>serial ${esc(selected)} (not plugged in)</option>` : '');
+        (selected && !known ? `<option value="${esc(selected)}" selected>serial ${esc(selected)} ` +
+          `(${sdr.devices === null ? 'not reported' : 'not plugged in'})</option>` : '');
     }
 
     function renderSdr() {
@@ -585,7 +586,7 @@
       const running = sdr.running || [];
       sdrRows.forEach((row, i) => {
         const [name, hint] = SDR_LABELS[row.mode] || [row.mode, ''];
-        const pinMissing = row.pin && !(sdr.devices || []).some(d => d.serial === row.pin);
+        const pinMissing = row.pin && sdr.devices !== null && !sdr.devices.some(d => d.serial === row.pin);
         const state = !row.enabled ? 'Off'
           : sdrDirty ? 'Unsaved'
           : sdr.running === null ? 'Unknown'
