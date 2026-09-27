@@ -547,8 +547,12 @@
       let rank = 0;
       sdrRows.forEach((row, i) => {
         const [name, hint] = SDR_LABELS[row.mode] || [row.mode, ''];
-        const running = sdrRunning.includes(row.mode);
-        const state = !row.enabled ? 'Off' : running ? 'Running' : (sdrDirty ? 'Unsaved' : 'Waiting for SDR');
+        const running = (sdrRunning || []).includes(row.mode);
+        // Unsaved first: a reorder must not keep claiming the old order is live.
+        const state = !row.enabled ? 'Off'
+          : sdrDirty ? 'Unsaved'
+          : sdrRunning === null ? 'Unknown'
+          : running ? 'Running' : 'Waiting for SDR';
         const el = document.createElement('div');
         el.className = 'sdr-row';
         el.innerHTML = `
@@ -557,7 +561,7 @@
           <span class="sdr-name">${name}<small>${hint}</small></span>
           <button class="sdr-move" aria-label="Move ${name} up" ${i === 0 ? 'disabled' : ''}>▲</button>
           <button class="sdr-move" aria-label="Move ${name} down" ${i === sdrRows.length - 1 ? 'disabled' : ''}>▼</button>
-          <span class="sdr-state ${running && row.enabled ? 'on' : ''}">${state}</span>`;
+          <span class="sdr-state ${state === 'Running' ? 'on' : ''}">${state}</span>`;
         const [box] = el.getElementsByTagName('input');
         const [up, down] = el.getElementsByTagName('button');
         box.onchange = () => { row.enabled = box.checked; markSdrDirty(); };
@@ -580,7 +584,7 @@
         const r = await fetch('/api/secondary');
         if (!r.ok) return;
         const d = await r.json();
-        sdrRunning = d.running || [];
+        sdrRunning = d.running;  // null = secondary SDR service unreachable
         sdrRows = [
           ...d.priority.map(mode => ({ mode, enabled: true })),
           ...d.modes.filter(m => !d.priority.includes(m)).map(mode => ({ mode, enabled: false })),
