@@ -210,10 +210,14 @@ class MQTTManager:
             logger.info("No API key on disk — requesting re-delivery from C2 server.")
             self._publish(self._t_key_request, {}, qos=1)
 
+    async def publish_checkin(self):
+        await self._publish_checkin()
+
     async def _publish_checkin(self):
         from app.internal.discord_radio import radio_bot
         from app.internal.config_manager import load_node_config
         from app.internal.op25_client import op25_client
+        from app.internal.secondary_sdr_client import secondary_sdr_client
         config = load_node_config()
         devices = await op25_client.devices()
         payload = {
@@ -228,11 +232,18 @@ class MQTTManager:
             "override_system_id": config.override_system_id,
             "enforce_override_timeout": config.enforce_override_timeout,
             "secondary_sdr_mode": config.secondary_sdr_mode,
+            "secondary_sdr_priority": config.secondary_sdr_priority,
         }
-        # Best-effort — the first node-initiated hardware-report field. Omit
-        # rather than guess if op25's control API is unreachable.
-        if devices is not None:
-            payload["sdr_count"] = devices.get("count")
+        secondary = await secondary_sdr_client.status()
+        if secondary is not None:
+            payload["secondary_sdr_running"] = [r["mode"] for r in secondary.get("running", [])]
+        # Best-effort hardware report — omit rather than guess. op25's :stable
+        # image has no lsusb, so fall back to the secondary-sdr container's count.
+        count = devices.get("count") if devices else None
+        if count is None and secondary is not None:
+            count = secondary.get("sdr_count")
+        if count is not None:
+            payload["sdr_count"] = count
         self._publish(self._t_checkin, payload, qos=1)
 
     def _publish(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):

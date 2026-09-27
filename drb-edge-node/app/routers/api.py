@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
-from typing import Optional
+from typing import List, Optional
 import asyncio
 import httpx
 from app.config import settings
-from app.models import SystemConfig
+from app.models import SystemConfig, SECONDARY_SDR_MODES
 from app.internal.op25_client import op25_client
 from app.internal.config_manager import load_node_config, save_node_config, apply_system_config
 from app.internal.call_recorder import call_recorder
@@ -202,6 +202,30 @@ async def ack_override(timeout_minutes: int = Body(1440)):
             return r.json()
     except Exception as e:
         raise HTTPException(500, f"Failed to contact C2: {e}")
+
+
+@router.get("/secondary")
+async def get_secondary():
+    """Secondary SDR priority plus what's actually running (node-26#9)."""
+    from app.internal.secondary_sdr_client import secondary_sdr_client
+    status = await secondary_sdr_client.status()
+    return {
+        "priority": load_node_config().secondary_sdr_priority,
+        "modes": list(SECONDARY_SDR_MODES),
+        "running": [r["mode"] for r in status.get("running", [])] if status else None,
+        "sdr_count": status.get("sdr_count") if status else None,
+    }
+
+
+@router.post("/secondary/priority")
+async def set_secondary_priority(priority: List[str] = Body(..., embed=True)):
+    """Set the ordered list the spare SDRs work through. Never restarts op25."""
+    from app.internal.secondary_priority import set_secondary_priority as apply_priority
+    unknown = [m for m in priority if m not in SECONDARY_SDR_MODES]
+    if unknown:
+        raise HTTPException(400, f"Unknown secondary SDR mode(s): {unknown}")
+    running = await apply_priority(priority)
+    return {"ok": True, "priority": load_node_config().secondary_sdr_priority, "running": running}
 
 
 @router.post("/discord/join")

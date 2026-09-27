@@ -105,6 +105,30 @@
       background: rgba(255, 255, 255, 0.1);
     }
 
+    .sdr-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.55rem 0;
+      border-bottom: 1px solid var(--glass-border);
+    }
+    .sdr-row:last-child { border-bottom: none; }
+    .sdr-rank { width: 1.2rem; color: var(--text-muted); font-size: 0.8rem; text-align: right; }
+    .sdr-name { flex: 1; }
+    .sdr-name small { display: block; color: var(--text-muted); font-size: 0.75rem; }
+    .sdr-move {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--glass-border);
+      color: var(--text-main);
+      border-radius: 6px;
+      width: 1.9rem;
+      height: 1.9rem;
+      cursor: pointer;
+    }
+    .sdr-move:disabled { opacity: 0.3; cursor: default; }
+    .sdr-state { font-size: 0.75rem; min-width: 6.5rem; text-align: right; color: var(--text-muted); }
+    .sdr-state.on { color: var(--success); }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -360,6 +384,22 @@
         </div>
       </div>
 
+      <!-- Secondary SDRs Card (node-26#9) -->
+      <div class="glass-card">
+        <div class="card-header">
+          <div class="card-title">Secondary SDRs</div>
+        </div>
+        <p style="color: var(--text-muted); font-size: 0.8rem; margin: 0 0 0.5rem;">
+          OP25 always keeps its own SDR. Every other SDR runs the next enabled item below, top first.
+          <span id="sdr-summary"></span>
+        </p>
+        <div id="sdr-list"></div>
+        <div style="display:flex; gap:0.75rem; align-items:center; margin-top:0.75rem;">
+          <button id="sdr-save" class="btn btn-primary" style="padding:0.5rem 1rem;" onclick="saveSdrPriority()" disabled>Save priority</button>
+          <span id="sdr-msg" style="color: var(--text-muted); font-size: 0.8rem;"></span>
+        </div>
+      </div>
+
       <!-- Local Listening Card -->
       <div class="glass-card player-card">
         <div class="card-header" style="margin-bottom:0.5rem; border:none;">
@@ -491,6 +531,99 @@
         console.error('Ack failed:', e);
       }
     }
+
+    // ── Secondary SDR priority ────────────────────────────────────────────
+    const SDR_LABELS = {
+      adsb: ['ADS-B', 'Aircraft · 1090 MHz'],
+      ais: ['AIS', 'Vessels · 162 MHz'],
+    };
+    let sdrRows = [];      // [{mode, enabled}] in display order
+    let sdrRunning = [];
+    let sdrDirty = false;
+
+    function renderSdr() {
+      const list = document.getElementById('sdr-list');
+      list.innerHTML = '';
+      let rank = 0;
+      sdrRows.forEach((row, i) => {
+        const [name, hint] = SDR_LABELS[row.mode] || [row.mode, ''];
+        const running = sdrRunning.includes(row.mode);
+        const state = !row.enabled ? 'Off' : running ? 'Running' : (sdrDirty ? 'Unsaved' : 'Waiting for SDR');
+        const el = document.createElement('div');
+        el.className = 'sdr-row';
+        el.innerHTML = `
+          <span class="sdr-rank">${row.enabled ? ++rank : ''}</span>
+          <input type="checkbox" ${row.enabled ? 'checked' : ''} aria-label="Enable ${name}">
+          <span class="sdr-name">${name}<small>${hint}</small></span>
+          <button class="sdr-move" aria-label="Move ${name} up" ${i === 0 ? 'disabled' : ''}>▲</button>
+          <button class="sdr-move" aria-label="Move ${name} down" ${i === sdrRows.length - 1 ? 'disabled' : ''}>▼</button>
+          <span class="sdr-state ${running && row.enabled ? 'on' : ''}">${state}</span>`;
+        const [box] = el.getElementsByTagName('input');
+        const [up, down] = el.getElementsByTagName('button');
+        box.onchange = () => { row.enabled = box.checked; markSdrDirty(); };
+        up.onclick = () => { [sdrRows[i - 1], sdrRows[i]] = [sdrRows[i], sdrRows[i - 1]]; markSdrDirty(); };
+        down.onclick = () => { [sdrRows[i + 1], sdrRows[i]] = [sdrRows[i], sdrRows[i + 1]]; markSdrDirty(); };
+        list.appendChild(el);
+      });
+      document.getElementById('sdr-save').disabled = !sdrDirty;
+    }
+
+    function markSdrDirty() {
+      sdrDirty = true;
+      document.getElementById('sdr-msg').textContent = '';
+      renderSdr();
+    }
+
+    async function loadSdr() {
+      if (sdrDirty) return;  // never clobber unsaved edits with a poll
+      try {
+        const r = await fetch('/api/secondary');
+        if (!r.ok) return;
+        const d = await r.json();
+        sdrRunning = d.running || [];
+        sdrRows = [
+          ...d.priority.map(mode => ({ mode, enabled: true })),
+          ...d.modes.filter(m => !d.priority.includes(m)).map(mode => ({ mode, enabled: false })),
+        ];
+        const summary = document.getElementById('sdr-summary');
+        if (d.running === null) {
+          summary.textContent = 'Secondary SDR service is not responding.';
+        } else if (d.sdr_count != null) {
+          const spare = Math.max(d.sdr_count - 1, 0);
+          summary.textContent = `This node has ${d.sdr_count} SDR${d.sdr_count === 1 ? '' : 's'}, so ${spare} spare.`;
+        }
+        renderSdr();
+      } catch (e) {
+        console.error('Secondary SDR load failed:', e);
+      }
+    }
+
+    async function saveSdrPriority() {
+      const priority = sdrRows.filter(r => r.enabled).map(r => r.mode);
+      const btn = document.getElementById('sdr-save');
+      const msg = document.getElementById('sdr-msg');
+      btn.disabled = true;
+      msg.textContent = 'Applying…';
+      try {
+        const r = await fetch('/api/secondary/priority', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ priority }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const d = await r.json();
+        sdrDirty = false;
+        msg.textContent = d.running === null ? 'Saved, but the secondary SDR service did not respond.' : 'Saved.';
+        await loadSdr();
+      } catch (e) {
+        console.error('Secondary SDR save failed:', e);
+        msg.textContent = 'Save failed.';
+        btn.disabled = false;
+      }
+    }
+
+    loadSdr();
+    setInterval(loadSdr, 10000);
 
     refresh();
     setInterval(refresh, 2000); // Polling every 2 seconds

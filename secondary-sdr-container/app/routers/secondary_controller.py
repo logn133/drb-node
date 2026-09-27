@@ -1,3 +1,5 @@
+from typing import List, Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -11,8 +13,24 @@ class StartBody(BaseModel):
     mode: str  # adsb | ais
 
 
+class StopBody(BaseModel):
+    mode: Optional[str] = None  # omit to stop every decoder
+
+
+class ApplyBody(BaseModel):
+    priority: List[str]  # ordered, e.g. ["adsb", "ais"]
+
+
 def create_secondary_router():
     router = APIRouter()
+
+    @router.post("/apply")
+    async def apply(body: ApplyBody):
+        try:
+            live = decoder_control.apply(body.priority)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"running": live}
 
     @router.post("/start")
     async def start(body: StartBody):
@@ -21,12 +39,12 @@ def create_secondary_router():
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         if not ok:
-            raise HTTPException(status_code=500, detail="Failed to start secondary SDR decoder")
+            raise HTTPException(status_code=409, detail="No free SDR for this decoder")
         return {"status": f"secondary SDR started ({body.mode})"}
 
     @router.post("/stop")
-    async def stop():
-        decoder_control.stop()
+    async def stop(body: Optional[StopBody] = None):
+        decoder_control.stop(body.mode if body else None)
         return {"status": "secondary SDR stopped"}
 
     @router.get("/status")
