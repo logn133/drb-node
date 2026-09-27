@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import FastAPI
 from app.config import settings
-from app.models import SystemConfig
+from app.models import SystemConfig, normalize_sdr_pins, normalize_secondary_priority
 from app.internal.logger import logger
 from app.internal.mqtt_manager import mqtt_manager
 from app.internal import credentials
@@ -158,9 +158,12 @@ async def on_command(payload: dict):
         )
     elif action == "discord_leave":
         await radio_bot.leave()
-    elif action == "set_secondary_priority":
-        from app.internal.secondary_priority import set_secondary_priority
-        await set_secondary_priority(payload.get("priority") or [])
+    elif action in ("set_sdr_config", "set_secondary_priority"):
+        from app.internal.sdr_settings import set_sdr_settings
+        try:
+            await set_sdr_settings(payload.get("priority"), payload.get("pins"))
+        except ValueError as e:
+            logger.error(f"Rejected SDR settings from C2: {e}")
     elif action == "op25_restart":
         from app.internal.op25_client import op25_client
         await op25_client.stop()
@@ -228,6 +231,7 @@ async def on_config_push(payload: dict):
     ppm_override = payload.pop("ppm_override", None)
     node_type = payload.pop("node_type", None)
     secondary_sdr_priority = payload.pop("secondary_sdr_priority", None)
+    sdr_pins = payload.pop("sdr_pins", None)
     secondary_sdr_mode = payload.pop("secondary_sdr_mode", None)  # legacy single-mode C2
     enforce_override_timeout = payload.pop("enforce_override_timeout", None)
     try:
@@ -250,6 +254,16 @@ async def on_config_push(payload: dict):
         node_cfg.node_type = node_type
     if enforce_override_timeout is not None:
         node_cfg.enforce_override_timeout = bool(enforce_override_timeout)
+    if secondary_sdr_priority is None and secondary_sdr_mode is not None:
+        secondary_sdr_priority = [secondary_sdr_mode]
+    if secondary_sdr_priority is not None:
+        node_cfg.secondary_sdr_priority = normalize_secondary_priority(secondary_sdr_priority)
+        node_cfg.secondary_sdr_mode = (node_cfg.secondary_sdr_priority or ["none"])[0]
+    if sdr_pins is not None:
+        try:
+            node_cfg.sdr_pins = normalize_sdr_pins(sdr_pins)
+        except ValueError as e:
+            logger.error(f"Ignoring invalid sdr_pins in config push: {e}")
     save_node_config(node_cfg)
 
     from app.internal.op25_client import op25_client
@@ -257,16 +271,16 @@ async def on_config_push(payload: dict):
         logger.error(f"Failed to generate OP25 config for {config.name}")
         return
 
+    # OP25's (pinned) dongle may be one a decoder holds right now: free the
+    # spares, restart OP25 on its own dongle, then hand the rest back out.
+    from app.internal.secondary_sdr_client import secondary_sdr_client
+    from app.internal.sdr_settings import apply_secondaries
+    await secondary_sdr_client.apply([], {}, [])
     await op25_client.stop()
     await asyncio.sleep(2)
     await op25_client.start()
     logger.info(f"Config push applied: {config.name}")
-
-    if secondary_sdr_priority is None and secondary_sdr_mode is not None:
-        secondary_sdr_priority = [secondary_sdr_mode]
-    if secondary_sdr_priority is not None:
-        from app.internal.secondary_priority import set_secondary_priority
-        await set_secondary_priority(secondary_sdr_priority)
+    await apply_secondaries()
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +339,9 @@ async def lifespan(app: FastAPI):
 
     # After op25 has claimed its dongle, so the decoders only get the spares.
     if node_cfg.secondary_sdr_priority:
-        from app.internal.secondary_sdr_client import secondary_sdr_client
+        from app.internal.sdr_settings import apply_secondaries
         logger.info(f"Resuming secondary SDRs (priority={node_cfg.secondary_sdr_priority!r}) after restart.")
-        await secondary_sdr_client.apply(node_cfg.secondary_sdr_priority)
+        await apply_secondaries()
 
     heartbeat_task = asyncio.create_task(mqtt_manager.heartbeat_loop())
     from app.internal.telemetry_uplink import telemetry_uplink_loop

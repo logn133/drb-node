@@ -15,12 +15,25 @@ class SecondarySdrClient:
     def __init__(self):
         self.api_url = settings.secondary_sdr_api_url
 
-    async def apply(self, priority: List[str]) -> Optional[List[str]]:
-        """Run decoders down the priority list until SDRs run out. Returns the
-        modes actually running, or None if the container is unreachable."""
+    async def devices(self) -> Optional[List[Dict[str, Any]]]:
+        """Every RTL-SDR on the node with its serial, or None if unreachable."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{self.api_url}/secondary/devices")
+                r.raise_for_status()
+                return r.json().get("devices", [])
+        except Exception as e:
+            logger.error(f"Secondary SDR device list failed: {e}")
+            return None
+
+    async def apply(self, priority: List[str], pins: Dict[str, str], reserved: List[str]) -> Optional[List[str]]:
+        """Run decoders down the priority list until SDRs run out, honouring
+        pins and never touching `reserved` (op25's) dongles. Returns the modes
+        actually running, or None if the container is unreachable."""
+        body = {"priority": priority, "pins": pins, "reserved": reserved}
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(f"{self.api_url}/secondary/apply", json={"priority": priority})
+                r = await client.post(f"{self.api_url}/secondary/apply", json=body)
                 r.raise_for_status()
                 return r.json().get("running", [])
         except Exception as e:

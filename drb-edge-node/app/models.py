@@ -38,6 +38,19 @@ def normalize_secondary_priority(items: Iterable[str]) -> List[str]:
     return out
 
 
+# Services that can be bound to a specific dongle by its USB serial.
+SDR_PIN_KEYS = ("op25",) + SECONDARY_SDR_MODES
+
+
+def normalize_sdr_pins(pins: Dict[str, Optional[str]]) -> Dict[str, str]:
+    """Known services only, blank = automatic (dropped). Two services can't
+    share a dongle, so a serial claimed twice raises."""
+    out = {k: str(v).strip() for k, v in (pins or {}).items() if k in SDR_PIN_KEYS and v and str(v).strip()}
+    if len(set(out.values())) != len(out):
+        raise ValueError("Two services can't be pinned to the same SDR.")
+    return out
+
+
 class NodeConfig(BaseModel):
     node_id: str
     node_name: str
@@ -50,6 +63,7 @@ class NodeConfig(BaseModel):
     ppm_override: Optional[float] = None
     node_type: str = "fixed"  # fixed or portable
     secondary_sdr_priority: List[str] = []  # ordered; SDRs beyond op25's run these top-down
+    sdr_pins: Dict[str, str] = {}  # service (op25/adsb/ais) -> dongle serial; absent = automatic
     # Legacy single-mode field (pre-priority). Still written as priority[0] so
     # an older C2 reading checkins sees something sensible; read only to
     # migrate a node_config.json saved before priority existed.

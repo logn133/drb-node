@@ -234,9 +234,17 @@ class MQTTManager:
             "secondary_sdr_mode": config.secondary_sdr_mode,
             "secondary_sdr_priority": config.secondary_sdr_priority,
         }
+        payload["sdr_pins"] = config.sdr_pins
         secondary = await secondary_sdr_client.status()
         if secondary is not None:
             payload["secondary_sdr_running"] = [r["mode"] for r in secondary.get("running", [])]
+            if secondary.get("devices") is not None:
+                payload["sdr_devices"] = [
+                    {k: d.get(k) for k in ("index", "serial", "name", "duplicate_serial")}
+                    for d in secondary["devices"]
+                ]
+                from app.internal.sdr_settings import op25_serial
+                payload["op25_sdr_serial"] = op25_serial(config, secondary["devices"])
         # Best-effort hardware report — omit rather than guess. Prefer the
         # secondary-sdr container's count: op25's :stable image has no lsusb and
         # its /op25/devices answers 0 rather than "unknown" when that fails. A
