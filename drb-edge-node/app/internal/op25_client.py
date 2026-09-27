@@ -80,10 +80,14 @@ class OP25Client:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.api_url}/op25/generate-config", json=config)
                 r.raise_for_status()
-                return True
         except Exception as e:
             logger.error(f"OP25 generate-config failed: {e}")
             return False
+        # Every generated config opens its dongle by serial, never "first
+        # found" (node-26#11) — here so no generation path can skip it.
+        from app.internal.sdr_settings import pin_op25_device
+        await pin_op25_device()
+        return True
 
     async def poll_terminal(self) -> Optional[TerminalUpdate]:
         """

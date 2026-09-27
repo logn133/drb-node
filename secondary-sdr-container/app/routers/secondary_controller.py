@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -19,6 +19,8 @@ class StopBody(BaseModel):
 
 class ApplyBody(BaseModel):
     priority: List[str]  # ordered, e.g. ["adsb", "ais"]
+    pins: Dict[str, str] = {}  # mode -> serial of the dongle with its antenna
+    reserved: List[str] = []  # serials no decoder may touch (op25's)
 
 
 def create_secondary_router():
@@ -27,7 +29,7 @@ def create_secondary_router():
     @router.post("/apply")
     async def apply(body: ApplyBody):
         try:
-            live = decoder_control.apply(body.priority)
+            live = decoder_control.apply(body.priority, body.pins, body.reserved)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"running": live}
@@ -50,6 +52,10 @@ def create_secondary_router():
     @router.get("/status")
     async def get_status():
         return decoder_control.status()
+
+    @router.get("/devices")
+    async def get_devices():
+        return {"devices": decoder_control.devices()}
 
     @router.get("/data")
     async def get_data():

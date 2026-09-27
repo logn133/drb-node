@@ -128,6 +128,16 @@
     .sdr-move:disabled { opacity: 0.3; cursor: default; }
     .sdr-state { font-size: 0.75rem; min-width: 6.5rem; text-align: right; color: var(--text-muted); }
     .sdr-state.on { color: var(--success); }
+    .sdr-select {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--glass-border);
+      color: var(--text-main);
+      border-radius: 6px;
+      padding: 0.3rem 0.4rem;
+      font-size: 0.8rem;
+      max-width: 13rem;
+    }
+    .sdr-select option { background: #111827; }
 
     .grid {
       display: grid;
@@ -384,18 +394,24 @@
         </div>
       </div>
 
-      <!-- Secondary SDRs Card (node-26#9) -->
+      <!-- SDRs Card (node-26#9, #11) -->
       <div class="glass-card">
         <div class="card-header">
-          <div class="card-title">Secondary SDRs</div>
+          <div class="card-title">SDRs</div>
         </div>
+        <div class="data-row" style="align-items:center;">
+          <span class="data-label">OP25 SDR</span>
+          <select id="sdr-op25" class="sdr-select" aria-label="OP25 SDR"></select>
+        </div>
+        <p id="sdr-op25-note" style="color: var(--text-muted); font-size: 0.75rem; margin: 0.25rem 0 0.75rem;"></p>
         <p style="color: var(--text-muted); font-size: 0.8rem; margin: 0 0 0.5rem;">
-          OP25 always keeps its own SDR. Every other SDR runs the next enabled item below, top first.
-          <span id="sdr-summary"></span>
+          Every other SDR runs the next enabled service, top first. Pin a service to the SDR
+          that has its antenna, or leave it on "Any spare SDR".
         </p>
         <div id="sdr-list"></div>
+        <p id="sdr-warning" style="color: var(--danger); font-size: 0.8rem; margin: 0.5rem 0 0; display:none;"></p>
         <div style="display:flex; gap:0.75rem; align-items:center; margin-top:0.75rem;">
-          <button id="sdr-save" class="btn btn-primary" style="padding:0.5rem 1rem;" onclick="saveSdrPriority()" disabled>Save priority</button>
+          <button id="sdr-save" class="btn btn-primary" style="padding:0.5rem 1rem;" onclick="saveSdr()" disabled>Save</button>
           <span id="sdr-msg" style="color: var(--text-muted); font-size: 0.8rem;"></span>
         </div>
       </div>
@@ -532,44 +548,81 @@
       }
     }
 
-    // ── Secondary SDR priority ────────────────────────────────────────────
+    // ── SDRs: OP25's dongle, secondary priority and per-service pins ────────
     const SDR_LABELS = {
       adsb: ['ADS-B', 'Aircraft · 1090 MHz'],
       ais: ['AIS', 'Vessels · 162 MHz'],
     };
-    let sdrRows = [];      // [{mode, enabled}] in display order
-    let sdrRunning = [];
+    let sdr = null;         // last GET /api/sdr
+    let sdrRows = [];       // [{mode, enabled, pin}] in display order
+    let sdrOp25Pin = '';    // '' = automatic
     let sdrDirty = false;
 
+    function esc(v) {
+      return String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+    }
+
+    function deviceOptions(selected, autoLabel) {
+      const devs = sdr.devices || [];
+      const known = devs.some(d => d.serial === selected);
+      return `<option value="">${esc(autoLabel)}</option>` +
+        devs.map(d => `<option value="${esc(d.serial)}" ${d.serial === selected ? 'selected' : ''}>` +
+          `SDR ${d.index + 1} · serial ${esc(d.serial)}${d.duplicate_serial ? ' (shared serial!)' : ''}</option>`).join('') +
+        (selected && !known ? `<option value="${esc(selected)}" selected>serial ${esc(selected)} ` +
+          `(${sdr.devices === null ? 'not reported' : 'not plugged in'})</option>` : '');
+    }
+
     function renderSdr() {
+      const op25 = document.getElementById('sdr-op25');
+      op25.innerHTML = deviceOptions(sdrOp25Pin, 'Automatic (first SDR)');
+      op25.onchange = () => { sdrOp25Pin = op25.value; markSdrDirty(); };
+      document.getElementById('sdr-op25-note').textContent = sdrOp25Pin !== (sdr.pins.op25 || '')
+        ? 'Saving will restart OP25 on the selected SDR.'
+        : (sdr.op25_serial ? `OP25 is using serial ${sdr.op25_serial}.` : '');
+
       const list = document.getElementById('sdr-list');
       list.innerHTML = '';
       let rank = 0;
+      const running = sdr.running || [];
       sdrRows.forEach((row, i) => {
         const [name, hint] = SDR_LABELS[row.mode] || [row.mode, ''];
-        const running = (sdrRunning || []).includes(row.mode);
-        // Unsaved first: a reorder must not keep claiming the old order is live.
+        const pinMissing = row.pin && sdr.devices !== null && !sdr.devices.some(d => d.serial === row.pin);
         const state = !row.enabled ? 'Off'
           : sdrDirty ? 'Unsaved'
-          : sdrRunning === null ? 'Unknown'
-          : running ? 'Running' : 'Waiting for SDR';
+          : sdr.running === null ? 'Unknown'
+          : running.includes(row.mode) ? 'Running'
+          : pinMissing ? 'Pinned SDR missing' : 'Waiting for SDR';
         const el = document.createElement('div');
         el.className = 'sdr-row';
         el.innerHTML = `
           <span class="sdr-rank">${row.enabled ? ++rank : ''}</span>
           <input type="checkbox" ${row.enabled ? 'checked' : ''} aria-label="Enable ${name}">
           <span class="sdr-name">${name}<small>${hint}</small></span>
+          <select class="sdr-select" aria-label="${name} SDR">${deviceOptions(row.pin, 'Any spare SDR')}</select>
           <button class="sdr-move" aria-label="Move ${name} up" ${i === 0 ? 'disabled' : ''}>▲</button>
           <button class="sdr-move" aria-label="Move ${name} down" ${i === sdrRows.length - 1 ? 'disabled' : ''}>▼</button>
           <span class="sdr-state ${state === 'Running' ? 'on' : ''}">${state}</span>`;
         const [box] = el.getElementsByTagName('input');
+        const [pick] = el.getElementsByTagName('select');
         const [up, down] = el.getElementsByTagName('button');
         box.onchange = () => { row.enabled = box.checked; markSdrDirty(); };
+        pick.onchange = () => { row.pin = pick.value; markSdrDirty(); };
         up.onclick = () => { [sdrRows[i - 1], sdrRows[i]] = [sdrRows[i], sdrRows[i - 1]]; markSdrDirty(); };
         down.onclick = () => { [sdrRows[i + 1], sdrRows[i]] = [sdrRows[i], sdrRows[i + 1]]; markSdrDirty(); };
         list.appendChild(el);
       });
-      document.getElementById('sdr-save').disabled = !sdrDirty;
+
+      const warn = document.getElementById('sdr-warning');
+      const pinned = [sdrOp25Pin, ...sdrRows.map(r => r.pin)].filter(Boolean);
+      const problems = [];
+      if (sdr.devices === null) problems.push('The secondary SDR service is not responding, so SDRs can\'t be listed.');
+      if ((sdr.devices || []).some(d => d.duplicate_serial)) {
+        problems.push('Two SDRs share a serial number, so they can\'t be told apart. Give each a unique serial (rtl_eeprom -s) before pinning.');
+      }
+      if (new Set(pinned).size !== pinned.length) problems.push('Two services are pinned to the same SDR.');
+      warn.textContent = problems.join(' ');
+      warn.style.display = problems.length ? 'block' : 'none';
+      document.getElementById('sdr-save').disabled = !sdrDirty || new Set(pinned).size !== pinned.length;
     }
 
     function markSdrDirty() {
@@ -581,47 +634,41 @@
     async function loadSdr() {
       if (sdrDirty) return;  // never clobber unsaved edits with a poll
       try {
-        const r = await fetch('/api/secondary');
+        const r = await fetch('/api/sdr');
         if (!r.ok) return;
-        const d = await r.json();
-        sdrRunning = d.running;  // null = secondary SDR service unreachable
+        sdr = await r.json();
+        sdrOp25Pin = sdr.pins.op25 || '';
         sdrRows = [
-          ...d.priority.map(mode => ({ mode, enabled: true })),
-          ...d.modes.filter(m => !d.priority.includes(m)).map(mode => ({ mode, enabled: false })),
+          ...sdr.priority.map(mode => ({ mode, enabled: true, pin: sdr.pins[mode] || '' })),
+          ...sdr.modes.filter(m => !sdr.priority.includes(m)).map(mode => ({ mode, enabled: false, pin: sdr.pins[mode] || '' })),
         ];
-        const summary = document.getElementById('sdr-summary');
-        if (d.running === null) {
-          summary.textContent = 'Secondary SDR service is not responding.';
-        } else if (d.sdr_count != null) {
-          const spare = Math.max(d.sdr_count - 1, 0);
-          summary.textContent = `This node has ${d.sdr_count} SDR${d.sdr_count === 1 ? '' : 's'}, so ${spare} spare.`;
-        }
         renderSdr();
       } catch (e) {
-        console.error('Secondary SDR load failed:', e);
+        console.error('SDR load failed:', e);
       }
     }
 
-    async function saveSdrPriority() {
-      const priority = sdrRows.filter(r => r.enabled).map(r => r.mode);
+    async function saveSdr() {
+      const pins = { op25: sdrOp25Pin || null };
+      sdrRows.forEach(r => { pins[r.mode] = r.pin || null; });
       const btn = document.getElementById('sdr-save');
       const msg = document.getElementById('sdr-msg');
       btn.disabled = true;
       msg.textContent = 'Applying…';
       try {
-        const r = await fetch('/api/secondary/priority', {
+        const r = await fetch('/api/sdr', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ priority }),
+          body: JSON.stringify({ priority: sdrRows.filter(r => r.enabled).map(r => r.mode), pins }),
         });
-        if (!r.ok) throw new Error(await r.text());
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
         const d = await r.json();
         sdrDirty = false;
         msg.textContent = d.running === null ? 'Saved, but the secondary SDR service did not respond.' : 'Saved.';
         await loadSdr();
       } catch (e) {
-        console.error('Secondary SDR save failed:', e);
-        msg.textContent = 'Save failed.';
+        console.error('SDR save failed:', e);
+        msg.textContent = `Save failed: ${e.message}`;
         btn.disabled = false;
       }
     }

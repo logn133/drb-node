@@ -1,3 +1,5 @@
+import ctypes
+import ctypes.util
 import json
 import os
 import signal
@@ -141,8 +143,9 @@ def running() -> List[str]:
     return [m for m in MODES if is_running(m)]
 
 
-def _start_one(mode: str) -> bool:
-    """Start one decoder on the first free SDR. False when none is free."""
+def _start_one(mode: str, candidates: Optional[List[int]] = None) -> bool:
+    """Start one decoder on the first free SDR among `candidates` (default:
+    every index). False when none is free."""
     if mode not in _COMMANDS:
         raise ValueError(f"Unknown secondary SDR mode: {mode!r}")
     if is_running(mode):
@@ -152,7 +155,7 @@ def _start_one(mode: str) -> bool:
             _ais_vessels.clear()
 
     needs_stdout = mode == "ais"
-    for index in range(MAX_SDR_INDEX):
+    for index in candidates if candidates is not None else range(MAX_SDR_INDEX):
         if index in {_indices[m] for m in running() if m in _indices}:
             continue
         try:
@@ -211,47 +214,95 @@ def stop(mode: Optional[str] = None) -> None:
             _stop_one(m)
 
 
-def apply(priority: List[str]) -> List[str]:
+def _candidates(mode: str, pins: Dict[str, str], reserved: List[str], devs: List[Dict[str, Any]]) -> List[int]:
+    """SDR indices `mode` may use. A pinned mode gets exactly its dongle; an
+    unpinned one gets any dongle that isn't op25's (reserved) or pinned to
+    another service. Without enumeration, fall back to probing every index."""
+    if not devs:
+        return [] if pins.get(mode) else list(range(MAX_SDR_INDEX))
+    if pins.get(mode):
+        idx = _index_of(pins[mode], devs)
+        return [] if idx is None else [idx]
+    taken = set(reserved) | {s for m, s in pins.items() if m != mode and s}
+    return [d["index"] for d in devs if d["serial"] not in taken]
+
+
+def apply(priority: List[str], pins: Optional[Dict[str, str]] = None,
+          reserved: Optional[List[str]] = None) -> List[str]:
     """Run decoders in priority order until SDRs run out; stop everything else.
 
-    Unchanged when the running set is already the right prefix of the list, so
-    re-applying the same priority (every restart/config push) is a no-op
-    rather than a decoder restart.
+    `pins` maps a mode to the serial of the dongle carrying its antenna;
+    `reserved` lists serials no decoder may touch (op25's). Pins only bind
+    enabled modes — a disabled service's dongle is free for the others.
+    Unchanged when the right decoders already run on allowed dongles, so
+    re-applying the same settings is a no-op rather than a restart.
     """
     for m in priority:
         if m not in _COMMANDS:
             raise ValueError(f"Unknown secondary SDR mode: {m!r}")
+    pins = {m: s for m, s in (pins or {}).items() if m in priority and s}
+    reserved = [s for s in (reserved or []) if s]
+    devs = devices()
     with _lock:
-        live = set(running())
-        if live and live == set(priority[:len(live)]):
-            # Already running the head of the list; only try to extend it.
-            for m in priority[len(live):]:
-                if not _start_one(m):
-                    break
-            return running()
-        for m in list(_procs):
-            _stop_one(m)
-        for m in priority:
-            if not _start_one(m):
-                break
+        for m in running():
+            if m not in priority or _indices.get(m) not in _candidates(m, pins, reserved, devs):
+                _stop_one(m)
+        for i, m in enumerate(priority):
+            if m in running():
+                continue
+            cands = _candidates(m, pins, reserved, devs)
+            if _start_one(m, cands):
+                continue
+            # Out of free dongles: take one from the lowest-priority decoder
+            # holding a dongle this mode may use, which then gets its own turn.
+            lower = [x for x in priority[i + 1:] if x in running() and _indices.get(x) in cands]
+            if lower:
+                _stop_one(lower[-1])
+                _start_one(m, cands)
         return running()
 
 
-def sdr_count() -> Optional[int]:
-    """RTL-SDR dongles on USB, same heuristic as install.sh. This container has
-    usbutils; op25's :stable image doesn't, so its /op25/devices can't answer."""
+def devices() -> List[Dict[str, Any]]:
+    """Every RTL-SDR on the node with its USB serial — readable even while a
+    dongle is claimed (op25's included), since it doesn't open the device.
+    Cheap dongles often ship with the same serial (00000001); those are
+    flagged, because pinning a service to a shared serial is ambiguous."""
     try:
-        out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return None
-    return sum(1 for line in out.splitlines() if "0bda:2838" in line or "0bda:2832" in line)
+        lib = ctypes.CDLL(ctypes.util.find_library("rtlsdr") or "librtlsdr.so.0")
+        lib.rtlsdr_get_device_name.restype = ctypes.c_char_p
+        out = []
+        for i in range(lib.rtlsdr_get_device_count()):
+            manufact, product, serial = (ctypes.create_string_buffer(256) for _ in range(3))
+            lib.rtlsdr_get_device_usb_strings(i, manufact, product, serial)
+            out.append({
+                "index": i,
+                "serial": serial.value.decode(errors="replace") or None,
+                "name": (lib.rtlsdr_get_device_name(i) or b"").decode(errors="replace"),
+            })
+    except Exception as e:
+        LOGGER.warning(f"SDR enumeration failed: {e}")
+        return []
+    serials = [d["serial"] for d in out]
+    for d in out:
+        d["duplicate_serial"] = d["serial"] is not None and serials.count(d["serial"]) > 1
+    return out
+
+
+def _index_of(serial: str, devs: List[Dict[str, Any]]) -> Optional[int]:
+    """Index of a uniquely-identified serial; None if absent or ambiguous."""
+    matches = [d["index"] for d in devs if d["serial"] == serial]
+    return matches[0] if len(matches) == 1 else None
 
 
 def status() -> Dict[str, Any]:
-    live = running()
+    devs = devices()
+    by_index = {d["index"]: d["serial"] for d in devs}
     return {
-        "running": [{"mode": m, "sdr_index": _indices.get(m)} for m in live],
-        "sdr_count": sdr_count(),
+        "running": [
+            {"mode": m, "sdr_index": _indices.get(m), "serial": by_index.get(_indices.get(m))} for m in running()
+        ],
+        "sdr_count": len(devs) if devs else None,
+        "devices": devs,
     }
 
 
