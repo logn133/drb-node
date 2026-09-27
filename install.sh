@@ -181,6 +181,13 @@ else
   warn "no RTL-SDR dongle detected on USB — plug one in before expecting audio"
 fi
 
+# The kernel's DVB-TV driver auto-binds RTL2838 dongles. op25 detaches it from
+# the one it opens, but any other dongle stays claimed and the secondary-sdr
+# decoder fails with "usb_claim_interface error -6" (node-26#9).
+echo "blacklist dvb_usb_rtl28xxu" > /etc/modprobe.d/blacklist-rtl-sdr.conf
+modprobe -r rtl2832_sdr dvb_usb_rtl28xxu 2>/dev/null || true
+ok "DVB-TV kernel driver blacklisted for RTL-SDR"
+
 # ── 2. Dependencies ─────────────────────────────────────────────────────────
 say "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive

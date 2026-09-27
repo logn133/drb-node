@@ -23,12 +23,14 @@ RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         git build-essential cmake pkg-config \
-        librtlsdr-dev libusb-1.0-0-dev libssl-dev zlib1g-dev usbutils
+        librtlsdr-dev libusb-1.0-0-dev libssl-dev zlib1g-dev libzstd-dev libncurses-dev usbutils
 
-# dump1090 (antirez/classic) — ADS-B decoder. --write-json support is a
-# long-standing, well-documented feature of this fork.
-RUN git clone https://github.com/antirez/dump1090 /opt/dump1090 && \
-    cd /opt/dump1090 && make
+# readsb (wiedehopf) — ADS-B decoder. antirez/dump1090 was used here first but
+# has no --write-json at all (it only serves /data.json over --net), so the
+# decoder exited on an unknown flag. readsb writes the dump1090-fa style
+# aircraft.json that _read_adsb_snapshot() parses.
+RUN git clone --depth 1 https://github.com/wiedehopf/readsb /opt/readsb && \
+    cd /opt/readsb && make RTLSDR=yes
 
 # AIS-catcher — AIS decoder.
 RUN git clone https://github.com/jvde-github/AIS-catcher /opt/AIS-catcher && \

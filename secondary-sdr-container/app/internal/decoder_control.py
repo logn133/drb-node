@@ -20,16 +20,22 @@ LOGGER = create_logger(__name__)
 _ais_vessels: Dict[str, Dict[str, Any]] = {}
 _ais_lock = threading.Lock()
 
-# The node's SECOND SDR, addressed by RTL-SDR index — not serial. op25 always
-# claims index 0 (its DeviceConfig.args has no serial concept either, see
-# op25-container/app/models.py). No hot-plug re-detection: if the two
-# dongles' USB enumeration order changes, this claims the wrong one. Tracked
-# as a real gap in node-26#9, not fixed here.
-SECONDARY_SDR_DEVICE_INDEX = 1
+# Which RTL-SDR index op25 holds is NOT fixed — on radio-box op25 had index 1
+# and index 0 was free, so "op25 is always 0" was wrong. rtlsdr can't open a
+# dongle another process has claimed, and the decoders exit within ~50ms when
+# that happens, so start() tries each index and keeps the first that stays up.
+# op25 is never disturbed: a failed claim doesn't touch its dongle.
+MAX_SDR_INDEX = 4
+_STARTUP_GRACE_S = 2.0
 
 _PGID_FILE = "/tmp/secondary_sdr.pgid"
 _MODE_FILE = "/tmp/secondary_sdr.mode"
 ADSB_JSON_DIR = Path("/tmp/adsb")
+
+# The live decoder handle. poll() is the only reliable liveness check: a
+# decoder that dies on startup (e.g. SDR busy) stays an unreaped zombie, and
+# killpg(pgid, 0) still succeeds on a zombie — status reported "running".
+_proc: Optional[subprocess.Popen] = None
 
 
 def _save_state(pgid: int, mode: str) -> None:
@@ -52,6 +58,8 @@ def _read_mode() -> Optional[str]:
 
 
 def is_running() -> bool:
+    if _proc is not None:
+        return _proc.poll() is None
     pgid = _read_pgid()
     if pgid is None:
         return False
@@ -62,21 +70,22 @@ def is_running() -> bool:
         return False
 
 
-def _adsb_command() -> List[str]:
+def _adsb_command(index: int) -> List[str]:
     ADSB_JSON_DIR.mkdir(parents=True, exist_ok=True)
     return [
-        "/opt/dump1090/dump1090",
+        "/opt/readsb/readsb",
         "--net",
-        "--device-index", str(SECONDARY_SDR_DEVICE_INDEX),
+        "--device-type", "rtlsdr",
+        "--device", str(index),
         "--write-json", str(ADSB_JSON_DIR),
         "--write-json-every", "1",
     ]
 
 
-def _ais_command() -> List[str]:
+def _ais_command(index: int) -> List[str]:
     return [
         "/opt/AIS-catcher/build/AIS-catcher",
-        "-d", str(SECONDARY_SDR_DEVICE_INDEX),
+        f"-d:{index}",  # "-d <x>" would select by serial, not index
         "-o", "JSON",
     ]
 
@@ -126,38 +135,51 @@ def _ais_reader(proc: subprocess.Popen) -> None:
 
 
 def start(mode: str) -> bool:
+    global _proc
     if is_running():
         stop()
 
     if mode == "adsb":
-        cmd = _adsb_command()
+        build = _adsb_command
     elif mode == "ais":
-        cmd = _ais_command()
+        build = _ais_command
         with _ais_lock:
             _ais_vessels.clear()
     else:
         raise ValueError(f"Unknown secondary SDR mode: {mode!r}")
 
-    try:
-        needs_stdout = mode == "ais"
-        proc = subprocess.Popen(
-            cmd,
-            preexec_fn=os.setsid,
-            stdout=subprocess.PIPE if needs_stdout else None,
-            text=True if needs_stdout else None,
-            bufsize=1 if needs_stdout else -1,
-        )
+    needs_stdout = mode == "ais"
+    for index in range(MAX_SDR_INDEX):
+        try:
+            proc = subprocess.Popen(
+                build(index),
+                preexec_fn=os.setsid,
+                stdout=subprocess.PIPE if needs_stdout else None,
+                text=True if needs_stdout else None,
+                bufsize=1 if needs_stdout else -1,
+            )
+        except Exception as e:
+            LOGGER.error(f"Failed to start secondary SDR decoder mode={mode!r}: {e}")
+            return False
+        try:
+            proc.wait(timeout=_STARTUP_GRACE_S)
+            LOGGER.info(f"Secondary SDR decoder mode={mode!r} could not use SDR index {index}, trying next")
+            continue
+        except subprocess.TimeoutExpired:
+            pass
         if needs_stdout:
             threading.Thread(target=_ais_reader, args=(proc,), daemon=True).start()
+        _proc = proc
         _save_state(proc.pid, mode)
-        LOGGER.info(f"Started secondary SDR decoder mode={mode!r} pid={proc.pid}")
+        LOGGER.info(f"Started secondary SDR decoder mode={mode!r} on SDR index {index} pid={proc.pid}")
         return True
-    except Exception as e:
-        LOGGER.error(f"Failed to start secondary SDR decoder mode={mode!r}: {e}")
-        return False
+
+    LOGGER.error(f"Secondary SDR decoder mode={mode!r}: no free SDR found (op25 holds one; is a second plugged in?)")
+    return False
 
 
 def stop() -> bool:
+    global _proc
     pgid = _read_pgid()
     if pgid is None:
         return True
@@ -165,6 +187,12 @@ def stop() -> bool:
         os.killpg(pgid, signal.SIGTERM)
     except OSError:
         pass
+    if _proc is not None:
+        try:
+            _proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        _proc = None
     try:
         os.remove(_PGID_FILE)
     except OSError:
@@ -184,12 +212,19 @@ def status() -> Dict[str, Any]:
     }
 
 
+def _altitude(a: Dict[str, Any]) -> Optional[int]:
+    alt = a.get("alt_baro", a.get("altitude"))
+    if alt == "ground":
+        return 0
+    return alt if isinstance(alt, (int, float)) else None
+
+
 def _read_adsb_snapshot() -> List[Dict[str, Any]]:
     """
-    Map dump1090's aircraft.json (--write-json output) to the server's
-    telemetry schema. Field names (hex/flight/lat/lon/altitude/speed/track)
-    match dump1090's long-documented JSON format — UNVERIFIED against a real
-    capture in this session, see the Dockerfile's caveat.
+    Map readsb's aircraft.json (--write-json output) to the server's
+    telemetry schema. readsb uses the dump1090-fa field names: alt_baro (int,
+    or the string "ground"), gs, track. Older dump1090 forks used
+    altitude/speed, kept as a fallback.
     """
     path = ADSB_JSON_DIR / "aircraft.json"
     try:
@@ -207,8 +242,8 @@ def _read_adsb_snapshot() -> List[Dict[str, Any]]:
             "callsign": (a.get("flight") or "").strip() or None,
             "lat": a.get("lat"),
             "lon": a.get("lon"),
-            "altitude_ft": a.get("altitude"),
-            "ground_speed_kt": a.get("speed"),
+            "altitude_ft": _altitude(a),
+            "ground_speed_kt": a.get("gs", a.get("speed")),
             "track_deg": a.get("track"),
         })
     return out
