@@ -1,5 +1,5 @@
 import httpx
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from app.config import settings
 from app.internal.logger import logger
 
@@ -14,6 +14,18 @@ class SecondarySdrClient:
 
     def __init__(self):
         self.api_url = settings.secondary_sdr_api_url
+
+    async def apply(self, priority: List[str]) -> Optional[List[str]]:
+        """Run decoders down the priority list until SDRs run out. Returns the
+        modes actually running, or None if the container is unreachable."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(f"{self.api_url}/secondary/apply", json={"priority": priority})
+                r.raise_for_status()
+                return r.json().get("running", [])
+        except Exception as e:
+            logger.error(f"Secondary SDR apply (priority={priority!r}) failed: {e}")
+            return None
 
     async def start(self, mode: str) -> bool:
         try:
