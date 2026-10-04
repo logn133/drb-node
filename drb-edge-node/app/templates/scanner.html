@@ -171,15 +171,14 @@
       <h3 style="color: var(--dept-color); margin-bottom: 6px; font-size: 13px;">Or Enter Freq Manually:</h3>
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px; font-size: 11px; margin-bottom: 8px;">
         <div>
-          <label>Control Freq (MHz/Hz):</label>
+          <label>Freq (MHz) — P25 control channel or analog:</label>
           <input type="text" id="manual-freq" style="background:#222; color:#fff; border:1px solid #555; padding:3px; width:100%; border-radius:2px;">
         </div>
         <div>
           <label>System Type:</label>
           <select id="manual-type" style="background:#222; color:#fff; border:1px solid #555; padding:3px; width:100%; border-radius:2px;">
             <option value="P25">P25</option>
-            <option value="DMR">DMR</option>
-            <option value="NBFM">NBFM</option>
+            <option value="NBFM">Analog FM</option>
           </select>
         </div>
       </div>
@@ -208,7 +207,7 @@
 
   <div class="softkeys">
     <div class="softkey">VOL (+/-)</div>
-    <div class="softkey">HOLD (H)</div>
+    <div class="softkey">SYSTEM (S)</div>
     <div class="softkey">PLAY (P)</div>
   </div>
 
@@ -309,7 +308,7 @@
       const container = document.getElementById('system-list');
       container.innerHTML = '';
       if (systems.length === 0) {
-        container.innerHTML = '<div style="padding: 10px; color: #888;">No cached systems found.</div>';
+        container.innerHTML = '<div style="padding: 10px; color: #888;">No server systems saved yet (they arrive once the node is approved). Enter a frequency below.</div>';
         return;
       }
       systems.forEach((sys, index) => {

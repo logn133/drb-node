@@ -235,6 +235,13 @@ class MetadataWatcher:
         self._last_tx_end: Optional[float] = None  # epoch of the srcaddr 1→0 edge
         self._last_ok_poll: float = 0.0
 
+        # Dashboard-only view of what the OP25 console last said. Read by
+        # /api/health; never consulted by segmentation or attribution.
+        self._terminal_epoch: Optional[float] = None
+        self._terminal_channels: List[Dict[str, Any]] = []
+        self._terminal_trunk: List[Dict[str, Any]] = []
+        self._last_heard: Optional[ConsoleEvent] = None
+
         # Rolling console history for close-time attribution.
         self._console: deque[ConsoleEvent] = deque(maxlen=CONSOLE_HISTORY_MAX)
 
@@ -294,6 +301,7 @@ class MetadataWatcher:
 
         self._last_ok_poll = now
         self._record_console(update, now)
+        self._note_terminal(update, now)
 
         activity = self._snapshot()
         if activity is None or not activity.capturing:
@@ -349,6 +357,18 @@ class MetadataWatcher:
         cutoff = now - CONSOLE_HISTORY_SECONDS
         while self._console and self._console[0].epoch < cutoff:
             self._console.popleft()
+
+    def _note_terminal(self, update: Any, now: float) -> None:
+        """Keep the latest console snapshot for the dashboard. No side effects
+        on segment state — trunk_update/channel_update are not sent on every
+        poll, so the last non-empty one is kept."""
+        self._terminal_epoch = now
+        if update.channels:
+            self._terminal_channels = update.channels
+        if getattr(update, "trunk", None):
+            self._terminal_trunk = update.trunk
+        if self._console:
+            self._last_heard = self._console[-1]
 
     def _is_duplicate_grant(self, event: ConsoleEvent) -> bool:
         for index in range(len(self._console) - 1, -1, -1):
@@ -897,6 +917,19 @@ class MetadataWatcher:
     @property
     def is_active(self) -> bool:
         return self._active_call_id is not None
+
+    @property
+    def console_state(self) -> Dict[str, Any]:
+        """Last thing the OP25 console reported, for /api/health only."""
+        heard = self._last_heard
+        return {
+            "last_poll_epoch": self._terminal_epoch,
+            "channels": self._terminal_channels,
+            "trunk": self._terminal_trunk,
+            "last_heard": None if heard is None else {
+                "epoch": heard.epoch, "tgid": heard.tgid, "name": heard.name, "freq": heard.freq,
+            },
+        }
 
     @property
     def unattributed_segments(self) -> int:

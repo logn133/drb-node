@@ -327,9 +327,12 @@ async def lifespan(app: FastAPI):
         if (node_cfg.override_system_id and node_cfg.override_config)
         else node_cfg.system_config
     )
-    if node_cfg.configured and active_config:
+    # Not gated on `configured` (set only by a C2 assignment): a standalone or
+    # not-yet-approved node listening to a system chosen on the local
+    # dashboard (an override) must come back on it after a reboot too.
+    if active_config:
         from app.internal.op25_client import op25_client
-        logger.info("Node is configured — waiting for OP25 API then generating config.")
+        logger.info("Node has a system to listen to — waiting for OP25 API then generating config.")
         for attempt in range(10):
             if await _generate_op25_config(active_config):
                 await op25_client.start()

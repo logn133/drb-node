@@ -11,6 +11,11 @@ from app.internal.logger import logger
 #                    each id is also a top-level key holding that channel's dict
 #                    (freq/tgid/tag/srcaddr/svcopts/hold_tgid/…).
 #
+#   trunk_update   — per-system trunking state keyed "0", "1", …; each carries
+#                    `last_tsbk` (OP25's time.time() of the last control-channel
+#                    message decoded) — the only direct proof OP25 is DECODING,
+#                    not merely running. Surfaced on the dashboard only.
+#
 #   call_log       — an EVENT QUEUE, not a snapshot. `log` holds entries appended
 #                    by tk_p25.log_call() at channel-grant time, each stamped with
 #                    OP25's own time.time(). get_call_log() DRAINS the deque, so
@@ -18,7 +23,7 @@ from app.internal.logger import logger
 #                    it forever. The deque is capped at CALL_LOG_MAX_LEN = 10, so
 #                    the consumer must keep up.
 #
-# Everything else (trunk_update, rx_update, terminal_config, …) is ignored.
+# Everything else (rx_update, terminal_config, …) is ignored.
 TERMINAL_UPDATE_COMMAND = [{"command": "update", "arg1": 0, "arg2": 0}]
 
 
@@ -28,6 +33,7 @@ class TerminalUpdate:
 
     channels: List[Dict[str, Any]] = field(default_factory=list)
     call_log: List[Dict[str, Any]] = field(default_factory=list)
+    trunk: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class OP25Client:
@@ -44,6 +50,23 @@ class OP25Client:
         except Exception as e:
             logger.error(f"OP25 start failed: {e}")
             return False
+
+    async def start_with_reason(self) -> Optional[str]:
+        """Start OP25; None on success, else a human-readable reason."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{self.api_url}/op25/start")
+        except Exception as e:
+            logger.error(f"OP25 start failed: {e}")
+            return "The op25 container isn't answering."
+        if r.is_success:
+            return None
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = None
+        logger.error(f"OP25 start failed: HTTP {r.status_code} {detail or r.text[:200]}")
+        return detail or f"op25 container returned HTTP {r.status_code}."
 
     async def stop(self) -> bool:
         try:
@@ -63,6 +86,17 @@ class OP25Client:
                 return r.json()
         except Exception as e:
             logger.error(f"OP25 status failed: {e}")
+            return None
+
+    async def log(self, lines: int = 80) -> Optional[List[str]]:
+        """Tail of multi_rx/liquidsoap output, kept by the op25 container."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{self.api_url}/op25/log", params={"lines": lines})
+                r.raise_for_status()
+                return r.json().get("lines", [])
+        except Exception as e:
+            logger.error(f"OP25 log fetch failed: {e}")
             return None
 
     async def devices(self) -> Optional[Dict[str, Any]]:
@@ -143,6 +177,11 @@ def parse_terminal_messages(messages: Any) -> TerminalUpdate:
                 channel = msg.get(str(chan_id))
                 if isinstance(channel, dict):
                     update.channels.append(channel)
+
+        elif json_type == "trunk_update":
+            for key, system in msg.items():
+                if key != "json_type" and isinstance(system, dict):
+                    update.trunk.append(system)
 
         elif json_type == "call_log":
             for entry in msg.get("log") or []:

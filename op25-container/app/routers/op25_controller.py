@@ -3,7 +3,11 @@ import subprocess
 import os
 import re
 import signal
+import sys
 import json
+import threading
+from collections import deque
+from typing import Optional
 from models import ConfigGenerator, DecodeMode, ChannelConfig, DeviceConfig, TrunkingConfig, TrunkingChannelConfig, TerminalConfig, MetadataConfig, MetadataStreamConfig, HARDWARE_PRESETS
 from internal.logger import create_logger
 from internal.op25_config_utls import save_talkgroup_tags, save_whitelist, del_none_in_dict, get_current_system_from_config
@@ -14,6 +18,16 @@ LOGGER = create_logger(__name__)
 OP25_PATH = "/op25/op25/gr-op25_repeater/apps/"
 OP25_SCRIPT = "run_multi-rx_service.sh"
 _PGID_FILE = "/tmp/op25.pgid"
+_ACTIVE_CFG = "/configs/active.cfg.json"
+
+# Analog: park the dongle's centre this far from the channel so the channel
+# does not sit on the RTL-SDR's DC spike. Well inside the 1.92 MS/s window.
+ANALOG_CENTER_OFFSET_HZ = 250_000
+
+# Last lines multi_rx/liquidsoap printed — the only place the reason OP25
+# died (SDR busy, bad config, no lock) is visible without SSH + docker logs.
+_log: deque = deque(maxlen=300)
+_proc: Optional[subprocess.Popen] = None
 
 
 def _save_pgid(pgid: int) -> None:
@@ -28,15 +42,60 @@ def _read_pgid():
         return None
 
 
+def _multi_rx_alive(pgid: int) -> bool:
+    """True only if a live multi_rx.py process is in OP25's process group.
+
+    node-26#12: killpg(pgid, 0) succeeds while the wrapper shell or
+    liquidsoap outlives a dead multi_rx (and even for a zombie leader), so
+    the old check reported a dead scanner as "running".
+    """
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            state, pgrp = fields[0], int(fields[2])
+            if pgrp != pgid or state == "Z":
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if b"multi_rx.py" in f.read():
+                    return True
+        except (OSError, IndexError, ValueError):
+            continue
+    return False
+
+
+def _reap() -> None:
+    if _proc is not None:
+        _proc.poll()
+
+
 def _is_running() -> bool:
     pgid = _read_pgid()
     if pgid is None:
         return False
+    _reap()
+    return _multi_rx_alive(pgid)
+
+
+def _kill_group(pgid: int) -> None:
     try:
-        os.killpg(pgid, 0)
-        return True
+        os.killpg(pgid, signal.SIGTERM)
     except OSError:
-        return False
+        pass
+
+
+def _pump(proc: subprocess.Popen) -> None:
+    """Mirror OP25's output to the container log and keep the tail for /log."""
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        _log.append(line.rstrip("\n"))
+    rc = proc.wait()
+    _log.append(f"[OP25 exited with code {rc}]")
 
 
 def create_op25_router():
@@ -44,11 +103,28 @@ def create_op25_router():
 
     @router.post("/start")
     async def start_op25():
+        global _proc
         if _is_running():
             return {"status": "OP25 already running"}
+        if not os.path.exists(_ACTIVE_CFG):
+            raise HTTPException(
+                status_code=409,
+                detail="No OP25 config yet — choose a system or frequency first.",
+            )
+        stale = _read_pgid()
+        if stale is not None:
+            # multi_rx died but liquidsoap/the wrapper may still hold the
+            # Icecast mount — clear the old group before starting a new one.
+            _kill_group(stale)
         try:
-            proc = subprocess.Popen(os.path.join(OP25_PATH, OP25_SCRIPT), shell=True, preexec_fn=os.setsid, cwd=OP25_PATH)
+            _log.clear()
+            proc = subprocess.Popen(
+                os.path.join(OP25_PATH, OP25_SCRIPT), shell=True, preexec_fn=os.setsid, cwd=OP25_PATH,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+            _proc = proc
             _save_pgid(proc.pid)
+            threading.Thread(target=_pump, args=(proc,), daemon=True).start()
             LOGGER.debug(proc)
             return {"status": "OP25 started"}
         except Exception as e:
@@ -57,10 +133,10 @@ def create_op25_router():
     @router.post("/stop")
     async def stop_op25():
         pgid = _read_pgid()
-        if pgid is None or not _is_running():
+        if pgid is None:
             return {"status": "OP25 is not running"}
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            _kill_group(pgid)
             os.remove(_PGID_FILE)
             return {"status": "OP25 stopped"}
         except Exception as e:
@@ -68,7 +144,18 @@ def create_op25_router():
 
     @router.get("/status")
     async def get_status():
-        return {"status": "running" if _is_running() else "stopped"}
+        if _is_running():
+            return {"status": "running"}
+        # Started (pgid file present, never stopped via the API) but multi_rx
+        # is gone: it crashed. The tail of /log says why.
+        if _read_pgid() is not None:
+            return {"status": "crashed", "configured": os.path.exists(_ACTIVE_CFG)}
+        return {"status": "stopped", "configured": os.path.exists(_ACTIVE_CFG)}
+
+    @router.get("/log")
+    async def get_log(lines: int = 80):
+        lines = max(1, min(lines, _log.maxlen))
+        return {"lines": list(_log)[-lines:]}
 
     @router.get("/devices")
     async def list_sdr_devices():
@@ -104,7 +191,7 @@ def create_op25_router():
                     meta_stream_name="stream_0"
                 )]
                 devices = [DeviceConfig(gains=preset["gains"], ppm=ppm)]
-                save_talkgroup_tags(generator.tags)
+                save_talkgroup_tags(generator.tags or [])
                 save_whitelist(generator.whitelist)
                 has_talkgroups = bool(generator.whitelist)
                 trunking = TrunkingConfig(
@@ -142,30 +229,48 @@ def create_op25_router():
                     "terminal": terminal.dict()
                 }
 
+
             elif generator.type == DecodeMode.ANALOG:
-                generator = generator.config
+                if not generator.channels:
+                    raise HTTPException(status_code=400, detail="Analog needs a frequency.")
+                preset = HARDWARE_PRESETS.get(generator.hardware_preset, HARDWARE_PRESETS["other"])
+                ppm = generator.ppm_override if generator.ppm_override is not None else preset["ppm"]
+                freq = int(float(generator.channels[0]))
+                # One fixed conventional channel: no trunking section, so
+                # multi_rx adds its default tk_p25 with no chans and reports
+                # the channel as `conventional` on the HTTP terminal.
                 channels = [ChannelConfig(
-                    channelName=generator.systemName,
-                    enableAnalog="on",
-                    demodType="fsk4",
-                    frequency=generator.frequency,
-                    filterType="widepulse",
-                    nbfmSquelch=generator.nbfmSquelch
+                    name=generator.systemName,
+                    trunking_sysname="",
+                    enable_analog="on",
+                    demod_type="fsk4",
+                    filter_type="rc",
+                    frequency=freq,
+                    meta_stream_name="",
+                    nbfm_squelch_threshold=generator.nbfm_squelch,
                 )]
-                devices = [DeviceConfig(gain="LNA:32")]
+                devices = [DeviceConfig(
+                    gains=preset["gains"], ppm=ppm, tunable=False,
+                    frequency=freq + ANALOG_CENTER_OFFSET_HZ,
+                )]
+                if generator.icecastConfig:
+                    generate_liquid_script(generator.icecastConfig)
 
                 config_dict = {
                     "channels": [channel.dict() for channel in channels],
-                    "devices": [device.dict() for device in devices]
+                    "devices": [device.dict() for device in devices],
+                    "terminal": TerminalConfig().dict(),
                 }
 
             else:
-                raise HTTPException(status_code=400, detail="Invalid configuration type. Must be 'p25' or 'nbfm'.")
+                raise HTTPException(status_code=400, detail="Unsupported system type. Must be 'P25' or 'NBFM' (DMR is not implemented).")
 
-            with open('/configs/active.cfg.json', 'w') as f:
+            with open(_ACTIVE_CFG, 'w') as f:
                 json.dump(del_none_in_dict(config_dict), f, indent=2)
 
-            return {"message": "Config exported to '/configs/active.cfg.json'"}
+            return {"message": f"Config exported to '{_ACTIVE_CFG}'"}
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
