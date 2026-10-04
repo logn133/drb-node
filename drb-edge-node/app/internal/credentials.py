@@ -3,8 +3,12 @@ Manages the persisted node API key, plus the local-auth signing material used
 by app/internal/auth.py.
 
 The API key is provisioned by the C2 server after an admin approves the node.
-It arrives via MQTT and is saved to /configs/credentials.json so it survives
-container restarts.
+install.sh fetches it over HTTPS (GET /nodes/{id}/credentials + the pickup
+secret it saved to /configs/pickup_secret) and writes /configs/credentials.json;
+the running app can also fetch it itself (app/internal/key_pickup.py) and
+re-read the file at any time (reload_api_key), so a key written after startup
+is picked up without a container restart (node-26#14). The legacy MQTT
+delivery (nodes/{id}/api_key) still saves here too.
 
 The scrypt salt and session-signing secret are generated locally on first boot
 (never provisioned externally) and persisted the same way, so dashboard
@@ -12,12 +16,14 @@ sessions survive a container restart instead of forcing every operator to
 re-login whenever the node restarts.
 """
 import json
+import os
 import secrets
 from pathlib import Path
 from app.config import settings
 from app.internal.logger import logger
 
 _CREDS_FILE = Path(settings.config_path) / "credentials.json"
+_PICKUP_FILE = Path(settings.config_path) / "pickup_secret"
 _api_key: str | None = None
 _auth_salt: bytes | None = None
 _session_secret: bytes | None = None
@@ -74,6 +80,37 @@ def get_api_key() -> str | None:
     return _api_key
 
 
+def reload_api_key() -> str | None:
+    """Re-read the api_key from disk (install.sh, or an operator, may have
+    written it after startup). Returns the key now in effect. Only the api_key
+    is taken from the file — the auth material already in memory stays."""
+    global _api_key
+    try:
+        data = json.loads(_CREDS_FILE.read_text())
+    except FileNotFoundError:
+        return _api_key
+    except Exception as e:
+        logger.warning(f"Could not re-read credentials file: {e}")
+        return _api_key
+    key = data.get("api_key")
+    if key and key != _api_key:
+        _api_key = key
+        logger.info("Node API key re-read from disk (changed since it was last loaded).")
+    return _api_key
+
+
+def get_pickup_secret() -> str | None:
+    """The one-time pickup secret install.sh saved at enrollment, if any."""
+    try:
+        secret = _PICKUP_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning(f"Could not read pickup secret: {e}")
+        return None
+    return secret or None
+
+
 def save_api_key(key: str) -> None:
     global _api_key
     _api_key = key
@@ -88,4 +125,10 @@ def _write() -> None:
         data["auth_salt"] = _auth_salt.hex()
     if _session_secret is not None:
         data["session_secret"] = _session_secret.hex()
-    _CREDS_FILE.write_text(json.dumps(data))
+    # Atomic replace with 0600: install.sh on the host writes this same file,
+    # and a torn half-written JSON would lose the key AND the auth material.
+    tmp = _CREDS_FILE.with_name(_CREDS_FILE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(data))
+    os.replace(tmp, _CREDS_FILE)

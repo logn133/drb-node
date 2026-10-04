@@ -6,11 +6,29 @@ from typing import Optional, Callable, Awaitable, Dict, Any
 import paho.mqtt.client as mqtt
 from app.config import settings
 from app.internal.logger import logger
-from app.internal import credentials
+from app.internal import credentials, key_pickup
 
 CommandCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 ConfigCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 ApiKeyCallback = Callable[[Dict[str, Any]], Awaitable[None]]
+
+# CONNACK codes meaning "your credentials are wrong", as paho reports them:
+# MQTT 3.1.1 return codes 4/5, and the MQTT 5 reason codes paho maps them to
+# (134 Bad user name or password, 135 Not authorized).
+_AUTH_FAILURE_CODES = {4, 5, 134, 135}
+
+# Credential-recovery backoff (node-26#14). The pickup endpoint is cheap, but a
+# node that is simply not approved yet must not hammer C2 for days.
+RECOVERY_MIN_DELAY = 30
+RECOVERY_MAX_DELAY = 900
+
+
+def _is_auth_failure(reason_code) -> bool:
+    value = getattr(reason_code, "value", reason_code)
+    if isinstance(value, int) and value in _AUTH_FAILURE_CODES:
+        return True
+    text = str(reason_code).lower()
+    return "not authori" in text or "bad user name or password" in text
 
 
 class MQTTManager:
@@ -19,6 +37,11 @@ class MQTTManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._connected = False
         self._connect_task: Optional[asyncio.Task] = None
+        # The api_key the CURRENT paho client was built with — not necessarily
+        # credentials.get_api_key(), which can move ahead of it (MQTT key push,
+        # install.sh writing the file). Recovery compares against this.
+        self._client_key: Optional[str] = None
+        self._recovery_task: Optional[asyncio.Task] = None
 
         self.on_command: Optional[CommandCallback] = None
         self.on_config_push: Optional[ConfigCallback] = None
@@ -53,6 +76,7 @@ class MQTTManager:
         )
 
         api_key = credentials.get_api_key()
+        self._client_key = api_key
         if api_key:
             # Post-cutover auth: broker's dynsec plugin authenticates this
             # exact (username, password) pair as this node's own client — see
@@ -70,18 +94,14 @@ class MQTTManager:
             client.username_pw_set(settings.mqtt_user, settings.mqtt_pass)
         else:
             # No api_key on disk and no legacy shared login configured. A
-            # dynsec broker (allow_anonymous false) refuses this outright —
-            # expected, not a bug to route around here: this node hasn't been
-            # enrolled/approved yet, and the enrollment flow that would fix
-            # that client-side is a later, separate pass (out of scope here;
-            # see MQTT-PUBLIC-AUTH-PLAN.md). paho's reconnect_delay_set()
-            # below bounds the retry rate (2..60s exponential backoff), so
-            # this degrades to a slow, clearly-logged refusal loop via
-            # _on_connect's "MQTT connect refused" line — not a hot spin.
+            # dynsec broker (allow_anonymous false) refuses this outright.
+            # connect() starts _recover_credentials() in this case, which
+            # fetches the key over HTTPS (key_pickup.py) and rebuilds this
+            # client with it — node-26#14. paho's reconnect_delay_set() below
+            # bounds the refusal loop meanwhile (2..60s backoff).
             logger.warning(
                 "No API key on disk and no legacy MQTT_USER configured — "
-                "connecting without credentials; the broker is expected to "
-                "refuse this until the node is enrolled/approved."
+                "connecting without credentials while the key is fetched from C2."
             )
 
         if settings.mqtt_tls:
@@ -120,6 +140,10 @@ class MQTTManager:
             asyncio.run_coroutine_threadsafe(self._flush_offline_buffer(), self._loop)
         else:
             logger.error(f"MQTT connect refused: {reason_code}")
+            if _is_auth_failure(reason_code) and self._loop is not None:
+                # paho thread -> event loop. A refused login never fixes itself
+                # by retrying the same password, so go get the right one.
+                self._loop.call_soon_threadsafe(self._start_recovery, f"broker refused login ({reason_code})")
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         self._connected = False
@@ -144,6 +168,72 @@ class MQTTManager:
         self._loop = asyncio.get_event_loop()
         self._client = self._build_client()
         self._connect_task = asyncio.create_task(self._connect_with_retry())
+        if not self._client_key and not settings.mqtt_user:
+            self._start_recovery("no API key at startup")
+
+    # ------------------------------------------------------------------
+    # Credential self-heal (node-26#14)
+    #
+    # A node with no key, or a stale one, used to sit in an MQTT refusal loop
+    # forever: key delivery was MQTT-only, and credentials were read once at
+    # startup. Now: re-read credentials.json (install.sh may have written it),
+    # else fetch from C2 over HTTPS with the pickup secret; if that yields a
+    # key different from the one the client is using, rebuild the client with
+    # it in place. No container restart.
+    # ------------------------------------------------------------------
+    def _start_recovery(self, why: str) -> None:
+        if self._recovery_task and not self._recovery_task.done():
+            return
+        logger.warning(f"MQTT credential recovery started: {why}")
+        self._recovery_task = asyncio.create_task(self._recover_credentials())
+
+    async def _recover_credentials(self) -> None:
+        delay = RECOVERY_MIN_DELAY
+        while True:
+            tried = self._client_key
+            key = credentials.reload_api_key()
+            if not key or key == tried:
+                fetched = await key_pickup.fetch_api_key()
+                if fetched and fetched != tried:
+                    credentials.save_api_key(fetched)
+                    key = fetched
+            if key and key != tried:
+                logger.info("MQTT credential recovery: new API key in hand — reconnecting with it.")
+                await self._rebuild_client()
+                return
+            if self._connected:
+                return
+            if key and key == tried:
+                logger.error(
+                    "MQTT credential recovery: C2 returns the same key the broker refuses. The broker's login for "
+                    "this node is out of sync with C2 (dynsec) — an admin re-approve re-syncs it without rotating."
+                )
+            logger.info(f"MQTT credential recovery: retrying in {delay}s.")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RECOVERY_MAX_DELAY)
+
+    async def _rebuild_client(self) -> None:
+        """Swap the paho client for one built from the current credentials."""
+        old = self._client
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
+        if old is not None:
+            # loop_stop() joins paho's thread, which can be mid-backoff — off the event loop.
+            await asyncio.to_thread(old.loop_stop)
+            try:
+                old.disconnect()
+            except Exception:
+                pass
+        self._connected = False
+        self._client = self._build_client()
+        self._connect_task = asyncio.create_task(self._connect_with_retry())
+
+    def update_api_key(self, key: str) -> None:
+        """A key arrived while connected (legacy MQTT push / reissue): use it on
+        the next reconnect without dropping the current, working session."""
+        if self._client is not None and key != self._client_key:
+            self._client.username_pw_set(settings.node_id, key)
+            self._client_key = key
 
     async def _connect_with_retry(self):
         """Attempt the initial TCP connect, retrying with backoff until it succeeds."""
@@ -161,6 +251,8 @@ class MQTTManager:
                 delay = min(delay * 2, 60)
 
     async def disconnect(self):
+        if self._recovery_task:
+            self._recovery_task.cancel()
         if self._connect_task:
             self._connect_task.cancel()
         if self._client:

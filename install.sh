@@ -17,9 +17,13 @@
 #   2. Install Docker + compose plugin + git + curl + jq
 #   3. Clone logan/node-26 at a PINNED ref into $INSTALL_DIR
 #   4. Write .env (non-interactive from flags/env, interactive fallback)
-#   5. Enroll with C2 (POST /nodes/enroll) and poll for the api_key
-#   6. docker compose pull && up -d   (prebuilt; --build opts into the ~1h build)
-#   7. Print the approval step
+#   5. Enroll with C2 (POST /nodes/enroll), then BLOCK until an admin approves
+#      and the api_key is written (node-26#14). Ctrl-C safe: re-run resumes
+#      from configs/pickup_secret. A re-run also refreshes a stale key.
+#   6. docker compose pull && up -d, ALWAYS recreating edge-node so it loads
+#      the key on disk  (prebuilt; --build opts into the ~1h build)
+#   7. Install the host updater (systemd timer + path unit, node-26#15)
+#   8. Print a summary
 #
 # It does NOT set up WireGuard. WireGuard-per-node was evaluated and rejected
 # (Server/MQTT-PUBLIC-AUTH-PLAN.md, Server/infra/main.tf:67-73). A field node
@@ -85,7 +89,14 @@ REGISTRY_PASS="${DRB_REGISTRY_PASS:-}"
 DO_BUILD=0        # 0 = pull prebuilt images (default), 1 = build on the Pi (~1h for op25)
 DO_START=1
 ASSUME_YES=0
-ENROLL_WAIT="${DRB_ENROLL_WAIT:-0}"   # seconds to block waiting for admin approval; 0 = don't block
+# How long to block waiting for admin approval. Default: forever (node-26#14 —
+# the old default of 0 started a keyless stack that never came online).
+# N>0 = give up after N seconds and start anyway; 0 = don't wait at all. Either
+# way the edge-node app keeps fetching the key itself and comes online on its
+# own once approved.
+ENROLL_WAIT="${DRB_ENROLL_WAIT:-forever}"
+APP_URL="${DRB_APP_URL:-}"
+INSTALL_UPDATER=1
 
 C='\033[0;36m'; G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
 say()  { printf "${C}==>${N} %s\n" "$*"; }
@@ -111,7 +122,12 @@ Usage: install.sh [options]
   --dir PATH           install location (default /opt/drb/node-26)
   --build              build images locally instead of pulling (~1h for op25)
   --no-start           configure and enroll, but do not start containers
-  --wait-approval SEC  block up to SEC seconds polling for admin approval
+  --wait-approval SEC  stop waiting for admin approval after SEC seconds
+                       (default: wait forever; 0 = don't wait). The node
+                       still fetches its key by itself once approved.
+  --app-url URL        admin UI base for the approval message
+                       (default: C2 URL without its "api." prefix)
+  --no-updater         don't install the host updater (no remote updates)
   -y, --yes            never prompt; fail instead of asking
 
 Every option also has an env var: DRB_NODE_ID, DRB_C2_URL, DRB_ENROLLMENT_TOKEN,
@@ -138,11 +154,16 @@ while [ $# -gt 0 ]; do
     --build)          DO_BUILD=1; shift ;;
     --no-start)       DO_START=0; shift ;;
     --wait-approval)  ENROLL_WAIT="$2"; shift 2 ;;
+    --app-url)        APP_URL="$2"; shift 2 ;;
+    --no-updater)     INSTALL_UPDATER=0; shift ;;
     -y|--yes)         ASSUME_YES=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+[ "$ENROLL_WAIT" = forever ] || [[ "$ENROLL_WAIT" =~ ^[0-9]+$ ]] \
+  || die "--wait-approval takes a number of seconds (or omit it to wait until approved)"
 
 # Prompts must come from the terminal, not from the `curl |` pipe on stdin.
 ask() {  # ask VAR "prompt" "default"
@@ -226,7 +247,9 @@ mkdir -p "$(dirname "$INSTALL_DIR")"
 if [ -d "$INSTALL_DIR/.git" ]; then
   ok "existing install at $INSTALL_DIR — updating in place (.env is preserved)"
   git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
-  git -C "$INSTALL_DIR" fetch --tags --prune origin
+  # --force: a moved release tag (v1 re-cut) must replace the local copy,
+  # otherwise fetch refuses with "would clobber existing tag" and set -e dies.
+  git -C "$INSTALL_DIR" fetch --force --tags --prune origin
 else
   git clone --no-checkout "$REPO_URL" "$INSTALL_DIR"
 fi
@@ -353,31 +376,58 @@ creds_pickup() {  # creds_pickup PICKUP_SECRET
 }
 cred_field() { printf '%s' "${CRED_BODY:-}" | jq -r "$1 // empty" 2>/dev/null || true; }
 
+KEY_WRITTEN=0
+# Merge into the existing file: the edge-node app keeps its dashboard auth
+# salt + session secret in the same JSON, and clobbering them logs everyone
+# out. Atomic (tmp + mv) so a Ctrl-C can never leave half a file.
 write_creds() {  # write_creds API_KEY
-  umask 077; jq -n --arg k "$1" '{api_key:$k}' > "$CREDS"; umask 022
-  ok "api_key received and written to configs/credentials.json"
+  local _tmp="$CREDS.tmp"
+  umask 077
+  if [ -s "$CREDS" ] && jq -e . "$CREDS" >/dev/null 2>&1; then
+    jq --arg k "$1" '.api_key = $k' "$CREDS" > "$_tmp"
+  else
+    jq -n --arg k "$1" '{api_key:$k}' > "$_tmp"
+  fi
+  umask 022
+  mv -f "$_tmp" "$CREDS"
+  KEY_WRITTEN=1
+  ok "api_key written to configs/credentials.json"
 }
+
+[ -n "$APP_URL" ] || { APP_URL="${C2_URL/:\/\/api./://}"; }
+APP_URL="${APP_URL%/}"
 
 say_pending() {  # say_pending APPROVAL_STATUS  — not an error: node is enrolled, key not minted yet
   warn "not approved yet — C2 reports approval_status=${1:-pending}, no api_key minted."
-  warn "an admin must, at  <app-url>/settings/nodes :  Approve '$NODE_ID'  (assigning a system is separate)."
-  warn "then re-run this installer — it reuses configs/pickup_secret — or fetch it directly:"
-  warn "  curl -fsS $C2_URL/nodes/$NODE_ID/credentials -H \"X-Pickup-Secret: \$(cat $PICKUP_FILE)\" | jq -r .api_key"
+  warn "an admin must approve '$NODE_ID' at ${APP_URL}/settings/nodes. The node keeps fetching"
+  warn "its key by itself and comes online once approved; re-running this installer also works."
 }
 
-# Poll creds_pickup for up to ENROLL_WAIT seconds while still pending. Result
-# left in CRED_HTTP/CRED_BODY. --wait-approval is what would have avoided the
-# original prod bug; the default (0) does not block, so the re-run path below
-# must stand on its own.
+# Block until the node is approved and C2 hands back an api_key (node-26#14).
+# Result left in CRED_HTTP/CRED_BODY. Returns 0 with a key, 1 on timeout/0-wait,
+# dies on a credential error (401/404) that waiting cannot fix.
 wait_for_key() {  # wait_for_key PICKUP_SECRET
-  [ "${ENROLL_WAIT:-0}" -gt 0 ] || return 0
-  local _end; _end=$(( $(date +%s) + ENROLL_WAIT ))
-  say "Waiting up to ${ENROLL_WAIT}s for an admin to approve '$NODE_ID'"
-  while [ "$(date +%s)" -lt "$_end" ]; do
-    sleep 10
+  [ "$ENROLL_WAIT" = 0 ] && return 1
+  local _end=0 _shown=0 _delay=5
+  [ "$ENROLL_WAIT" = forever ] || _end=$(( $(date +%s) + ENROLL_WAIT ))
+  trap 'printf "\n"; warn "interrupted — nothing is lost: re-run the same command to resume waiting (configs/pickup_secret is saved)."; exit 130' INT TERM
+  while :; do
+    case "$CRED_HTTP" in
+      200) [ -n "$(cred_field '.api_key')" ] && { trap - INT TERM; return 0; } ;;
+      401) die "C2 rejected the saved pickup secret (401) while waiting — re-run with --token DRB-… to re-enroll." ;;
+      404) die "C2 no longer knows node '$NODE_ID' (404) — it was deleted. Re-run with --token DRB-… to enroll again." ;;
+      *)   : ;;  # 000/5xx: transient, keep waiting
+    esac
+    if [ "$_shown" = 0 ]; then
+      printf "\n${Y}Please have an admin approve node '%s' at %s/settings/nodes to continue.${N}\n" \
+        "$NODE_ID" "$APP_URL"
+      printf "Waiting for approval%s… (Ctrl-C is safe — re-run the same command to resume)\n\n" \
+        "$([ "$_end" = 0 ] && echo "" || echo " for up to ${ENROLL_WAIT}s")"
+      _shown=1
+    fi
+    if [ "$_end" != 0 ] && [ "$(date +%s)" -ge "$_end" ]; then trap - INT TERM; return 1; fi
+    sleep "$_delay"; [ "$_delay" -lt 30 ] && _delay=$(( _delay + 5 ))
     creds_pickup "$1"
-    [ "$CRED_HTTP" = 200 ] || return 0
-    [ -z "$(cred_field '.api_key')" ] || return 0
   done
 }
 
@@ -418,21 +468,32 @@ do_fresh_enroll() {
 
   creds_pickup "$PICKUP"
   [ "$CRED_HTTP" = 200 ] || die "post-enroll credential fetch failed (HTTP $CRED_HTTP): ${CRED_BODY:-<no body>}"
-  KEY="$(cred_field '.api_key')"
-  if [ -z "$KEY" ]; then
-    wait_for_key "$PICKUP" || true
-    KEY="$(cred_field '.api_key')"
-  fi
-  if [ -n "$KEY" ]; then
-    write_creds "$KEY"
+  if wait_for_key "$PICKUP"; then
+    write_creds "$(cred_field '.api_key')"
   else
     say_pending "$(cred_field '.approval_status')"
   fi
 }
 
-if [ -s "$CREDS" ] && jq -e '.api_key // empty' "$CREDS" >/dev/null 2>&1; then
+DISK_KEY="$(jq -r '.api_key // empty' "$CREDS" 2>/dev/null || true)"
+if [ -n "$DISK_KEY" ] && [ -s "$PICKUP_FILE" ] && [ -n "${C2_URL:-}" ]; then
+  # Key on disk, but it may be STALE (an admin Reissue, or the old approve
+  # that rotated on every click). Ask C2 for the current one and replace it if
+  # different. Best-effort: on any error keep the key we have.
+  say "Enrollment — key on disk; checking it is still current"
+  creds_pickup "$(cat "$PICKUP_FILE")"
+  SERVER_KEY="$(cred_field '.api_key')"
+  if [ "$CRED_HTTP" = 200 ] && [ -n "$SERVER_KEY" ] && [ "$SERVER_KEY" != "$DISK_KEY" ]; then
+    warn "the key on disk is not the one C2 has on file (reissued?) — replacing it"
+    write_creds "$SERVER_KEY"
+  elif [ "$CRED_HTTP" = 200 ] && [ -n "$SERVER_KEY" ]; then
+    ok "api_key on disk matches C2"
+  else
+    warn "could not confirm the key with C2 (HTTP $CRED_HTTP) — keeping the key on disk"
+  fi
+elif [ -n "$DISK_KEY" ]; then
   say "Enrollment"
-  ok "api_key already on disk — skipping enrollment"
+  ok "api_key already on disk (no pickup secret to re-check it with) — skipping enrollment"
 elif [ -z "${C2_URL:-}" ]; then
   say "Enrollment"
   warn "no C2_URL — skipping enrollment"
@@ -446,16 +507,11 @@ elif [ -s "$PICKUP_FILE" ]; then
   creds_pickup "$PICKUP"
   case "$CRED_HTTP" in
     200)
-      API_KEY="$(cred_field '.api_key')"
-      if [ -z "$API_KEY" ]; then
-        wait_for_key "$PICKUP" || true
-        API_KEY="$(cred_field '.api_key')"
-      fi
-      if [ -n "$API_KEY" ]; then
-        write_creds "$API_KEY"
+      if wait_for_key "$PICKUP"; then
+        write_creds "$(cred_field '.api_key')"
       else
-        # Still pending. Enrolled and idempotent — next run collects the key.
-        # Clean exit, fall through to start the stack. NOT a failure.
+        # Only with --wait-approval N/0. Enrolled and idempotent; the app
+        # fetches the key itself once approved. NOT a failure.
         say_pending "$(cred_field '.approval_status')"
       fi
       ;;
@@ -510,12 +566,30 @@ if [ "$DO_START" = 1 ]; then
     fi
     docker compose up --no-build -d
   fi
-  ok "stack started"
+  # ALWAYS recreate edge-node (node-26#14): `up -d` leaves an already-running
+  # container alone, and a process started before the key was written would
+  # otherwise keep running keyless. Cheap, and makes every re-run a fix.
+  docker compose up -d --no-build --force-recreate --no-deps edge-node
+  ok "stack started (edge-node recreated so it loads configs/credentials.json)"
 else
   say "Skipping start (--no-start). Run: cd $INSTALL_DIR && make up-prebuilt"
 fi
 
-# ── 7. What the operator does next ──────────────────────────────────────────
+# ── 7. Host updater (node-26#15) ───────────────────────────────────────────
+UPDATER_STATE="not installed (--no-updater)"
+if [ "$INSTALL_UPDATER" = 1 ]; then
+  say "Installing the host updater"
+  UPD_ARGS=(--dir "$INSTALL_DIR" --repo-url "$REPO_URL" --ref "$REF" --registry "$REGISTRY")
+  [ "$DO_BUILD" = 1 ] && UPD_ARGS+=(--build)
+  if bash "$INSTALL_DIR/scripts/install-updater.sh" "${UPD_ARGS[@]}"; then
+    UPDATER_STATE="enabled — checks C2 every ~15 min; 'Update Node Software' in the admin UI"
+  else
+    warn "host updater NOT installed — this node cannot be updated remotely"
+    UPDATER_STATE="FAILED to install (see above)"
+  fi
+fi
+
+# ── 8. Summary ──────────────────────────────────────────────────────────────
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 cat <<EOF
 
@@ -525,20 +599,18 @@ $(printf "${G}Node '%s' installed at %s${N}" "$NODE_ID" "$INSTALL_DIR")
   images         $([ "$DO_BUILD" = 1 ] && echo "built locally" || echo "pulled from $REGISTRY")
   dashboard      http://${IP:-<node-ip>}/    (user: ${DASHBOARD_USER})
   logs           cd $INSTALL_DIR && docker compose logs -f edge-node
+  updater        ${UPDATER_STATE}
+  api key        $([ -n "$(jq -r '.api_key // empty' "$CREDS" 2>/dev/null)" ] && echo "present" || echo "NOT YET — node fetches it once approved")
 
-NEXT — an admin must approve this node before it can do anything:
-
-  1. Open  <app-url>/settings/nodes
-  2. Approve  "$NODE_ID"
-  3. Assign it a radio system
+NEXT — assign this node a radio system at ${APP_URL}/nodes/${NODE_ID}
 
 EOF
 if [ "${GENERATED_DASH:-0}" = 1 ]; then
   printf "${Y}Generated dashboard password (shown once): %s${N}\n\n" "$DASHBOARD_PASS"
 fi
-if [ ! -s "$CREDS" ]; then
+if [ -z "$(jq -r '.api_key // empty' "$CREDS" 2>/dev/null)" ]; then
   if [ -s "$PICKUP_FILE" ]; then
-    printf "${Y}This node has no api_key yet. After an admin approves it, re-run the same\ninstall command — it reuses configs/pickup_secret and will collect the key\n(no --token needed for the re-run).${N}\n\n"
+    printf "${Y}This node has no api_key yet. Once an admin approves it at %s/settings/nodes\nthe node fetches the key and comes online by itself (no re-run needed).${N}\n\n" "$APP_URL"
   else
     printf "${Y}This node has no api_key and no saved pickup secret, so a plain re-run cannot\nfix it. Re-run with --token DRB-… to enroll; or, if the node is already\napproved, have an admin Reissue key and write it into\n%s by hand.${N}\n\n" "$CREDS"
   fi
