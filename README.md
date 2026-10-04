@@ -142,13 +142,17 @@ this repo at the `v1` tag, enrols with C2, pulls the prebuilt images and starts:
 
 ```bash
 curl -fsSL https://git.vpn.cusano.net/logan/node-26/raw/tag/v1/install.sh \
-  | sudo bash -s -- --token DRB-xxxx --node-id node-003 \
+  | sudo bash -s -- --node-id node-003 \
       --c2-url https://api.<domain> --mqtt-broker mqtt.<domain>
 ```
 
-Mint the `--token` at **Settings → Nodes** in the web app (the panel prints the
-whole command). Run `install.sh --help` for every flag; each also has a
-`DRB_*` env var. `--build` compiles op25 on the Pi (~1h) instead of pulling.
+It prompts (hidden input) for an enrollment token, minted at **Settings → Nodes**
+in the web app. The token never goes on the command line — argv lands in shell
+history and `ps` (node-26#18). Unattended installs use `--token-file PATH` (mode
+0600) or an exported `DRB_ENROLLMENT_TOKEN` (pass it through with
+`sudo --preserve-env=DRB_ENROLLMENT_TOKEN`; plain `sudo` drops it); the old `--token` flag still works
+but warns. Run `install.sh --help` for every flag; each also has a `DRB_*` env
+var. `--build` compiles op25 on the Pi (~1h) instead of pulling.
 
 ### Local dev / manual
 

@@ -3,8 +3,13 @@
 # DRB edge node — one-shot bootstrap for a clean Raspberry Pi OS (arm64).
 #
 #   curl -fsSL https://git.vpn.cusano.net/logan/node-26/raw/tag/v1/install.sh \
-#     | sudo bash -s -- --token DRB-xxxx --node-id node-003 \
+#     | sudo bash -s -- --node-id node-003 \
 #         --c2-url https://api.<domain> --mqtt-broker mqtt.<domain>
+#
+# It prompts (hidden input) for the enrollment token. The token is never
+# taken from the command line by design (node-26#18, CISO condition from
+# server-26#61): argv lands in shell history and in `ps`. Unattended installs
+# use --token-file PATH (a 0600 file) or an exported DRB_ENROLLMENT_TOKEN.
 #
 # (fetch install.sh from the same tag it installs; use raw/branch/main with
 #  --track-main for the owner's own always-latest nodes)
@@ -81,6 +86,7 @@ MQTT_BROKER="${DRB_MQTT_BROKER:-}"
 MQTT_PORT="${DRB_MQTT_PORT:-8883}"
 MQTT_TLS="${DRB_MQTT_TLS:-true}"
 ENROLLMENT_TOKEN="${DRB_ENROLLMENT_TOKEN:-}"
+unset DRB_ENROLLMENT_TOKEN   # read once; don't leak it into every child's env
 DASHBOARD_USER="${DRB_DASHBOARD_USERNAME:-admin}"
 DASHBOARD_PASS="${DRB_DASHBOARD_PASSWORD:-}"
 REGISTRY="${DRB_IMAGE_REGISTRY:-git.vpn.cusano.net}"   # D1 (public host)
@@ -111,7 +117,10 @@ usage() {
   cat <<'USAGE'
 Usage: install.sh [options]
 
-  --token TOKEN        Enrollment token (Settings -> Nodes -> New token)
+  (enrollment token)   Prompted for on the terminal, input hidden. Mint one at
+                       Settings -> Nodes -> New token.
+  --token-file PATH    read the enrollment token from PATH (unattended installs;
+                       keep it mode 0600 and delete it afterwards)
   --node-id ID         Unique node id, e.g. node-003
   --name NAME          Display name (default: node id)
   --lat N --lon N      Decimal degrees for the map
@@ -135,13 +144,19 @@ Usage: install.sh [options]
 
 Every option also has an env var: DRB_NODE_ID, DRB_C2_URL, DRB_ENROLLMENT_TOKEN,
 DRB_MQTT_BROKER, DRB_REF, DRB_INSTALL_DIR, DRB_REGISTRY_USER/PASS, ...
-Secrets are read from the environment or prompted on the TTY, never from a pipe.
+Secrets are read from a file, the environment or a TTY prompt, never from a
+pipe. Never put the token on a command line: `--token X` and
+`sudo DRB_ENROLLMENT_TOKEN=X bash` both expose it in shell history and `ps`.
+An exported DRB_ENROLLMENT_TOKEN only reaches the installer through sudo with
+`sudo --preserve-env=DRB_ENROLLMENT_TOKEN bash` (plain sudo drops it).
+(`--token` still works for old copied commands but is deprecated, see node-26#18.)
 USAGE
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --token)          ENROLLMENT_TOKEN="$2"; shift 2 ;;
+    --token)          ENROLLMENT_TOKEN="$2"; TOKEN_ON_ARGV=1; shift 2 ;;
+    --token-file)     TOKEN_FILE="$2"; shift 2 ;;
     --node-id)        NODE_ID="$2"; shift 2 ;;
     --name)           NODE_NAME="$2"; shift 2 ;;
     --lat)            NODE_LAT="$2"; shift 2 ;;
@@ -165,6 +180,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "${TOKEN_ON_ARGV:-0}" = 1 ]; then
+  warn "--token is deprecated: the token is now in your shell history and visible in"
+  warn "\`ps\` for this whole install (node-26#18). Omit it to be prompted, or use --token-file."
+fi
+if [ -n "${TOKEN_FILE:-}" ]; then
+  [ -r "$TOKEN_FILE" ] || die "--token-file: cannot read $TOKEN_FILE"
+  _mode="$(stat -c %a "$TOKEN_FILE" 2>/dev/null || echo 600)"
+  (( 8#$_mode & 8#044 )) && warn "--token-file $TOKEN_FILE is readable by other users — chmod 600 it"
+  ENROLLMENT_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  [ -n "$ENROLLMENT_TOKEN" ] || die "--token-file: $TOKEN_FILE is empty"
+fi
+
 [ "$ENROLL_WAIT" = forever ] || [[ "$ENROLL_WAIT" =~ ^[0-9]+$ ]] \
   || die "--wait-approval takes a number of seconds (or omit it to wait until approved)"
 
@@ -184,6 +211,14 @@ ask_secret() {
   read -rsp "$__p: " __r </dev/tty; echo >/dev/tty
   printf -v "$__v" '%s' "$__r"
 }
+# Make sure ENROLLMENT_TOKEN is set: already given, else prompt on the TTY.
+# Returns 1 if there is still no token (non-interactive, or Enter at the prompt).
+need_token() {
+  [ -n "$ENROLLMENT_TOKEN" ] || ask_secret ENROLLMENT_TOKEN "Enrollment token (input hidden)"
+  [ -n "$ENROLLMENT_TOKEN" ]
+}
+NO_TOKEN_HELP="mint one at Settings -> Nodes and re-run the install command; it prompts for
+  the token (unattended: --token-file PATH, or an exported DRB_ENROLLMENT_TOKEN)"
 genpw() { head -c 24 /dev/urandom | base64 | tr -d '\n=' ; }
 
 # ── 1. Preflight ────────────────────────────────────────────────────────────
@@ -433,8 +468,8 @@ wait_for_key() {  # wait_for_key PICKUP_SECRET
   while :; do
     case "$CRED_HTTP" in
       200) [ -n "$(cred_field '.api_key')" ] && { trap - INT TERM; return 0; } ;;
-      401) die "C2 rejected the saved pickup secret (401) while waiting — re-run with --token DRB-… to re-enroll." ;;
-      404) die "C2 no longer knows node '$NODE_ID' (404) — it was deleted. Re-run with --token DRB-… to enroll again." ;;
+      401) die "C2 rejected the saved pickup secret (401) while waiting — re-run the installer to re-enroll (it asks for a fresh enrollment token)." ;;
+      404) die "C2 no longer knows node '$NODE_ID' (404) — it was deleted. Re-run the installer to enroll again (it asks for an enrollment token)." ;;
       *)   : ;;  # 000/5xx: transient, keep waiting
     esac
     if [ "$_shown" = 0 ]; then
@@ -452,8 +487,7 @@ wait_for_key() {  # wait_for_key PICKUP_SECRET
 
 do_fresh_enroll() {
   say "Enrolling '$NODE_ID' with $C2_URL"
-  [ -n "$ENROLLMENT_TOKEN" ] || ask_secret ENROLLMENT_TOKEN "Enrollment token"
-  [ -n "$ENROLLMENT_TOKEN" ] || die "no enrollment token — mint one at Settings -> Nodes, then re-run with --token"
+  need_token || die "no enrollment token — $NO_TOKEN_HELP"
 
   local BODY RESP PICKUP STATUS KEY
   BODY="$(jq -nc --arg id "$NODE_ID" --arg n "${NODE_NAME:-$NODE_ID}" \
@@ -476,7 +510,7 @@ do_fresh_enroll() {
   or have an admin Reissue key (Settings -> Nodes) and write the key into
   $CREDS by hand (see node-26#6)." ;;
       *401*) die "enroll refused (401): enrollment token missing/invalid/revoked —
-  mint a fresh one at Settings -> Nodes and re-run with --token." ;;
+  $NO_TOKEN_HELP." ;;
       *429*) die "enroll refused (429): rate limited. Wait ~1 minute, then re-run." ;;
       *)     die "enroll failed: $RESP" ;;
     esac
@@ -539,24 +573,26 @@ elif [ -s "$PICKUP_FILE" ]; then
       fi
       ;;
     401)
-      if [ -n "$ENROLLMENT_TOKEN" ]; then
-        warn "saved pickup secret rejected (401) — likely rotated by a re-enroll elsewhere. Re-enrolling with --token."
+      warn "saved pickup secret rejected (401) — likely rotated by a re-enroll elsewhere."
+      if need_token; then
+        warn "re-enrolling with the enrollment token."
         rm -f "$PICKUP_FILE"
         do_fresh_enroll
       else
-        die "saved pickup secret is stale (401) and no --token was given. Re-run with
-  --token DRB-… to re-enroll (only works while the node is still pending), or
-  have an admin Reissue key for an approved node and write $CREDS by hand."
+        die "saved pickup secret is stale (401) and no enrollment token was given.
+  Re-enrolling only works while the node is still pending: $NO_TOKEN_HELP.
+  For an approved node, have an admin Reissue key and write $CREDS by hand."
       fi
       ;;
     404)
-      if [ -n "$ENROLLMENT_TOKEN" ]; then
-        warn "C2 does not know node '$NODE_ID' (404) — deleted server-side or never fully enrolled. Re-enrolling with --token."
+      warn "C2 does not know node '$NODE_ID' (404) — deleted server-side or never fully enrolled."
+      if need_token; then
+        warn "re-enrolling with the enrollment token."
         rm -f "$PICKUP_FILE"
         do_fresh_enroll
       else
-        die "C2 does not know node '$NODE_ID' (404) and no --token was given.
-  Re-run with --token DRB-… to enroll it again."
+        die "C2 does not know node '$NODE_ID' (404) and no enrollment token was given:
+  $NO_TOKEN_HELP."
       fi
       ;;
     000)
@@ -640,6 +676,6 @@ if [ -z "$(jq -r '.api_key // empty' "$CREDS" 2>/dev/null)" ]; then
   if [ -s "$PICKUP_FILE" ]; then
     printf "${Y}This node has no api_key yet. Once an admin approves it at %s/settings/nodes\nthe node fetches the key and comes online by itself (no re-run needed).${N}\n\n" "$APP_URL"
   else
-    printf "${Y}This node has no api_key and no saved pickup secret, so a plain re-run cannot\nfix it. Re-run with --token DRB-… to enroll; or, if the node is already\napproved, have an admin Reissue key and write it into\n%s by hand.${N}\n\n" "$CREDS"
+    printf "${Y}This node has no api_key and no saved pickup secret. Re-run the installer\nand give it an enrollment token when it asks; or, if the node is already\napproved, have an admin Reissue key and write it into\n%s by hand.${N}\n\n" "$CREDS"
   fi
 fi
