@@ -31,6 +31,10 @@ RUN ./install.sh -f
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
+# DRB's trunking module for P25 conventional channels (node-26#24): reports
+# encryption + NAC and applies the NAC filter, which stock tk_p25 does not.
+COPY op25_addons/tk_drb_conv.py /op25/op25/gr-op25_repeater/apps/tk_drb_conv.py
+
 # Create the run_multi-rx_service.sh script
 COPY run_multi-rx_service.sh /op25/op25/gr-op25_repeater/apps/run_multi-rx_service.sh
 RUN chmod +x /op25/op25/gr-op25_repeater/apps/run_multi-rx_service.sh

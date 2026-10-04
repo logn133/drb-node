@@ -56,6 +56,51 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 3600} h ago"
 
 
+def _channel_label(ch: Dict[str, Any]) -> str:
+    freq = _mhz(ch.get("freq"))
+    name = ch.get("name") or ""
+    if name and freq and freq not in name:
+        return f"{name} ({freq})"
+    return name or freq or "a channel"
+
+
+def _conventional_decode_check(chans: List[Dict[str, Any]]) -> Dict[str, str]:
+    """P25 conventional (node-26#24): no control channel to lock on to, so the
+    proof of decoding is P25 frames (a NAC) heard on the channels — and the one
+    failure the owner can't fix is encryption."""
+    if not chans:
+        return _check("decode", "Decoding", WARN, "Waiting for OP25 to report its channels…")
+    encrypted = [c for c in chans if c.get("encrypted")]
+    if encrypted:
+        from app.internal.conventional import algid_name
+        parts = []
+        for c in encrypted:
+            key = f", key 0x{c['keyid']:04X}" if c.get("keyid") is not None else ""
+            parts.append(f"{_channel_label(c)}: {algid_name(c.get('algid'))}{key}")
+        # "Everything is encrypted" only when no clear call was ever heard —
+        # `encrypted` alone means a channel's most recent call was.
+        every = len(encrypted) == len(chans) and not any(c.get("clear_calls") for c in chans)
+        return _check(
+            "decode", "Decoding", ERROR if every else WARN,
+            ("Encrypted — " if every else "Partly encrypted — ") + "; ".join(parts)
+            + ". Encrypted calls can't be decoded, so nothing from "
+            + ("these channels" if every else "those channels") + " is recorded.",
+            "Nothing to fix on the node: the agency encrypts this traffic. "
+            + ("Point the node at a different system." if every else "Clear calls are still recorded."),
+        )
+    heard = [c for c in chans if c.get("nac")]
+    listening = ", ".join(_channel_label(c) for c in chans)
+    if not heard:
+        return _check(
+            "decode", "Decoding", OK,
+            f"Listening on {listening} (P25 conventional) — no P25 traffic heard yet.",
+            "Normal on a quiet channel: conventional channels are silent until someone talks. If it stays "
+            "silent through a busy period, check the frequency, antenna and the SDR's PPM.",
+        )
+    nacs = ", ".join(sorted({f"0x{c['nac']:03X}" for c in heard}))
+    return _check("decode", "Decoding", OK, f"Listening on {listening} (P25 conventional) — decoding, NAC {nacs}.")
+
+
 def active_config(node_cfg) -> Any:
     if node_cfg.override_system_id and node_cfg.override_config:
         return node_cfg.override_config
@@ -144,7 +189,8 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
         ))
     else:
         origin = "chosen on this dashboard" if src["local"] else "assigned by the server"
-        checks.append(_check("source", "What to listen to", OK, f"{src['name']} ({src['type']}) — {origin}."))
+        kind = "P25 conventional" if src.get("mode") == "conventional" else src["type"]
+        checks.append(_check("source", "What to listen to", OK, f"{src['name']} ({kind}) — {origin}."))
 
     # 6. OP25
     op25 = f.get("op25_status")
@@ -170,6 +216,7 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
     console = f.get("console") or {}
     last_poll = console.get("last_poll_epoch")
     is_analog = bool(src) and str(src.get("type", "")).upper() in ("NBFM", "ANALOG")
+    is_conventional = bool(src) and src.get("mode") == "conventional"
     if not running:
         checks.append(_check("decode", "Decoding", OFF, "Starts when OP25 runs."))
     elif last_poll is None or now - last_poll > CONSOLE_STALE_SECONDS:
@@ -182,8 +229,9 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
         freq = _mhz(chans[0].get("freq")) if chans else None
         checks.append(_check(
             "decode", "Decoding", OK, f"Tuned to {freq or 'the analog frequency'} (analog FM — no decoding needed).",
-            "Live listening only: analog calls are not recorded or uploaded yet (node-26#20).",
         ))
+    elif is_conventional:
+        checks.append(_conventional_decode_check(f.get("conventional") or []))
     else:
         trunk = console.get("trunk") or []
         tsbk = [float(t.get("last_tsbk") or 0) for t in trunk]
@@ -261,6 +309,7 @@ async def gather_facts() -> Dict[str, Any]:
     from app.internal.metadata_watcher import metadata_watcher
     from app.internal.mqtt_manager import mqtt_manager
     from app.internal.op25_client import op25_client
+    from app.internal.radio_config import system_mode
     from app.internal.secondary_sdr_client import secondary_sdr_client
 
     node_cfg = load_node_config()
@@ -289,8 +338,10 @@ async def gather_facts() -> Dict[str, Any]:
         "sdr_count": sdr_count,
         "source": None if cfg is None else {
             "name": cfg.name, "type": cfg.type, "system_id": cfg.system_id,
+            "mode": system_mode(cfg.type, cfg.config),
             "local": bool(node_cfg.override_system_id and node_cfg.override_config),
         },
+        "conventional": metadata_watcher.conventional_channels,
         "op25_status": (op25 or {}).get("status") if op25 is not None else None,
         "console": metadata_watcher.console_state,
         "audio_capturing": call_recorder.is_capturing,

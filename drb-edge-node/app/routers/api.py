@@ -37,9 +37,12 @@ async def get_status():
         else node_cfg.system_config
     )
     system_type = None
+    system_kind = None
     if active_config:
+        from app.internal.radio_config import system_kind as _kind
         system_name = active_config.name
         system_type = active_config.type
+        system_kind = _kind(active_config.type, active_config.config)
         if active_tgid:
             # Reverse engineer the TGID to talkgroup name based on active system object
             tgs = active_config.config.get("talkgroups", [])
@@ -61,6 +64,8 @@ async def get_status():
         "assigned_system_id": node_cfg.assigned_system_id,
         "system_name": system_name,
         "system_type": system_type,
+        # Human label that tells P25 trunked from P25 conventional (node-26#24).
+        "system_kind": system_kind,
         # True when what OP25 is tuned to was chosen on this dashboard rather
         # than assigned by C2 (a local override, revertible to C2's system).
         "local_choice": bool(node_cfg.override_system_id and node_cfg.override_config),
@@ -192,11 +197,14 @@ class Talkgroup(BaseModel):
 
 class ListenBody(BaseModel):
     """What to listen to, chosen on the local dashboard."""
-    mode: Literal["system", "p25", "analog"]
+    mode: Literal["system", "p25", "p25conv", "analog"]
     system_id: Optional[str] = None       # mode=system: a cached C2 system
     name: Optional[str] = None
-    frequencies: List[float] = []          # MHz; p25 = control channels, analog = exactly one
+    # MHz. p25 = control channels; p25conv = 1-2 voice channels (node-26#24);
+    # analog = exactly one.
+    frequencies: List[float] = []
     talkgroups: List[Talkgroup] = []       # p25 only; empty = every talkgroup
+    nac: Optional[str] = None              # p25conv only, hex; empty = any NAC
 
 
 # RTL-SDR (R820T/R828D) tuning range.
@@ -225,20 +233,60 @@ async def listen(body: ListenBody):
             )
         if body.mode == "analog" and len(freqs) != 1:
             raise HTTPException(400, "Analog listens to exactly one frequency.")
-        is_p25 = body.mode == "p25"
         first = f"{freqs[0]:.5f}".rstrip("0").rstrip(".")
-        label = (body.name or "").strip() or (f"P25 {first} MHz" if is_p25 else f"Analog {first} MHz")
-        config = SystemConfig(
-            system_id=f"local-{body.mode}",
-            name=label,
-            type="P25" if is_p25 else "NBFM",
-            config={
-                "control_channels": freqs,
-                "talkgroups": [tg.model_dump() for tg in body.talkgroups] if is_p25 else [],
-            },
-        )
+        if body.mode == "p25conv":
+            config = _conventional_listen_config(body, freqs, first)
+        else:
+            is_p25 = body.mode == "p25"
+            label = (body.name or "").strip() or (f"P25 {first} MHz" if is_p25 else f"Analog {first} MHz")
+            config = SystemConfig(
+                system_id=f"local-{body.mode}",
+                name=label,
+                type="P25" if is_p25 else "NBFM",
+                config={
+                    "control_channels": freqs,
+                    "talkgroups": [tg.model_dump() for tg in body.talkgroups] if is_p25 else [],
+                },
+            )
     await _apply_override(config)
     return {"ok": True, "name": config.name}
+
+
+# One SDR's usable passband, less a channel's width — op25-container makes the
+# exact check; this one just turns the common mistake into a readable error.
+_CONVENTIONAL_MAX_SPAN_MHZ = 1.5
+
+
+def _conventional_listen_config(body: ListenBody, freqs: List[float], first: str) -> SystemConfig:
+    from app.internal.radio_config import MAX_CONVENTIONAL_CHANNELS, parse_nac
+    if len(freqs) > MAX_CONVENTIONAL_CHANNELS:
+        raise HTTPException(400, f"P25 conventional listens to at most {MAX_CONVENTIONAL_CHANNELS} channels.")
+    if len(set(freqs)) != len(freqs):
+        raise HTTPException(400, "The same frequency is entered twice.")
+    if max(freqs) - min(freqs) > _CONVENTIONAL_MAX_SPAN_MHZ:
+        raise HTTPException(
+            400, f"Those channels are {max(freqs) - min(freqs):.3f} MHz apart — one SDR covers about "
+            f"{_CONVENTIONAL_MAX_SPAN_MHZ:g} MHz. Pick channels closer together.",
+        )
+    try:
+        nac = parse_nac(body.nac)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    label = (body.name or "").strip() or f"P25 conventional {first} MHz"
+    return SystemConfig(
+        system_id="local-p25conv",
+        name=label,
+        type="P25",
+        config={
+            "mode": "conventional",
+            "channels": [
+                {"freq": f, "name": f"{label} {f:.4f}" if len(freqs) > 1 else label,
+                 **({"nac": f"{nac:03X}"} if nac is not None else {})}
+                for f in freqs
+            ],
+            "talkgroups": [],
+        },
+    )
 
 
 @router.get("/systems")

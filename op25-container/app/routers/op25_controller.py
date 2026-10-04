@@ -8,7 +8,8 @@ import json
 import threading
 from collections import deque
 from typing import Optional
-from models import ConfigGenerator, DecodeMode, ChannelConfig, DeviceConfig, TrunkingConfig, TrunkingChannelConfig, TerminalConfig, MetadataConfig, MetadataStreamConfig, HARDWARE_PRESETS
+from models import ConfigGenerator, DecodeMode, P25Mode, ChannelConfig, DeviceConfig, TrunkingConfig, TrunkingChannelConfig, TerminalConfig, MetadataConfig, MetadataStreamConfig, HARDWARE_PRESETS
+from internal.conventional_config import build_conventional_config, CONVENTIONAL_TRUNKING_MODULE
 from internal.logger import create_logger
 from internal.op25_config_utls import save_talkgroup_tags, save_whitelist, del_none_in_dict, get_current_system_from_config
 from internal.liquidsoap_config_utils import generate_liquid_script
@@ -178,7 +179,20 @@ def create_op25_router():
     @router.post("/generate-config")
     async def generate_config(generator: ConfigGenerator):
         try:
-            if generator.type == DecodeMode.P25:
+            if generator.type == DecodeMode.P25 and generator.p25_mode == P25Mode.CONVENTIONAL:
+                # node-26#24: fixed voice channels, no control channel to hunt.
+                preset = HARDWARE_PRESETS.get(generator.hardware_preset, HARDWARE_PRESETS["other"])
+                ppm = generator.ppm_override if generator.ppm_override is not None else preset["ppm"]
+                try:
+                    config_dict, two_channel = build_conventional_config(
+                        generator.systemName, generator.conv_channels, preset["gains"], ppm,
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+                if generator.icecastConfig:
+                    generate_liquid_script(generator.icecastConfig, two_channel=two_channel)
+
+            elif generator.type == DecodeMode.P25:
                 preset = HARDWARE_PRESETS.get(generator.hardware_preset, HARDWARE_PRESETS["other"])
                 ppm = generator.ppm_override if generator.ppm_override is not None else preset["ppm"]
                 channels = [ChannelConfig(
@@ -236,9 +250,9 @@ def create_op25_router():
                 preset = HARDWARE_PRESETS.get(generator.hardware_preset, HARDWARE_PRESETS["other"])
                 ppm = generator.ppm_override if generator.ppm_override is not None else preset["ppm"]
                 freq = int(float(generator.channels[0]))
-                # One fixed conventional channel: no trunking section, so
-                # multi_rx adds its default tk_p25 with no chans and reports
-                # the channel as `conventional` on the HTTP terminal.
+                # One fixed conventional channel: a trunking module with no
+                # chans, so the channel is reported as `conventional` on the
+                # HTTP terminal.
                 channels = [ChannelConfig(
                     name=generator.systemName,
                     trunking_sysname="",
@@ -259,6 +273,11 @@ def create_op25_router():
                 config_dict = {
                     "channels": [channel.dict() for channel in channels],
                     "devices": [device.dict() for device in devices],
+                    # Same module as P25 conventional (node-26#24): it reports
+                    # the channel as `conventional` whatever tk_p25 version the
+                    # image was built with, which is what the edge node's
+                    # single-channel attribution keys on (node-26#20).
+                    "trunking": {"module": CONVENTIONAL_TRUNKING_MODULE, "chans": []},
                     "terminal": TerminalConfig().dict(),
                 }
 

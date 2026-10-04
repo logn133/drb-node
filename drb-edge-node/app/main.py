@@ -191,36 +191,30 @@ async def on_api_key(payload: dict):
         logger.info("Node API key received and saved.")
 
 
-def _to_hz(freq) -> int:
-    """Convert a frequency to Hz. Accepts MHz floats (< 1e6) or Hz ints."""
-    f = float(freq)
-    return int(f * 1_000_000) if f < 1_000_000 else int(f)
-
-
 async def _generate_op25_config(config: SystemConfig) -> bool:
-    """Translate a SystemConfig (Firestore format) into OP25 active.cfg.json + op25.liq."""
+    """Translate a SystemConfig (Firestore format) into OP25 active.cfg.json + op25.liq.
+
+    Trunked / conventional / analog are told apart in radio_config (node-26#24);
+    a system saved before that has no `mode` and is trunked, as it always was.
+    """
     from app.internal.op25_client import op25_client
+    from app.internal.radio_config import build_generate_payload
     node_cfg = load_node_config()
-    raw = config.config
-    payload = {
-        "type": config.type,
-        "systemName": config.name,
-        "channels": [_to_hz(ch) for ch in raw.get("control_channels", [])],
-        "tags": [
-            {"talkgroup": str(tg.get("name", "")), "tagDec": int(tg["id"])}
-            for tg in raw.get("talkgroups", [])
-            if tg.get("id") is not None
-        ],
-        "whitelist": [int(tg["id"]) for tg in raw.get("talkgroups", []) if tg.get("id") is not None],
-        "icecastConfig": {
-            "icecast_host": settings.icecast_host,
-            "icecast_port": settings.icecast_port,
-            "icecast_mountpoint": settings.icecast_mount,
-            "icecast_password": settings.icecast_source_password,
-        },
-        "hardware_preset": node_cfg.hardware_preset,
-        **({"ppm_override": node_cfg.ppm_override} if node_cfg.ppm_override is not None else {}),
-    }
+    try:
+        payload = build_generate_payload(
+            config.type, config.name, config.config,
+            icecast={
+                "icecast_host": settings.icecast_host,
+                "icecast_port": settings.icecast_port,
+                "icecast_mountpoint": settings.icecast_mount,
+                "icecast_password": settings.icecast_source_password,
+            },
+            hardware_preset=node_cfg.hardware_preset,
+            ppm_override=node_cfg.ppm_override,
+        )
+    except ValueError as e:
+        logger.error(f"System {config.name!r} has an unusable channel list: {e}")
+        return False
     return await op25_client.generate_config(payload)
 
 

@@ -327,6 +327,11 @@ class MQTTManager:
             "secondary_sdr_priority": config.secondary_sdr_priority,
         }
         payload["sdr_pins"] = config.sdr_pins
+        # Conventional channels (node-26#24): name/freq/NAC and whether the
+        # agency encrypts them — the one decode failure nobody can fix on the
+        # node, so C2 has to be told. Empty list on a trunked system.
+        from app.internal.metadata_watcher import metadata_watcher
+        payload["radio_channels"] = metadata_watcher.conventional_channels
         secondary = await secondary_sdr_client.status()
         # Unreachable secondary-sdr: say so with explicit nulls. C2 only
         # overwrites keys present in the checkin, so omitting them would leave

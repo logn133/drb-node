@@ -126,8 +126,46 @@ def test_analog_needs_no_control_channel():
         console={"last_poll_epoch": now, "channels": [{"freq": 154430000}], "trunk": [], "last_heard": None},
     )))
     assert c["decode"]["state"] == "ok" and "154.4300 MHz" in c["decode"]["summary"]
-    assert "not recorded" in c["decode"]["action"]
+    # node-26#20: analog calls are recorded now (single-channel attribution).
+    assert c["decode"]["action"] == ""
     assert "this dashboard" in c["source"]["summary"]
+
+
+_CONV_SRC = {"name": "White Plains", "type": "P25", "mode": "conventional", "system_id": "wp", "local": False}
+_PD1 = {"name": "PD1 Dispatch", "freq": 460400000, "nac": None, "encrypted": False, "algid": None, "keyid": None}
+_PD3 = {"name": "PD3 Tac", "freq": 460425000, "nac": None, "encrypted": False, "algid": None, "keyid": None}
+
+
+def _conv_facts(chans):
+    now = 1_000_000.0
+    return _facts(source=_CONV_SRC, conventional=chans,
+                  console={"last_poll_epoch": now, "channels": [], "trunk": [], "last_heard": None})
+
+
+def test_conventional_quiet_channels_are_ok_not_a_control_channel_error():
+    c = _by_id(health.build_checks(_conv_facts([_PD1, _PD3])))
+    assert c["decode"]["state"] == "ok"
+    assert "PD1 Dispatch (460.4000 MHz)" in c["decode"]["summary"]
+    assert "control channel" not in c["decode"]["summary"]
+    assert "P25 conventional" in c["source"]["summary"]
+
+
+def test_conventional_decoding_shows_nac():
+    c = _by_id(health.build_checks(_conv_facts([dict(_PD1, nac=0x293), _PD3])))
+    assert c["decode"]["state"] == "ok" and "NAC 0x293" in c["decode"]["summary"]
+
+
+def test_conventional_all_encrypted_is_an_error_naming_the_algorithm():
+    enc = [dict(_PD1, encrypted=True, algid=0x84, keyid=0x1234), dict(_PD3, encrypted=True, algid=0x84)]
+    c = _by_id(health.build_checks(_conv_facts(enc)))
+    assert c["decode"]["state"] == "error"
+    assert "AES-256" in c["decode"]["summary"] and "0x1234" in c["decode"]["summary"]
+    assert "different system" in c["decode"]["action"]
+
+
+def test_conventional_partly_encrypted_warns():
+    c = _by_id(health.build_checks(_conv_facts([dict(_PD1, encrypted=True, algid=0x81), _PD3])))
+    assert c["decode"]["state"] == "warn" and "PD1 Dispatch" in c["decode"]["summary"]
 
 
 def test_op25_unreachable_and_icecast_down():
@@ -182,7 +220,26 @@ def test_listen_analog_single_frequency(client, op25):
     assert (cfg.type, cfg.name, cfg.config["control_channels"]) == ("NBFM", "Fire", [154.43])
 
 
+def test_listen_p25_conventional(client, op25):
+    r = client.post("/api/listen", json={
+        "mode": "p25conv", "frequencies": [460.4, 460.425], "name": "White Plains", "nac": "0x293",
+    })
+    assert r.status_code == 200, r.text
+    cfg = config_manager.load_node_config().override_config
+    assert cfg.type == "P25" and cfg.config["mode"] == "conventional"
+    assert "control_channels" not in cfg.config
+    assert [c["freq"] for c in cfg.config["channels"]] == [460.4, 460.425]
+    assert {c["nac"] for c in cfg.config["channels"]} == {"293"}
+    op25["gen"].assert_awaited_once()
+    status = client.get("/api/status").json()
+    assert status["system_kind"] == "P25 conventional"
+
+
 @pytest.mark.parametrize("body,needle", [
+    ({"mode": "p25conv", "frequencies": [460.4, 460.425, 460.45]}, "at most 2"),
+    ({"mode": "p25conv", "frequencies": [460.4, 462.6]}, "apart"),
+    ({"mode": "p25conv", "frequencies": [460.4, 460.4]}, "twice"),
+    ({"mode": "p25conv", "frequencies": [460.4], "nac": "zz"}, "hex"),
     ({"mode": "p25", "frequencies": []}, "at least one"),
     ({"mode": "p25", "frequencies": [851012500]}, "MHz"),
     ({"mode": "analog", "frequencies": [154.43, 155.1]}, "exactly one"),

@@ -167,6 +167,7 @@
 
     <div class="tabs" role="radiogroup" aria-label="Source type">
       <label><input type="radio" name="mode" value="p25" checked> P25 trunked</label>
+      <label><input type="radio" name="mode" value="p25conv"> P25 conventional</label>
       <label><input type="radio" name="mode" value="analog"> Analog FM</label>
       <label><input type="radio" name="mode" value="system" id="mode-system"> Server's systems</label>
     </div>
@@ -185,6 +186,23 @@
         <label for="p25-tgs">Talkgroups to keep <span class="hint">(optional)</span></label>
         <textarea id="p25-tgs" placeholder="1001 Fire Dispatch&#10;1002 Fireground"></textarea>
         <span class="hint">One per line: decimal ID, then a name. Leave empty to hear every talkgroup.</span>
+      </div>
+    </div>
+
+    <div class="pane" data-pane="p25conv" hidden>
+      <div class="field">
+        <label for="pc-freqs">Channel frequencies (MHz)</label>
+        <input type="text" id="pc-freqs" class="mono" placeholder="460.4000, 460.4250" inputmode="decimal">
+        <span class="hint">One or two voice channels, comma-separated, within about 1.5 MHz of each other. No control channel — RadioReference lists these as conventional frequencies with mode P25 (or "DE").</span>
+      </div>
+      <div class="field">
+        <label for="pc-name">Name <span class="hint">(optional)</span></label>
+        <input type="text" id="pc-name" placeholder="City PD">
+      </div>
+      <div class="field">
+        <label for="pc-nac">NAC <span class="hint">(optional, hex)</span></label>
+        <input type="text" id="pc-nac" class="mono" placeholder="293">
+        <span class="hint">RadioReference's NAC for these channels. Leave empty to accept any.</span>
       </div>
     </div>
 
@@ -307,7 +325,7 @@
       $('node-name').textContent = d.node_name || 'DRB Edge Node';
       $('node-id').textContent = d.node_id || '';
       document.title = `${d.node_name || 'DRB Edge Node'} — DRB`;
-      $('now-system').textContent = d.system_name ? `${d.system_name} (${d.system_type})` : 'Nothing chosen yet';
+      $('now-system').textContent = d.system_name ? `${d.system_name} (${d.system_kind || d.system_type})` : 'Nothing chosen yet';
       $('now-tg').innerHTML = d.active_tgid
         ? `<span class="live">${esc(d.active_tgid_name || 'Talkgroup')}</span> <span class="mono">TG ${esc(d.active_tgid)}</span>`
         : 'No call right now';
@@ -335,7 +353,7 @@
       actions.hidden = true;
       return;
     }
-    cur.innerHTML = `Now: <strong>${esc(d.system_name)}</strong> (${esc(d.system_type)}) — ` +
+    cur.innerHTML = `Now: <strong>${esc(d.system_name)}</strong> (${esc(d.system_kind || d.system_type)}) — ` +
       (d.local_choice ? 'chosen on this dashboard.' : 'assigned by the DRB server.');
     actions.hidden = !d.local_choice;
     $('revert-btn').textContent = d.has_c2_system ? "Go back to the server's system" : 'Clear and stop';
@@ -387,7 +405,9 @@
     try { systems = await api('/api/systems'); } catch (e) { systems = []; }
     const pick = $('sys-pick');
     const usable = systems.filter(s => String(s.type).toUpperCase() !== 'DMR');
-    pick.innerHTML = usable.map(s => `<option value="${esc(s.system_id)}">${esc(s.name)} (${esc(s.type)})</option>`).join('');
+    const kind = s => String(s.type).toUpperCase() === 'P25' && s.config && s.config.mode === 'conventional'
+      ? 'P25 conventional' : s.type;
+    pick.innerHTML = usable.map(s => `<option value="${esc(s.system_id)}">${esc(s.name)} (${esc(kind(s))})</option>`).join('');
     const none = usable.length === 0;
     $('mode-system').disabled = none;
     pick.disabled = none;
@@ -416,6 +436,10 @@
         tgs.push({ id: Number(mm[1]), name: mm[2] });
       }
       body = { mode: 'p25', frequencies: freqs, name: $('p25-name').value, talkgroups: tgs };
+    } else if (m === 'p25conv') {
+      const freqs = parseFreqs($('pc-freqs').value);
+      if (!freqs.length || freqs.length > 2 || freqs.some(isNaN)) { msg.className = 'msg err'; msg.textContent = 'Enter one or two channel frequencies in MHz, e.g. 460.4000, 460.4250'; return; }
+      body = { mode: 'p25conv', frequencies: freqs, name: $('pc-name').value, nac: $('pc-nac').value.trim() || null };
     } else {
       const freqs = parseFreqs($('an-freq').value);
       if (freqs.length !== 1 || isNaN(freqs[0])) { msg.className = 'msg err'; msg.textContent = 'Enter one frequency in MHz, e.g. 154.4300'; return; }
