@@ -50,7 +50,7 @@ async def fetch_api_key() -> Optional[str]:
     if r.status_code == 401:
         logger.error(
             "Key pickup: C2 rejected the saved pickup secret (401) — it was rotated by a re-enroll elsewhere. "
-            "Re-run install.sh with --token to recover."
+            "Re-run install.sh and give it a fresh enrollment token when it asks (node-26#18)."
         )
         return None
     if r.status_code == 404:

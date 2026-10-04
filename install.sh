@@ -144,6 +144,8 @@ DRB_MQTT_BROKER, DRB_REF, DRB_INSTALL_DIR, DRB_REGISTRY_USER/PASS, ...
 Secrets are read from a file, the environment or a TTY prompt, never from a
 pipe. Never put the token on a command line: `--token X` and
 `sudo DRB_ENROLLMENT_TOKEN=X bash` both expose it in shell history and `ps`.
+An exported DRB_ENROLLMENT_TOKEN only reaches the installer through sudo with
+`sudo --preserve-env=DRB_ENROLLMENT_TOKEN bash` (plain sudo drops it).
 (`--token` still works for old copied commands but is deprecated, see node-26#18.)
 USAGE
 }
