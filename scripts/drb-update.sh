@@ -17,7 +17,9 @@
 #   * Node credentials go to curl via a 0600 header file, never argv.
 #   * C2 must be https.
 # What this does NOT defend against: a compromised git host or registry —
-# refs and images are not signed (see the issue filed with node-26#15).
+# refs and images are not signed (node-26#17).
+#   * Images are pinned to the checked-out source (node-26#19): each one is
+#     pulled as src-<git tree hash of its build directory>, never :latest.
 #
 # The whole body is inside main(), called on the last line: bash parses the
 # function completely before running it, so `git checkout` replacing this
@@ -146,6 +148,45 @@ do_update() {
   fi
   local old new
   old="$(git rev-parse HEAD)"; new="$(git rev-parse "$target^{commit}")"
+
+  local env_registry
+  env_registry="$(grep -E '^IMAGE_REGISTRY=' .env | head -1 | cut -d= -f2- | tr -d '"' || true)"
+  [ "${env_registry:-git.vpn.cusano.net}" = "$REGISTRY" ] \
+    || { err ".env IMAGE_REGISTRY '$env_registry' != configured '$REGISTRY' — refusing"; return 1; }
+
+  # Image pins for the TARGET commit (node-26#19): each image is tagged with
+  # the git tree hash of its own source directory, so the images always match
+  # the code being checked out. The helper is read from the target commit so
+  # its service list matches the target's compose file.
+  local pin=0
+  if git cat-file -e "$new:scripts/image-tags.sh" 2>/dev/null; then
+    # shellcheck disable=SC1090
+    source <(git show "$new:scripts/image-tags.sh") && pin=1
+  fi
+  [ "$pin" = 1 ] || log "target ${new:0:12} predates image pinning — using its compose file's default tags"
+
+  if [ "$BUILD" != 1 ]; then
+    # Pull BEFORE checkout. The app code is bind-mounted from the checkout
+    # (install.sh D3) and edge-node runs uvicorn --reload, so checking out first
+    # would run the new code on the old images for as long as the pull takes —
+    # or for good, if the pinned images don't exist. Pulling against the
+    # target's own compose file means a failed pull changes nothing. It is
+    # written next to the real one so its relative paths (.env, env_file,
+    # build contexts) resolve exactly the same way.
+    local tfile="$INSTALL_DIR/.drb-update-compose.yml" pulled=0
+    git show "$new:docker-compose.yml" > "$tfile" || { rm -f "$tfile"; return 1; }
+    local -a tc=(-f "$tfile" --project-directory "$INSTALL_DIR")
+    (
+      if [ "$pin" = 1 ]; then
+        while IFS= read -r l; do export "$l"; done < <(drb_image_tags "$INSTALL_DIR" "$new")
+      fi
+      docker compose "${tc[@]}" pull || exit 1
+      if [ "$pin" = 1 ]; then drb_images_present "${tc[@]}" || exit 1; fi
+    ) && pulled=1
+    rm -f "$tfile"
+    [ "$pulled" = 1 ] || { err "images for ${new:0:12} are not available — nothing changed (CI may still be building them; the 'Release images' workflow publishes any that are missing)"; return 1; }
+  fi
+
   if [ "$old" != "$new" ]; then
     git -c advice.detachedHead=false checkout --force --detach "$new" || return 1
     log "checked out $REF: ${old:0:12} -> ${new:0:12}"
@@ -153,19 +194,28 @@ do_update() {
     bash scripts/install-updater.sh --refresh || log "unit refresh failed (continuing with the old units)"
   fi
 
-  local env_registry
-  env_registry="$(grep -E '^IMAGE_REGISTRY=' .env | head -1 | cut -d= -f2- | tr -d '"' || true)"
-  [ "${env_registry:-git.vpn.cusano.net}" = "$REGISTRY" ] \
-    || { err ".env IMAGE_REGISTRY '$env_registry' != configured '$REGISTRY' — refusing"; return 1; }
+  if [ "$pin" = 1 ]; then
+    drb_pin_image_tags "$INSTALL_DIR/.env" "$INSTALL_DIR" "$new" || { err "could not write image pins to .env"; return 1; }
+  fi
 
   if [ "$BUILD" = 1 ]; then
-    docker compose build || return 1
-  else
-    docker compose pull || return 1
+    docker compose build || return 1   # tags the local builds with the same pins
   fi
   # --force-recreate: app code is bind-mounted from the checkout (install.sh
   # D3), so a code-only change also needs every container restarted.
   docker compose up -d --no-build --force-recreate --remove-orphans || return 1
+
+  # Drop pinned images this node no longer runs. `image prune` only removes
+  # dangling images, and every previous src- tag is still tagged. `image rm`
+  # without -f refuses anything a container still uses.
+  if [ "$pin" = 1 ]; then
+    local keep ref
+    keep="$(drb_image_tags "$INSTALL_DIR" "$new" | cut -d= -f2)"
+    docker images --format '{{.Repository}}:{{.Tag}}' | grep -E ':src-[0-9a-f]{40}$' \
+      | while IFS= read -r ref; do
+          grep -qxF "${ref##*:}" <<< "$keep" || docker image rm "$ref" >/dev/null 2>&1 || true
+        done || true
+  fi
   docker image prune -f >/dev/null 2>&1 || true
 }
 
