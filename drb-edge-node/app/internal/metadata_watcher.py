@@ -36,6 +36,19 @@ have seen the whole window and ask the rolling console history "what was active
 during this audio, give or take a few seconds" — see _attribute and the
 ATTRIBUTION_* constants.
 
+CONVENTIONAL CHANNELS (node-26#24 P25 conventional, node-26#20 analog). There
+is no control channel, so internal/conventional.py rewrites each console update
+first: a conventional channel that is keyed becomes an ordinary active row whose
+talkgroup is the link-control TGID when it is distinctive, else a stable
+synthetic id derived from the channel frequency. Such a row counts as a talker
+without a radio id (`drb_active`) — link control does not always carry one and
+analog never does. One more rule, applied only at CLOSE: with exactly one
+conventional channel configured, audio the console said nothing about can only
+have come from that channel, so it is attributed to it rather than discarded.
+Not at open: on a channel whose link control carries a real talkgroup, the
+grant may arrive a poll after the audio, and a premature synthetic label would
+force a bogus split when it does.
+
 ORPHAN AUDIO. If nothing in the console history overlaps the window, the audio
 is unattributed: Liquidsoap fallback, a test tone, stray noise, or a dropped
 `call_log`. Policy is DISCARD AND SHOUT — the recording is not uploaded and no
@@ -74,6 +87,7 @@ from typing import Optional, Callable, Awaitable, Any, List, Dict
 
 from app.config import settings
 from app.internal.call_recorder import AudioActivity
+from app.internal.conventional import ConventionalChannels
 from app.internal.op25_client import op25_client
 from app.internal.logger import logger
 
@@ -177,6 +191,22 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
+def _talker(channel: Dict[str, Any]) -> Optional[tuple]:
+    """(tgid, rid) if this channel row says someone is transmitting, else None.
+
+    Trunked rows need both a talkgroup and a source address — an idle channel
+    can keep its last tgid. A normalized conventional row (`drb_active`) only
+    has a tgid while a call is up, and may legitimately have no radio id.
+    """
+    tgid = _as_int(channel.get("tgid"))
+    if tgid is None:
+        return None
+    rid = _as_int(channel.get("srcaddr"))
+    if rid is None and not channel.get("drb_active"):
+        return None
+    return tgid, rid
+
+
 def _iso(epoch: Optional[float]) -> Optional[str]:
     if epoch is None:
         return None
@@ -252,6 +282,10 @@ class MetadataWatcher:
         # Field-visible counter of discarded orphan audio.
         self._unattributed_segments: int = 0
 
+        # Conventional-channel normalizer (node-26#24/#20); also remembers the
+        # channel list and their encryption state for the dashboard + checkin.
+        self._conventional = ConventionalChannels()
+
         # Injectable for tests; production is always the host wall clock.
         self._clock: Callable[[], float] = time.time
 
@@ -300,6 +334,7 @@ class MetadataWatcher:
             return
 
         self._last_ok_poll = now
+        update = self._conventional.normalize(update)
         self._record_console(update, now)
         self._note_terminal(update, now)
 
@@ -341,10 +376,10 @@ class MetadataWatcher:
                 self._console.append(event)
 
         for channel in update.channels:
-            tgid = _as_int(channel.get("tgid"))
-            srcaddr = _as_int(channel.get("srcaddr"))
-            if tgid is None or srcaddr is None:
+            talker = _talker(channel)
+            if talker is None:
                 continue  # idle channel says nothing about who is talking
+            tgid, srcaddr = talker
             self._console.append(ConsoleEvent(
                 epoch=now,
                 tgid=tgid,
@@ -379,7 +414,7 @@ class MetadataWatcher:
                 return True
         return False
 
-    def _attribute(self, start: float, end: float) -> Optional[Attribution]:
+    def _attribute(self, start: float, end: float, allow_sole_channel: bool = False) -> Optional[Attribution]:
         """
         Resolve which talkgroup a stretch of audio belongs to.
 
@@ -387,7 +422,8 @@ class MetadataWatcher:
         how well its console activity overlaps the audio itself, preferring
         real overlap over merely being nearby, and grants over channel rows.
         Returns None only when NOTHING was observed in that band at all — the
-        orphan-audio case.
+        orphan-audio case — unless allow_sole_channel and the node listens to
+        exactly one conventional channel (see module docstring).
         """
         low = start - ATTRIBUTION_LOOKBACK_SECONDS
         high = end + ATTRIBUTION_LOOKAHEAD_SECONDS
@@ -415,7 +451,14 @@ class MetadataWatcher:
                 found.rid = event.rid  # most recent wins
 
         if not candidates:
-            return None
+            sole = self._conventional.sole_channel() if allow_sole_channel else None
+            if sole is None:
+                return None
+            logger.info(
+                f"No console activity near {start:.3f}-{end:.3f}; attributing to the only "
+                f"conventional channel, {sole['name']} (tgid {sole['tgid']})."
+            )
+            return Attribution(tgid=sole["tgid"], name=sole["name"], freq=sole["freq"])
 
         best = max(
             candidates.values(),
@@ -530,6 +573,11 @@ class MetadataWatcher:
             self._refresh_meta_from_log(entry)
             return
 
+        if self._same_channel(tgid, entry.get("freq"), entry.get("tgtag") or ""):
+            self._transmissions += 1
+            self._refresh_meta_from_log(entry)
+            return
+
         # FORCED SPLIT. Two talkgroups can be back to back with no silence
         # between them; pure audio segmentation would merge them into one file
         # under one label, which is exactly the kind of wrong that corrupts
@@ -546,6 +594,21 @@ class MetadataWatcher:
             transmissions=1,
         )
 
+    def _same_channel(self, tgid: int, freq: Any, name: str) -> bool:
+        """A conventional channel seen under its synthetic id and its real
+        talkgroup is one channel, not a split (see ConventionalChannels.
+        same_channel_relabel). Adopts the real talkgroup when offered."""
+        decision = self._conventional.same_channel_relabel(self._current_tgid, self._current_freq, tgid, freq)
+        if decision == "adopt":
+            logger.info(
+                f"Segment {self._active_call_id}: link control names tgid {tgid} for the channel "
+                f"labelled {self._current_tgid} — relabelling, not splitting."
+            )
+            self._current_tgid = tgid
+            if name:
+                self._current_tgid_name = name
+        return decision is not None
+
     async def _scan_channels(self, channels: List[Dict[str, Any]], now: float) -> None:
         """Channel rows in audio mode: refresh metadata, catch an unlogged split."""
         if self._active_call_id is None:
@@ -554,14 +617,15 @@ class MetadataWatcher:
         active: List[Dict[str, Any]] = []
         ours = False
         for channel in channels:
-            tgid = _as_int(channel.get("tgid"))
-            srcaddr = _as_int(channel.get("srcaddr"))
-            if tgid is None or srcaddr is None:
+            talker = _talker(channel)
+            if talker is None:
                 continue
+            tgid, srcaddr = talker
             active.append(channel)
-            if tgid == self._current_tgid:
+            if tgid == self._current_tgid or self._same_channel(tgid, channel.get("freq"), channel.get("tag") or ""):
                 ours = True
-                self._current_srcaddr = srcaddr
+                if srcaddr is not None:
+                    self._current_srcaddr = srcaddr
                 self._last_activity = now
                 self._refresh_meta_from_channel(channel)
 
@@ -658,13 +722,14 @@ class MetadataWatcher:
         foreign_active_tgid: Optional[int] = None
 
         for channel in channels:
-            srcaddr = _as_int(channel.get("srcaddr"))
-            chan_tgid = _as_int(channel.get("tgid"))
-            if srcaddr is None:
+            talker = _talker(channel)
+            if talker is None:
                 continue
+            chan_tgid, srcaddr = talker
             if chan_tgid == self._current_tgid:
                 tx_active = True
-                self._current_srcaddr = srcaddr
+                if srcaddr is not None:
+                    self._current_srcaddr = srcaddr
                 self._refresh_meta_from_channel(channel)
             elif chan_tgid is not None:
                 foreign_active_tgid = chan_tgid
@@ -868,7 +933,7 @@ class MetadataWatcher:
         two talkgroups' console activity overlaps one recording, i.e. the split
         logic should have fired and did not.
         """
-        found = self._attribute(start, end)
+        found = self._attribute(start, end, allow_sole_channel=self._current_tgid is None)
         if found is None:
             return
 
@@ -930,6 +995,12 @@ class MetadataWatcher:
                 "epoch": heard.epoch, "tgid": heard.tgid, "name": heard.name, "freq": heard.freq,
             },
         }
+
+    @property
+    def conventional_channels(self) -> List[Dict[str, Any]]:
+        """Per conventional channel: name, freq, NAC heard, encryption. Empty on
+        a trunked system. Read by /api/health and the checkin."""
+        return self._conventional.encryption_report()
 
     @property
     def unattributed_segments(self) -> int:

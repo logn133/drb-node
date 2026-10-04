@@ -49,12 +49,28 @@ class IcecastConfig(BaseModel):
     icecast_genre: Optional[str] = "Public Safety"
 
 
+class P25Mode(str, Enum):
+    TRUNKED = "trunked"
+    CONVENTIONAL = "conventional"
+
+
+class ConventionalChannel(BaseModel):
+    """One fixed P25 conventional voice channel (node-26#24)."""
+    frequency: int                 # Hz
+    name: str = ""
+    nac: Optional[int] = None      # 0x001-0xFFF; None = accept any NAC
+
+
 class ConfigGenerator(BaseModel):
     type: DecodeMode
     systemName: str
-    # P25: control channel list (Hz). NBFM: channels[0] is the one analog
-    # frequency to listen to (Hz).
-    channels: List[Union[int, str]]
+    # P25 trunked: control channel list (Hz). NBFM: channels[0] is the one
+    # analog frequency to listen to (Hz). P25 conventional: unused — see
+    # conv_channels.
+    channels: List[Union[int, str]] = []
+    # P25 only. Missing = trunked, so every existing caller is unchanged.
+    p25_mode: P25Mode = P25Mode.TRUNKED
+    conv_channels: List[ConventionalChannel] = []
     tags: Optional[List[TalkgroupTag]] = None
     whitelist: Optional[List[int]] = None
     icecastConfig: Optional[IcecastConfig] = None
@@ -84,6 +100,13 @@ class ChannelConfig(BaseModel):
     # Key name op25_nbfm.py actually reads (from_dict(config, 'nbfm_squelch_threshold', -60)).
     nbfm_squelch_threshold: Optional[float] = None
     destination: Optional[str] = "udp://127.0.0.1:23456"
+    # P25 conventional only, read by tk_drb_conv.py (not by multi_rx): the NAC
+    # to lock the frame assembler to. multi_rx passes the whole channel dict
+    # through, so an extra key is harmless.
+    nac: Optional[int] = None
+    # Set on the channel itself for conventional (multi_rx forwards it to the
+    # frame assembler). 2 = drop encrypted voice instead of decoding noise.
+    crypt_behavior: Optional[int] = None
     tracking_threshold: Optional[int] = 120
     tracking_feedback: Optional[float] = 0.75
     excess_bw: Optional[float] = 0.2

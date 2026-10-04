@@ -17,8 +17,9 @@ ICE_DESCRIPTION = "${icecast_description}"
 ICE_GENRE = "${icecast_genre}"
 # ==========================================================
 
-input = mksafe(input.external(buffer=0.25, channels=2, samplerate=8000, restart_on_error=false, "./audio.py -x 2.5 -s"))
+input = mksafe(input.external(buffer=0.25, channels=2, samplerate=8000, restart_on_error=false, "./audio.py -x 2.5 -s${audio_py_args}"))
 # Consider increasing the buffer value on slow systems such as RPi3. e.g. buffer=0.25
+${two_channel_mix}
 
 # Compression
 input = compress(input, attack = 2.0, gain = 0.0, knee = 13.0, ratio = 2.0, release = 12.3, threshold = -18.0)
