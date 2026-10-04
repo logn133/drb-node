@@ -11,6 +11,7 @@ from app.internal import credentials, key_pickup
 CommandCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 ConfigCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 ApiKeyCallback = Callable[[Dict[str, Any]], Awaitable[None]]
+DesiredCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
 # CONNACK codes meaning "your credentials are wrong", as paho reports them:
 # MQTT 3.1.1 return codes 4/5, and the MQTT 5 reason codes paho maps them to
@@ -46,6 +47,7 @@ class MQTTManager:
         self.on_command: Optional[CommandCallback] = None
         self.on_config_push: Optional[ConfigCallback] = None
         self.on_api_key: Optional[ApiKeyCallback] = None
+        self.on_discord_desired: Optional[DesiredCallback] = None
 
         self._offline_buffer = deque(maxlen=settings.offline_call_buffer_size)
 
@@ -55,6 +57,10 @@ class MQTTManager:
         self._t_metadata = f"nodes/{nid}/metadata"
         self._t_commands = f"nodes/{nid}/commands"
         self._t_config = f"nodes/{nid}/config"
+        # Discord radio desired state (retained by C2) and our actual state —
+        # node-26#25. Token IDs only; the strings come over HTTPS.
+        self._t_discord_desired = f"nodes/{nid}/discord/desired"
+        self._t_discord_actual = f"nodes/{nid}/discord/actual"
         # TODO(mqtt-cutover): dead once enrollment lands client-side. This
         # was the pre-dynsec key-delivery path (server retain-publishes the
         # api_key here after admin approval; node asks for redelivery via
@@ -131,6 +137,7 @@ class MQTTManager:
             self._connected = True
             client.subscribe(self._t_commands, qos=1)
             client.subscribe(self._t_config, qos=1)
+            client.subscribe(self._t_discord_desired, qos=1)
             client.subscribe(self._t_api_key, qos=2)  # TODO(mqtt-cutover): see _t_api_key comment above
             client.subscribe(self._t_discovery, qos=0)
             logger.info("MQTT connected.")
@@ -159,6 +166,8 @@ class MQTTManager:
             asyncio.run_coroutine_threadsafe(self.on_command(payload), self._loop)
         elif msg.topic == self._t_config and self.on_config_push:
             asyncio.run_coroutine_threadsafe(self.on_config_push(payload), self._loop)
+        elif msg.topic == self._t_discord_desired and self.on_discord_desired:
+            asyncio.run_coroutine_threadsafe(self.on_discord_desired(payload), self._loop)
         elif msg.topic == self._t_api_key and self.on_api_key:
             asyncio.run_coroutine_threadsafe(self.on_api_key(payload), self._loop)
         elif msg.topic == self._t_discovery:
@@ -284,6 +293,12 @@ class MQTTManager:
                 logger.debug(f"MQTT offline. Dropping metadata event: {event_type}")
         else:
             self._publish(self._t_metadata, payload, qos=1)
+
+    def publish_discord_actual(self, payload: dict) -> None:
+        """What the Discord radio manager is actually doing. Not buffered while
+        offline: a fresh report is sent after every change and periodically,
+        and only the newest one means anything."""
+        self._publish(self._t_discord_actual, payload, qos=1)
 
     async def _flush_offline_buffer(self):
         if not self._offline_buffer:

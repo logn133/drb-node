@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     # Bounded wait for the shared PulseAudio socket before launching FFmpeg.
     pulse_wait_timeout: float = 30.0
 
+    # Discord radio (node-26#25): with the broker unreachable this long, log
+    # every radio bot out. MUST stay below C2's
+    # DISCORD_LEASE_OFFLINE_RELEASE_SECONDS (default 600), after which C2 hands
+    # this node's bot tokens to other nodes — so a token is never logged in on
+    # two nodes at once.
+    discord_mqtt_loss_stop_seconds: int = 300
+
     # ------------------------------------------------------------------
     # Call segmentation
     #
