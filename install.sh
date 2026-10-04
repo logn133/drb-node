@@ -442,12 +442,15 @@ do_fresh_enroll() {
   BODY="$(jq -nc --arg id "$NODE_ID" --arg n "${NODE_NAME:-$NODE_ID}" \
             --argjson lat "${NODE_LAT:-0}" --argjson lon "${NODE_LON:-0}" \
             '{node_id:$id,name:$n,lat:$lat,lon:$lon}')"
-  # Token goes in a header from a shell variable — never on a process command
-  # line, never echoed.
+  # Token goes in a 0600 header file — never on a process command line (curl's
+  # argv is visible in `ps`; CISO condition, server-26#61), never echoed.
+  local _ehdr; _ehdr="$(mktemp)"; chmod 600 "$_ehdr"
+  printf 'X-Enrollment-Token: %s\n' "$ENROLLMENT_TOKEN" > "$_ehdr"
   if ! RESP="$(curl -fsS -X POST "$C2_URL/nodes/enroll" \
             -H "Content-Type: application/json" \
-            -H "X-Enrollment-Token: $ENROLLMENT_TOKEN" \
+            -H "@$_ehdr" \
             --data "$BODY" 2>&1)"; then
+    rm -f "$_ehdr"
     case "$RESP" in
       *403*) die "enroll refused (403): node '$NODE_ID' is already approved on C2, and
   this machine has no configs/pickup_secret to collect its key with. A token
@@ -461,6 +464,7 @@ do_fresh_enroll() {
       *)     die "enroll failed: $RESP" ;;
     esac
   fi
+  rm -f "$_ehdr"
   PICKUP="$(printf '%s' "$RESP" | jq -r '.pickup_secret')"
   STATUS="$(printf '%s' "$RESP" | jq -r '.approval_status')"
   [ -n "$PICKUP" ] && [ "$PICKUP" != null ] || die "enroll returned no pickup_secret: $RESP"
