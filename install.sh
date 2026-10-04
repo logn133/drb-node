@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# DRB edge node — one-shot bootstrap for a clean Raspberry Pi OS (arm64).
+# DRB edge node — one-shot bootstrap for a clean Raspberry Pi OS (arm64) or Debian (amd64).
 #
 #   curl -fsSL https://git.vpn.cusano.net/logan/node-26/raw/tag/v1/install.sh \
 #     | sudo bash -s -- --node-id node-003 \
@@ -228,8 +228,8 @@ command -v apt-get >/dev/null || die "apt-get not found — this script targets 
 
 ARCH="$(dpkg --print-architecture)"
 case "$ARCH" in
-  arm64|aarch64) ok "arch $ARCH" ;;
-  *) warn "arch is $ARCH — CI only builds linux/arm64 images. Prebuilt pull will fail; use --build." ;;
+  arm64|aarch64|amd64|x86_64) ok "arch $ARCH" ;;
+  *) warn "arch is $ARCH — CI only builds linux/amd64 + linux/arm64 images. Prebuilt pull will fail; use --build." ;;
 esac
 ok "running as root"
 

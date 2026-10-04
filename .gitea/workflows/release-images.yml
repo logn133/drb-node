@@ -67,12 +67,16 @@ jobs:
           TAG="src-$(git rev-parse HEAD:${{ matrix.context }})"
           echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
-          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+          # Present only counts if BOTH platforms are in it: src- tags pushed
+          # before node-26#28 are arm64-only, and an amd64 node can't pull them.
+          RAW="$(docker buildx imagetools inspect --raw "$IMAGE:$TAG" 2>/dev/null | tr -d ' \n' || true)"
+          if printf '%s' "$RAW" | grep -q '"architecture":"amd64"' \
+             && printf '%s' "$RAW" | grep -q '"architecture":"arm64"'; then
             echo "EXISTS=true" >> $GITHUB_OUTPUT
-            echo "$IMAGE:$TAG already published — nothing to do"
+            echo "$IMAGE:$TAG already published for amd64 + arm64 — nothing to do"
           else
             echo "EXISTS=false" >> $GITHUB_OUTPUT
-            echo "$IMAGE:$TAG missing — building it"
+            echo "$IMAGE:$TAG missing or not multi-arch — building it"
           fi
 
       - if: steps.meta.outputs.EXISTS != 'true'
@@ -80,8 +84,8 @@ jobs:
         with:
           context: ./${{ matrix.context }}
           file: ./${{ matrix.context }}/Dockerfile
-          # arm64 only, same as the build-*.yml workflows (node-26#28).
-          platforms: linux/arm64
+          # amd64 + arm64, same as the build-*.yml workflows (node-26#28).
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.IMAGE }}:${{ steps.meta.outputs.TAG }}
           cache-from: type=registry,ref=${{ steps.meta.outputs.IMAGE }}:buildcache
