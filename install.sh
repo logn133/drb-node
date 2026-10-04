@@ -368,11 +368,13 @@ PICKUP_FILE="$INSTALL_DIR/configs/pickup_secret"
 # GET /nodes/{id}/credentials. Sets CRED_HTTP + CRED_BODY (no -f: we need the
 # body and status on a 4xx). One implementation so first-run and re-run agree.
 creds_pickup() {  # creds_pickup PICKUP_SECRET
-  local _tmp; _tmp="$(mktemp)"
+  local _tmp _hdr; _tmp="$(mktemp)"; _hdr="$(mktemp)"; chmod 600 "$_hdr"
+  # Secret via a 0600 header file, never curl's argv (visible in `ps`).
+  printf 'X-Pickup-Secret: %s\n' "$1" > "$_hdr"
   CRED_HTTP="$(curl -sS -o "$_tmp" -w '%{http_code}' \
-      "$C2_URL/nodes/$NODE_ID/credentials" -H "X-Pickup-Secret: $1" 2>/dev/null || echo 000)"
+      "$C2_URL/nodes/$NODE_ID/credentials" -H "@$_hdr" 2>/dev/null || echo 000)"
   CRED_BODY="$(cat "$_tmp" 2>/dev/null || true)"
-  rm -f "$_tmp"
+  rm -f "$_tmp" "$_hdr"
 }
 cred_field() { printf '%s' "${CRED_BODY:-}" | jq -r "$1 // empty" 2>/dev/null || true; }
 
