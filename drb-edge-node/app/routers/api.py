@@ -400,15 +400,25 @@ async def set_sdr(body: SdrSettingsBody):
     return {"ok": True, "running": running}
 
 
+@router.get("/discord")
+async def discord_status():
+    """What the node's radio bots are doing (desired state from C2, actual here)."""
+    return radio_bot.snapshot()
+
+
 @router.post("/discord/join")
-async def discord_join(guild_id: int, channel_id: int):
-    ok = await radio_bot.join(guild_id, channel_id)
-    if not ok:
-        raise HTTPException(500, "Failed to join voice channel")
-    return {"ok": True}
+async def discord_join():
+    # node-26#25 item 4: this used to call join() without a token and 500 every
+    # time. A node cannot lease a radio bot by itself — C2 owns the pool.
+    raise HTTPException(
+        409,
+        "Discord radio channels are started from Discord (/join) or the DRB web app; "
+        "the node cannot pick a radio bot on its own.",
+    )
 
 
 @router.post("/discord/leave")
 async def discord_leave():
-    await radio_bot.leave()
+    """Local stop: log every radio bot out until DRB sends a new channel list."""
+    await radio_bot.pause_locally()
     return {"ok": True}

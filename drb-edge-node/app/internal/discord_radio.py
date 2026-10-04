@@ -1,299 +1,484 @@
+"""
+Discord radio streams on the edge, driven by desired state (node-26#25,
+server-26#203/#204).
+
+C2 retains ``nodes/{id}/discord/desired`` = the FULL list of streams this node
+should carry: ``{seq, streams: [{stream_id, guild_id, channel_id, token_id,
+system_name, ...}]}``. This module reconciles toward that list and publishes
+``nodes/{id}/discord/actual`` = ``{applied_seq, sessions: [token_id],
+streams: {stream_id: {state, error, code}}}`` after every change.
+
+Rules this enforces by construction:
+
+* One gateway session per leased token; a token no stream needs any more is
+  logged OUT (``client.close()``), not just disconnected from voice. C2 frees
+  the token only after an ``actual`` with ``applied_seq`` >= the drop and the
+  token absent from ``sessions`` — so one token is never logged in on two
+  nodes (node-26#25 item 1).
+* One voice connection per (token, guild); one token can serve many guilds.
+* The watchdog is a separate reconcile loop that never closes itself: closing
+  a session cannot cancel it (node-26#25 item 2).
+* No message-content intent, no ``@bot leave/join`` mention controls — voice
+  is controlled only through C2 (node-26#25 item 3).
+* MQTT-loss fail-safe: if the broker has been unreachable for
+  ``discord_mqtt_loss_stop_seconds`` every radio bot is logged out, because C2
+  returns this node's tokens to the pool after its own (longer) grace.
+
+Bot token strings never travel over MQTT: they are fetched over HTTPS from C2
+(``GET /discord/node/{node}/tokens/{id}``, node API key), which hands a token
+only to the node holding its lease, and are kept in memory only.
+
+Audio: each voice connection plays the PulseAudio monitor (``-f pulse`` on
+``settings.pulse_source``) — the accuracy path, never Icecast.
+"""
+from __future__ import annotations
+
 import asyncio
-from typing import Optional
+import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+
 import discord
-from discord.ext import commands
+
 from app.config import settings
 from app.internal import pulse
 from app.internal.logger import logger
 
-BOT_READY_TIMEOUT = 15   # seconds to wait for Discord bot to become ready
-WATCHDOG_INTERVAL = 30   # seconds between voice-connection health checks
-REJOIN_DELAY = 5  # seconds to wait before attempting a rejoin
-STREAM_RETRY_DELAY = 5   # seconds to back off before re-arming the audio source
+BOT_READY_TIMEOUT = 15     # seconds to wait for a Discord login to become ready
+WATCHDOG_INTERVAL = 15     # seconds between reconcile passes
+STREAM_RETRY_DELAY = 5     # seconds to back off before re-arming an audio source
+REPORT_EVERY_TICKS = 4     # unconditional actual-state report every ~60s
+_VOICE_TYPES = (discord.ChannelType.voice, discord.ChannelType.stage_voice)
 
 
-class RadioBot:
-    def __init__(self):
-        self._bot: Optional[commands.Bot] = None
-        self._voice_client: Optional[discord.VoiceClient] = None
-        self._task: Optional[asyncio.Task] = None
-        self._watchdog_task: Optional[asyncio.Task] = None
-        self._ready_event: Optional[asyncio.Event] = None
-        self._current_token: Optional[str] = None
+@dataclass
+class _Session:
+    token_id: str
+    client: object
+    task: Optional[asyncio.Task] = None
+    presence: Optional[str] = None
+
+    def alive(self) -> bool:
+        return self.task is not None and not self.task.done() and not self.client.is_closed()
+
+
+@dataclass
+class _Voice:
+    stream_id: str
+    token_id: str
+    guild_id: int
+    channel_id: int
+    vc: Optional[object] = None
+    state: str = "connecting"
+    error: Optional[str] = None
+    code: Optional[str] = None
+
+
+def _default_client_factory():
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.voice_states = True
+    return discord.Client(intents=intents)
+
+
+def _default_audio_factory():
+    # before_options land ahead of -i:  ffmpeg -f pulse -i drb_sink.monitor …
+    source = discord.FFmpegPCMAudio(settings.pulse_source, before_options="-f pulse")
+    return discord.PCMVolumeTransformer(source, volume=1.0)
+
+
+async def _default_token_fetcher(token_id: str) -> Optional[str]:
+    import httpx
+    from app.internal import credentials
+    api_key = credentials.get_api_key()
+    if not settings.c2_url or not api_key:
+        logger.error("Cannot fetch a radio-bot token: C2_URL or the node API key is missing.")
+        return None
+    url = f"{settings.c2_url.rstrip('/')}/discord/node/{settings.node_id}/tokens/{token_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
+            if r.status_code != 200:
+                logger.error(f"C2 refused radio-bot token {token_id}: HTTP {r.status_code}")
+                return None
+            return r.json().get("token")
+    except Exception as e:
+        logger.error(f"Fetching radio-bot token {token_id} failed: {e}")
+        return None
+
+
+async def _default_publisher(payload: dict) -> None:
+    from app.internal.mqtt_manager import mqtt_manager
+    mqtt_manager.publish_discord_actual(payload)
+
+
+def _default_mqtt_up() -> bool:
+    from app.internal.mqtt_manager import mqtt_manager
+    return mqtt_manager.is_connected
+
+
+class RadioManager:
+    def __init__(
+        self,
+        client_factory: Callable[[], object] = _default_client_factory,
+        token_fetcher: Callable[[str], Awaitable[Optional[str]]] = _default_token_fetcher,
+        publisher: Callable[[dict], Awaitable[None]] = _default_publisher,
+        audio_factory: Callable[[], object] = _default_audio_factory,
+        mqtt_up: Callable[[], bool] = _default_mqtt_up,
+        ready_timeout: float = BOT_READY_TIMEOUT,
+    ):
+        self._client_factory = client_factory
+        self._fetch_token = token_fetcher
+        self._publish = publisher
+        self._audio_factory = audio_factory
+        self._mqtt_up = mqtt_up
+        self._ready_timeout = ready_timeout
+
+        self._desired: dict[str, dict] = {}
+        self._applied_seq: Optional[int] = None
+        self._sessions: dict[str, _Session] = {}
+        self._voices: dict[str, _Voice] = {}
+        self._session_errors: dict[str, str] = {}
+        self._tokens: dict[str, str] = {}          # token_id -> string, memory only
+        self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._watchdog: Optional[asyncio.Task] = None
+        self._mqtt_down_since: Optional[float] = None
+        self._failsafe = False
+        self._paused = False
+        self._ticks = 0
 
-        # Remembered so we can rejoin after an unexpected disconnect
-        self._guild_id: Optional[int] = None
-        self._channel_id: Optional[int] = None
-        self._was_streaming: bool = False
+    # ------------------------------------------------------------------
+    # Inputs
+    # ------------------------------------------------------------------
 
-    async def join(self, guild_id: int, channel_id: int, token: str,
-                   call_active: bool = False, system_name: str = None) -> bool:
-        # (Re)start the bot if the token changed or the bot isn't running
-        if self._current_token != token or not self._is_bot_running():
-            if not await self._start_bot(token):
-                return False
-
-        guild = self._bot.get_guild(guild_id)
-        if not guild:
-            logger.error(f"Guild {guild_id} not found — bot may not be a member.")
-            return False
-
-        channel = guild.get_channel(channel_id)
-        if not isinstance(channel, discord.VoiceChannel):
-            logger.error(f"Channel {channel_id} is not a voice channel.")
-            return False
-
-        try:
-            if self._voice_client and self._voice_client.is_connected():
-                await self._voice_client.disconnect(force=True)
-            self._voice_client = await channel.connect()
-            # Remember where we are so the watchdog can rejoin if we drop
-            self._guild_id = guild_id
-            self._channel_id = channel_id
-            # Bounded wait for the shared PulseAudio socket. Historically FFmpeg was
-            # launched before the op25 container had created it, failed instantly,
-            # and the bot sat silently connected forever.
-            await pulse.wait_until_ready()
-            self._play_stream()
-            if system_name:
-                await self._bot.change_presence(
-                    activity=discord.Activity(
-                        type=discord.ActivityType.listening,
-                        name=system_name,
-                    )
-                )
-            logger.info(f"Joined #{channel.name} in {guild.name}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to join voice channel: {e}")
-            return False
-
-    async def leave(self) -> bool:
-        # Clear remembered channel so the watchdog doesn't rejoin
-        self._guild_id = None
-        self._channel_id = None
-        self._was_streaming = False
-
-        if self._voice_client and self._voice_client.is_connected():
+    async def apply_desired(self, payload: dict) -> None:
+        """Handle a (retained) desired-state message from C2."""
+        if not isinstance(payload, dict):
+            return
+        seq = payload.get("seq")
+        seq = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+        if seq is not None and self._applied_seq is not None and seq < self._applied_seq:
+            logger.warning(f"Ignoring stale Discord desired state seq {seq} (applied {self._applied_seq})")
+            return
+        wanted = {}
+        for s in payload.get("streams") or []:
             try:
-                self._stop_stream()
-                await self._voice_client.disconnect(force=True)
-                self._voice_client = None
-                await self._bot.change_presence(activity=None)
-                logger.info("Disconnected from voice channel.")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to disconnect: {e}")
-        return False
+                wanted[str(s["stream_id"])] = {
+                    "stream_id": str(s["stream_id"]), "guild_id": int(s["guild_id"]),
+                    "channel_id": int(s["channel_id"]), "token_id": str(s["token_id"]),
+                    "system_name": s.get("system_name"),
+                }
+            except (KeyError, TypeError, ValueError):
+                logger.error(f"Malformed Discord desired stream entry ignored: {s!r}")
+        self._ensure_watchdog()
+        self._desired = wanted
+        self._paused = False
+        await self.reconcile()
+        if seq is not None:
+            self._applied_seq = seq
+        await self.publish_actual()
 
+    async def pause_locally(self) -> None:
+        """Local-dashboard stop: log every bot out until C2 sends a new list."""
+        self._paused = True
+        await self.reconcile()
+        await self.publish_actual()
+
+    # ------------------------------------------------------------------
+    # Reconcile
+    # ------------------------------------------------------------------
+
+    def _target(self) -> dict[str, dict]:
+        return {} if (self._paused or self._failsafe) else self._desired
+
+    async def reconcile(self) -> None:
+        async with self._lock:
+            target = self._target()
+            # 1) voice connections no longer wanted (or re-pointed)
+            for sid, v in list(self._voices.items()):
+                d = target.get(sid)
+                if not d or (d["token_id"], d["guild_id"], d["channel_id"]) != (v.token_id, v.guild_id, v.channel_id):
+                    await self._disconnect(v)
+                    del self._voices[sid]
+            # 2) gateway sessions no stream needs: LOG OUT, not just leave voice
+            needed = {d["token_id"] for d in target.values()}
+            for tid in list(self._sessions):
+                if tid not in needed:
+                    await self._close_session(tid)
+            for tid in list(self._tokens):
+                if tid not in needed:
+                    self._tokens.pop(tid, None)
+            # 3) sessions + voice for everything wanted
+            for sid, d in sorted(target.items()):
+                v = self._voices.get(sid)
+                if v is None:
+                    v = self._voices[sid] = _Voice(sid, d["token_id"], d["guild_id"], d["channel_id"])
+                sess = await self._ensure_session(d["token_id"])
+                if sess is None:
+                    v.state, v.code = "error", "login_failed"
+                    v.error = self._session_errors.get(d["token_id"], "The radio bot could not log in to Discord.")
+                    continue
+                await self._ensure_voice(sess, v, d)
+
+    async def _ensure_session(self, token_id: str) -> Optional[_Session]:
+        sess = self._sessions.get(token_id)
+        if sess and sess.alive():
+            return sess
+        if sess:
+            await self._close_session(token_id)
+        token = self._tokens.get(token_id) or await self._fetch_token(token_id)
+        if not token:
+            self._session_errors[token_id] = "DRB would not hand this node the radio bot's token."
+            return None
+        client = self._client_factory()
+        sess = _Session(token_id, client)
+        ready = asyncio.Event()
+
+        async def on_ready():
+            ready.set()
+        client.event(on_ready)
+        sess.task = asyncio.create_task(client.start(token))
+        waiter = asyncio.create_task(ready.wait())
+        done, _ = await asyncio.wait({waiter, sess.task}, timeout=self._ready_timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if waiter not in done:
+            waiter.cancel()
+            err = sess.task.exception() if sess.task.done() and not sess.task.cancelled() else None
+            msg = f"{type(err).__name__}: {err}" if err else f"not ready after {self._ready_timeout:.0f}s"
+            logger.error(f"Radio bot {token_id} failed to log in: {msg}")
+            self._session_errors[token_id] = f"The radio bot could not log in to Discord ({msg[:120]})."
+            await self._shutdown_client(sess)
+            if isinstance(err, discord.LoginFailure):
+                self._tokens.pop(token_id, None)
+            return None
+        self._tokens[token_id] = token
+        self._sessions[token_id] = sess
+        self._session_errors.pop(token_id, None)
+        logger.info(f"Radio bot {token_id} logged in as {getattr(client, 'user', None)}")
+        return sess
+
+    async def _ensure_voice(self, sess: _Session, v: _Voice, d: dict) -> None:
+        client = sess.client
+        guild = client.get_guild(v.guild_id)
+        if guild is None:
+            v.state, v.code = "error", "not_in_guild"
+            v.error = "This radio bot is not a member of that Discord server — invite it first."
+            return
+        channel = guild.get_channel(v.channel_id)
+        if channel is None or getattr(channel, "type", None) not in _VOICE_TYPES:
+            v.state, v.code = "error", "bad_channel"
+            v.error = "That channel is not a voice channel the radio bot can see."
+            return
+        vc = v.vc
+        if vc is not None and vc.is_connected() and getattr(vc.channel, "id", None) == v.channel_id:
+            if not vc.is_playing():
+                self._play(v)
+            v.state, v.error, v.code = "connected", None, None
+            await self._set_presence(sess, d.get("system_name"))
+            return
+        v.state = "connecting"
+        try:
+            existing = guild.voice_client
+            if existing is not None and existing.is_connected():
+                await existing.move_to(channel)
+                v.vc = existing
+            else:
+                if existing is not None:
+                    await existing.disconnect(force=True)
+                v.vc = await channel.connect()
+        except Exception as e:
+            v.vc = None
+            v.state, v.code = "error", "connect_failed"
+            v.error = f"Could not connect to the voice channel ({type(e).__name__}: {str(e)[:120]})."
+            logger.error(f"Stream {v.stream_id}: voice connect failed: {e}")
+            return
+        # Bounded wait for the shared PulseAudio socket (op25 container creates it).
+        if not await pulse.wait_until_ready():
+            v.state, v.code = "error", "no_audio"
+            v.error = "The node's audio path (PulseAudio) is not up."
+            return
+        self._play(v, pulse_checked=True)
+        v.state, v.error, v.code = "connected", None, None
+        await self._set_presence(sess, d.get("system_name"))
+        logger.info(f"Stream {v.stream_id} connected (bot {v.token_id})")
+
+    async def _set_presence(self, sess: _Session, name: Optional[str]) -> None:
+        if not name or sess.presence == name:
+            return
+        try:
+            await sess.client.change_presence(
+                activity=discord.Activity(type=discord.ActivityType.listening, name=name))
+            sess.presence = name
+        except Exception as e:
+            logger.warning(f"Presence update failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+
+    def _play(self, v: _Voice, pulse_checked: bool = False) -> None:
+        vc = v.vc
+        if vc is None or not vc.is_connected():
+            return
+        if not pulse_checked and not pulse.is_ready():
+            logger.error(f"PulseAudio socket {pulse.socket_path()} missing — retrying audio in {STREAM_RETRY_DELAY}s.")
+            self._schedule_replay(v.stream_id)
+            return
+        try:
+            vc.play(self._audio_factory(), after=lambda err, sid=v.stream_id: self._on_audio_end(sid, err))
+        except Exception as e:
+            logger.error(f"Stream {v.stream_id}: could not start audio: {e}")
+            self._schedule_replay(v.stream_id)
+
+    def _on_audio_end(self, stream_id: str, error) -> None:
+        """discord.py calls this from its player thread."""
+        if error:
+            logger.error(f"Stream {stream_id} audio ended with error: {error}")
+        self._schedule_replay(stream_id, STREAM_RETRY_DELAY if error else 0.5)
+
+    def _schedule_replay(self, stream_id: str, delay: float = STREAM_RETRY_DELAY) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        async def _later():
+            await asyncio.sleep(delay)
+            v = self._voices.get(stream_id)
+            if v and v.vc and v.vc.is_connected() and not v.vc.is_playing():
+                self._play(v)
+
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_later()))
+
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
+    async def _disconnect(self, v: _Voice) -> None:
+        vc, v.vc = v.vc, None
+        if vc is None:
+            return
+        try:
+            if vc.is_playing():
+                vc.stop()
+            await vc.disconnect(force=True)
+        except Exception as e:
+            logger.warning(f"Stream {v.stream_id}: voice disconnect error: {e}")
+
+    async def _close_session(self, token_id: str) -> None:
+        sess = self._sessions.pop(token_id, None)
+        if sess is None:
+            return
+        for v in self._voices.values():
+            if v.token_id == token_id:
+                await self._disconnect(v)
+        await self._shutdown_client(sess)
+        logger.info(f"Radio bot {token_id} logged out")
+
+    async def _shutdown_client(self, sess: _Session) -> None:
+        try:
+            await sess.client.close()
+        except Exception as e:
+            logger.warning(f"Radio bot {sess.token_id} close error: {e}")
+        if sess.task and not sess.task.done():
+            sess.task.cancel()
+            try:
+                await sess.task
+            except BaseException:
+                pass
+
+    async def stop(self) -> None:
+        """Node shutdown: log every radio bot out."""
+        if self._watchdog:
+            self._watchdog.cancel()
+            self._watchdog = None
+        async with self._lock:
+            for v in list(self._voices.values()):
+                await self._disconnect(v)
+            self._voices.clear()
+            for tid in list(self._sessions):
+                await self._close_session(tid)
+            self._tokens.clear()
+
+    # ------------------------------------------------------------------
+    # Watchdog + MQTT-loss fail-safe
+    # ------------------------------------------------------------------
+
+    def _ensure_watchdog(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        if self._watchdog is None or self._watchdog.done():
+            self._watchdog = asyncio.create_task(self._watchdog_loop())
+
+    async def _watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Discord watchdog error: {e}")
+
+    async def tick(self, now: Optional[float] = None) -> None:
+        """One watchdog pass: fail-safe check, then reconcile + report if needed."""
+        now = time.monotonic() if now is None else now
+        before = self.snapshot()
+        if self._mqtt_up():
+            self._mqtt_down_since = None
+            if self._failsafe:
+                logger.info("MQTT back — resuming Discord radio streams.")
+                self._failsafe = False
+        else:
+            if self._mqtt_down_since is None:
+                self._mqtt_down_since = now
+            elif (not self._failsafe and self._sessions
+                  and now - self._mqtt_down_since >= settings.discord_mqtt_loss_stop_seconds):
+                logger.warning("MQTT unreachable past the fail-safe — logging every radio bot out "
+                               "(C2 will hand these tokens to other nodes).")
+                self._failsafe = True
+        await self.reconcile()
+        self._ticks += 1
+        # On change, and every few passes regardless: a periodic report is what
+        # lets C2 settle a release whose first ack was lost.
+        if self.snapshot() != before or self._ticks % REPORT_EVERY_TICKS == 0:
+            await self.publish_actual()
+
+    # ------------------------------------------------------------------
+    # Reporting
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        streams = {}
+        for sid in self._desired:
+            v = self._voices.get(sid)
+            if self._paused:
+                streams[sid] = {"state": "paused_locally", "error": None, "code": None}
+            elif v is None:
+                streams[sid] = {"state": "connecting", "error": None, "code": None}
+            else:
+                streams[sid] = {"state": v.state, "error": v.error, "code": v.code}
+        return {
+            "applied_seq": self._applied_seq,
+            "sessions": sorted(tid for tid, s in self._sessions.items() if s.alive()),
+            "streams": streams,
+        }
+
+    async def publish_actual(self) -> None:
+        try:
+            await self._publish(self.snapshot())
+        except Exception as e:
+            logger.warning(f"Publishing Discord actual state failed: {e}")
+
+    # metadata_watcher hooks — audio plays continuously, nothing to do per call.
     def start_stream(self):
-        """Called when an OP25 call starts — stream plays continuously, nothing to do."""
         pass
 
     def stop_stream(self):
-        """Called when an OP25 call ends — stream plays continuously, nothing to do."""
         pass
-
-    async def stop(self):
-        self._guild_id = None
-        self._channel_id = None
-        self._was_streaming = False
-
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
-            self._watchdog_task = None
-
-        await self.leave()
-
-        if self._task:
-            self._task.cancel()
-        if self._bot:
-            await self._bot.close()
-        self._bot = None
-        self._task = None
-        self._current_token = None
-        self._ready_event = None
-
-    def _play_stream(self):
-        """
-        Feed Discord voice straight from the PulseAudio monitor.
-
-        Icecast is NOT used here: it lags ~1 s at connect and drifts to 100 s+,
-        which is unusable for live listening. Icecast remains the frontend/mobile
-        listening path only.
-        """
-        if not self._voice_client:
-            return
-
-        if not pulse.is_ready():
-            logger.error(
-                f"PulseAudio socket {pulse.socket_path()} missing — "
-                f"cannot start Discord audio; retrying in {STREAM_RETRY_DELAY}s."
-            )
-            self._schedule_restart()
-            return
-
-        # before_options land ahead of -i, so this becomes:
-        #   ffmpeg -f pulse -i drb_sink.monitor …
-        source = discord.FFmpegPCMAudio(
-            settings.pulse_source,
-            before_options="-f pulse",
-        )
-        self._voice_client.play(
-            discord.PCMVolumeTransformer(source, volume=1.0),
-            after=self._on_stream_end,
-        )
-
-    def _schedule_restart(self, delay: float = STREAM_RETRY_DELAY):
-        """Re-arm the audio source after a delay — safe to call from any thread."""
-        if not self._loop:
-            return
-
-        async def _delayed_restart():
-            await asyncio.sleep(delay)
-            vc = self._voice_client
-            if vc and vc.is_connected() and not vc.is_playing():
-                self._play_stream()
-
-        self._loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_delayed_restart()))
-
-    def _on_stream_end(self, error):
-        if error:
-            logger.error(f"Stream ended with error: {error}")
-        vc = self._voice_client
-        if not (self._loop and vc and vc.is_connected() and not vc.is_playing()):
-            return
-        if error:
-            # Back off before retrying — prevents a tight loop when PulseAudio is
-            # unavailable (FFmpeg exits immediately in that case).
-            self._schedule_restart()
-        else:
-            self._loop.call_soon_threadsafe(self._play_stream)
-
-    def _stop_stream(self):
-        if self._voice_client and self._voice_client.is_playing():
-            self._voice_client.stop()
-
-    async def _watchdog_loop(self):
-        """Periodically verify the voice connection is alive; rejoin silently if not."""
-        await asyncio.sleep(WATCHDOG_INTERVAL)  # give initial join time to settle
-        while True:
-            try:
-                await asyncio.sleep(WATCHDOG_INTERVAL)
-
-                # Only act if we're supposed to be in a channel
-                if not self._guild_id or not self._channel_id:
-                    continue
-
-                connected = self._voice_client is not None and self._voice_client.is_connected()
-                if not connected:
-                    logger.warning("Watchdog: voice connection lost — attempting rejoin.")
-                    await asyncio.sleep(REJOIN_DELAY)
-                    rejoined = await self.join(
-                        self._guild_id,
-                        self._channel_id,
-                        self._current_token,
-                    )
-                    if rejoined:
-                        logger.info("Watchdog: successfully rejoined voice channel.")
-                    else:
-                        logger.error("Watchdog: rejoin failed — will retry next cycle.")
-
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.error(f"Watchdog error: {e}")
-
-    async def _start_bot(self, token: str) -> bool:
-        await self.stop()  # clean up any previous instance
-
-        intents = discord.Intents.default()
-        intents.voice_states = True
-        intents.message_content = True
-        intents.messages = True
-        self._bot = commands.Bot(command_prefix="!", intents=intents)
-        self._ready_event = asyncio.Event()
-        self._current_token = token
-        self._loop = asyncio.get_event_loop()
-
-        @self._bot.event
-        async def on_ready():
-            logger.info(f"Discord bot ready: {self._bot.user} ({self._bot.user.id})")
-            self._ready_event.set()
-
-        @self._bot.event
-        async def on_voice_state_update(
-            member: discord.Member,
-            before: discord.VoiceState,
-            after: discord.VoiceState,
-        ):
-            """Detect when our own bot gets disconnected from a voice channel."""
-            if self._bot.user and member.id != self._bot.user.id:
-                return
-            if before.channel is not None and after.channel is None:
-                # Bot was disconnected (kicked or server drop).
-                # Don't null _voice_client here — Discord.py reconnects voice
-                # transparently and would leave _voice_client stale as None.
-                # The watchdog detects real disconnects via is_connected().
-                logger.warning("Bot was disconnected from voice channel — watchdog will rejoin if needed.")
-
-        @self._bot.event
-        async def on_message(message: discord.Message):
-            if message.author.bot:
-                return
-            if self._bot.user not in message.mentions:
-                return
-            content = message.content.lower()
-            if "leave" in content:
-                await self.leave()
-                try:
-                    await message.reply("Disconnected.")
-                except Exception:
-                    pass
-            elif "joinme" in content or "join" in content:
-                member = message.guild.get_member(message.author.id) if message.guild else None
-                vc = member.voice.channel if member and member.voice else None
-                if not vc:
-                    try:
-                        await message.reply("You're not in a voice channel.")
-                    except Exception:
-                        pass
-                    return
-                try:
-                    if self._voice_client and self._voice_client.is_connected():
-                        await self._voice_client.move_to(vc)
-                    else:
-                        self._voice_client = await vc.connect()
-                    self._channel_id = vc.id
-                    # A fresh connect() has no audio source attached yet.
-                    if not self._voice_client.is_playing():
-                        self._play_stream()
-                    await message.reply(f"Joined {vc.name}.")
-                except Exception as e:
-                    logger.error(f"joinme failed: {e}")
-
-        self._task = asyncio.create_task(self._bot.start(token))
-
-        try:
-            await asyncio.wait_for(self._ready_event.wait(), timeout=BOT_READY_TIMEOUT)
-            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-            return True
-        except asyncio.TimeoutError:
-            logger.error("Timed out waiting for Discord bot to become ready.")
-            await self.stop()
-            return False
-
-    def _is_bot_running(self) -> bool:
-        return (
-            self._bot is not None
-            and self._task is not None
-            and not self._task.done()
-        )
 
     @property
     def is_connected(self) -> bool:
-        return self._voice_client is not None and self._voice_client.is_connected()
+        return any(v.vc is not None and v.vc.is_connected() for v in self._voices.values())
 
 
-radio_bot = RadioBot()
+radio_bot = RadioManager()

@@ -15,7 +15,7 @@
 #  --track-main for the owner's own always-latest nodes)
 #
 # Hosting, the pinned ref, and setup.sh's retirement are settled (owner
-# decisions, 2026-09-06). One standing hazard remains — D3 below.
+# decisions, 2026-09-06). D3 below is mitigated by image pinning (node-26#19).
 #
 # What it does, in order:
 #   1. Preflight (root, arch, apt, SDR present)
@@ -53,15 +53,18 @@
 #       the mint panel / node-26#4). DEFAULT_REF below is `v1`. `--track-main`
 #       stays as an opt-in for the owner's own nodes.
 #
-# STANDING HAZARD
+# MITIGATED HAZARD
 #
 #   D3  SOURCE-OVERLAY. docker-compose.yml bind-mounts ./drb-edge-node/app and
-#       ./op25-container/app OVER the image's /app. So even in prebuilt mode
-#       the running Python is the CLONED REF's code against the pulled image's
-#       dependencies. `v1` == the commit CI built the current :latest/:stable
-#       from, so today they match — but the moment `v1` and the image tags
-#       diverge this silently mixes them. Fix: drop those two mounts from the
-#       prod compose path, or always retag images from the same ref as `v1`.
+#       ./op25-container/app OVER the image's /app, so the running Python is
+#       the CLONED REF's code against the pulled image's dependencies. Those
+#       used to be :latest/:stable, built from main — silently a different
+#       commit from `v1`. Since node-26#19 every image is pinned to
+#       src-<git tree hash of its own directory at the checked-out ref>
+#       (scripts/image-tags.sh, written into .env as DRB_TAG_*), which CI tags
+#       identically. The mounts now overlay the same code the image was built
+#       from. A pinned image that was never built fails the pull loudly; the
+#       "Release images" workflow builds any a release tag is missing.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -369,6 +372,20 @@ EOF
   ok ".env written for '$NODE_ID'"
 fi
 
+# Pin every image to the source just checked out (node-26#19, D3). Written
+# into .env — fresh or preserved — so later manual `docker compose` runs on
+# this node use the same pins.
+# A --ref older than #19 has no helper; its compose file hardcodes its tags.
+if [ -f "$INSTALL_DIR/scripts/image-tags.sh" ]; then
+  # shellcheck source=scripts/image-tags.sh
+  . "$INSTALL_DIR/scripts/image-tags.sh"
+  drb_pin_image_tags "$INSTALL_DIR/.env" "$INSTALL_DIR" "$RESOLVED_SHA" || die "could not write image pins to .env"
+  ok "images pinned to the source at ${RESOLVED_SHA:0:12} (DRB_TAG_* in .env)"
+else
+  warn "$REF predates image pinning (node-26#19) — using its compose file's default image tags"
+  drb_images_present() { return 0; }
+fi
+
 # ── 5. Enrollment ───────────────────────────────────────────────────────────
 # Client half of Server/drb-c2-core/app/routers/enrollment.py. It does NOT
 # exist in the edge-node app today (mqtt_manager.py:73-85 says so explicitly),
@@ -606,6 +623,11 @@ if [ "$DO_START" = 1 ]; then
   requirement or a transient network error: re-run with DRB_REGISTRY_USER /
   DRB_REGISTRY_PASS set, or with --build to compile on the Pi (~1h for op25)."
     fi
+    # compose pull only WARNS for a missing image that also has a build:
+    # section, so check the pinned images really arrived.
+    drb_images_present || die "the images pinned to $REF (${RESOLVED_SHA:0:12}) are not in
+  $REGISTRY yet. CI may still be building them — wait and re-run; the owner can
+  run the 'Release images' workflow on that ref; or re-run with --build."
     docker compose up --no-build -d
   fi
   # ALWAYS recreate edge-node (node-26#14): `up -d` leaves an already-running
