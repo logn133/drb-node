@@ -38,6 +38,10 @@ jobs:
         run: |
           echo "REPO_NAME=$(echo ${GITHUB_REPOSITORY} | awk -F'/' '{print $2}')" >> $GITHUB_OUTPUT
           echo "VERSION=$(git describe --tags --always | sed 's/^v//')" >> $GITHUB_OUTPUT
+          # Source pin (node-26#19): the git tree hash of the build context.
+          # A node pulls src-<tree of its own checkout> — scripts/image-tags.sh
+          # computes the identical value — so its code and image always match.
+          echo "SRC_TAG=src-$(git rev-parse HEAD:secondary-sdr-container)" >> $GITHUB_OUTPUT
 
       - uses: docker/build-push-action@v6
         with:
@@ -47,6 +51,7 @@ jobs:
           push: true
           tags: |
             git.vpn.cusano.net/${{ vars.DOCKER_ORG }}/${{ steps.meta.outputs.REPO_NAME }}/${{ env.CONTAINER_NAME }}:${{ steps.meta.outputs.VERSION }}
+            git.vpn.cusano.net/${{ vars.DOCKER_ORG }}/${{ steps.meta.outputs.REPO_NAME }}/${{ env.CONTAINER_NAME }}:${{ steps.meta.outputs.SRC_TAG }}
             git.vpn.cusano.net/${{ vars.DOCKER_ORG }}/${{ steps.meta.outputs.REPO_NAME }}/${{ env.CONTAINER_NAME }}:latest
           cache-from: type=registry,ref=git.vpn.cusano.net/${{ vars.DOCKER_ORG }}/${{ steps.meta.outputs.REPO_NAME }}/${{ env.CONTAINER_NAME }}:buildcache
           cache-to: type=registry,ref=git.vpn.cusano.net/${{ vars.DOCKER_ORG }}/${{ steps.meta.outputs.REPO_NAME }}/${{ env.CONTAINER_NAME }}:buildcache,mode=max

@@ -1,6 +1,10 @@
+# Image tags: a provisioned node pins every image to the source tree it has
+# checked out (DRB_TAG_* = src-<git tree hash>, written into .env by install.sh
+# and scripts/drb-update.sh via scripts/image-tags.sh — node-26#19). Unset, as
+# in local dev, they fall back to :latest / :stable, which CI builds from main.
 services:
   icecast:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/icecast:latest
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/icecast:${DRB_TAG_ICECAST:-latest}
     build: ./icecast
     restart: unless-stopped
     network_mode: host
@@ -16,7 +20,7 @@ services:
   # rather than being exposed. edge-node still reaches both over localhost
   # because it shares this host network namespace.
   op25:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/op25-client:stable
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/op25-client:${DRB_TAG_OP25:-stable}
     build: ./op25-container
     restart: unless-stopped
     privileged: true
@@ -38,7 +42,7 @@ services:
   # node-26#9. Same network/device access as op25 for the same reason: it
   # needs the raw USB device, not a virtualized one.
   secondary-sdr:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/secondary-sdr:latest
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/secondary-sdr:${DRB_TAG_SECONDARY_SDR:-latest}
     build: ./secondary-sdr-container
     restart: unless-stopped
     privileged: true
@@ -48,7 +52,7 @@ services:
       - /dev:/dev
 
   edge-node:
-    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/edge-node:latest
+    image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/edge-node:${DRB_TAG_EDGE_NODE:-latest}
     build: ./drb-edge-node
     restart: unless-stopped
     network_mode: host
