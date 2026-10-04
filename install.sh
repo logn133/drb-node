@@ -340,10 +340,16 @@ fi
 # Pin every image to the source just checked out (node-26#19, D3). Written
 # into .env — fresh or preserved — so later manual `docker compose` runs on
 # this node use the same pins.
-# shellcheck source=scripts/image-tags.sh
-. "$INSTALL_DIR/scripts/image-tags.sh"
-drb_pin_image_tags "$INSTALL_DIR/.env" "$INSTALL_DIR" "$RESOLVED_SHA" || die "could not write image pins to .env"
-ok "images pinned to the source at ${RESOLVED_SHA:0:12} (DRB_TAG_* in .env)"
+# A --ref older than #19 has no helper; its compose file hardcodes its tags.
+if [ -f "$INSTALL_DIR/scripts/image-tags.sh" ]; then
+  # shellcheck source=scripts/image-tags.sh
+  . "$INSTALL_DIR/scripts/image-tags.sh"
+  drb_pin_image_tags "$INSTALL_DIR/.env" "$INSTALL_DIR" "$RESOLVED_SHA" || die "could not write image pins to .env"
+  ok "images pinned to the source at ${RESOLVED_SHA:0:12} (DRB_TAG_* in .env)"
+else
+  warn "$REF predates image pinning (node-26#19) — using its compose file's default image tags"
+  drb_images_present() { return 0; }
+fi
 
 # ── 5. Enrollment ───────────────────────────────────────────────────────────
 # Client half of Server/drb-c2-core/app/routers/enrollment.py. It does NOT

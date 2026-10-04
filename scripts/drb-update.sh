@@ -158,10 +158,12 @@ do_update() {
   # the git tree hash of its own source directory, so the images always match
   # the code being checked out. The helper is read from the target commit so
   # its service list matches the target's compose file.
-  local pin=0
+  # Read into a variable, not `source <(...)`: a failed `git show` must leave
+  # pin=0 rather than "succeed" with no functions defined.
+  local pin=0 helper
   if git cat-file -e "$new:scripts/image-tags.sh" 2>/dev/null; then
-    # shellcheck disable=SC1090
-    source <(git show "$new:scripts/image-tags.sh") && pin=1
+    helper="$(git show "$new:scripts/image-tags.sh")" && [ -n "$helper" ] && eval "$helper" \
+      && declare -F drb_image_tags drb_images_present drb_pin_image_tags >/dev/null && pin=1
   fi
   [ "$pin" = 1 ] || log "target ${new:0:12} predates image pinning — using its compose file's default tags"
 

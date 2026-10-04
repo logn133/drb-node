@@ -24,21 +24,37 @@ pytestmark = pytest.mark.skipif(
 )
 
 REPO = "https://git.example.net/logan/node-26.git"
-OLD, NEW = "a" * 40, "b" * 40
+OLD, NEW, TREE = "a" * 40, "b" * 40, "c" * 40
+REPO_ROOT = SCRIPT.parents[1]
 
 STUB_GIT = r'''#!/usr/bin/env bash
 echo "git $*" >> "$STUB/calls"
-while [ "$1" = -c ]; do shift 2; done
+while [ "$1" = -c ] || [ "$1" = -C ]; do shift 2; done
 case "$1" in
-  rev-parse) if [ "$2" = HEAD ]; then cat "$STUB/head"; else echo "$STUB_NEW"; fi ;;
+  rev-parse)
+    if [ "$2" = HEAD ]; then cat "$STUB/head"
+    elif [ "$2" = --verify ]; then echo "$STUB_TREE"   # tree hash of <commit>:<dir>
+    else echo "$STUB_NEW"; fi ;;
   remote) echo "$STUB_ORIGIN" ;;
   fetch) exit 0 ;;
   show-ref) [ "$4" = "refs/tags/v1" ] ;;
+  cat-file) [ -z "${STUB_NO_PIN:-}" ] ;;   # target has scripts/image-tags.sh
+  show) case "$2" in
+          *:scripts/image-tags.sh) cat "$STUB_REPO/scripts/image-tags.sh" ;;
+          *:docker-compose.yml) cat "$STUB_REPO/docker-compose.yml" ;;
+        esac ;;
   checkout) echo "${@: -1}" > "$STUB/head" ;;
   *) exit 0 ;;
 esac
 '''
-STUB_DOCKER = '#!/usr/bin/env bash\necho "docker $*" >> "$STUB/calls"\n'
+STUB_DOCKER = r'''#!/usr/bin/env bash
+echo "docker $*" >> "$STUB/calls"
+case "$*" in
+  *"config --images"*) echo "reg.example/edge-node:$STUB_PULLED_TAG" ;;
+  "image inspect"*) [ -z "${STUB_MISSING_IMAGE:-}" ] || exit 1 ;;
+esac
+exit 0
+'''
 STUB_CURL = r'''#!/usr/bin/env bash
 echo "curl $*" >> "$STUB/calls"
 for a in "$@"; do case "$a" in @*) cat "${a#@}" >> "$STUB/headers" ;; esac; done
@@ -79,6 +95,7 @@ def env(tmp_path):
     e.update({
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "STUB": str(stub), "STUB_NEW": NEW, "STUB_ORIGIN": REPO,
+        "STUB_TREE": TREE, "STUB_REPO": str(REPO_ROOT), "STUB_PULLED_TAG": f"src-{TREE}",
         "DRB_UPDATER_CONF": str(conf),
         "DRB_UPDATER_STATE": str(tmp_path / "state"),
         "DRB_UPDATER_LOCK": str(tmp_path / "lock"),
@@ -92,6 +109,10 @@ def _run(env):
 
 def _calls(env):
     return (env["stub"] / "calls").read_text()
+
+
+def _pulled(calls: str) -> bool:
+    return any(line.startswith("docker compose ") and line.endswith(" pull") for line in calls.splitlines())
 
 
 def test_no_request_means_checkin_only(env):
@@ -108,7 +129,7 @@ def test_c2_request_updates_once_and_reports(env):
     r = _run(env)
     assert r.returncode == 0, r.stderr + r.stdout
     calls = _calls(env)
-    assert "docker compose pull" in calls
+    assert _pulled(calls)
     assert "docker compose up -d --no-build --force-recreate --remove-orphans" in calls
     assert (env["stub"] / "head").read_text().strip() == NEW
     assert '"applied_request_at":"2026-10-04T12:00:00+00:00"' in calls
@@ -126,7 +147,7 @@ def test_mqtt_sentinel_triggers_update_and_is_consumed(env):
     assert r.returncode == 0, r.stderr
     assert not sentinel.exists()
     calls = _calls(env)
-    assert "docker compose pull" in calls
+    assert _pulled(calls)
     assert "evil" not in calls and "rm -rf" not in calls
 
 
@@ -153,7 +174,7 @@ def test_refuses_when_env_registry_differs(env):
     (env["inst"] / "configs" / "update-requested").write_text("")
     r = _run(env)
     assert r.returncode != 0
-    assert "docker compose pull" not in _calls(env)
+    assert not _pulled(_calls(env))
 
 
 def test_non_https_repo_in_conf_is_rejected(env):
@@ -177,3 +198,42 @@ def test_plain_http_c2_skips_checkin(env):
     r = _run(env)
     assert r.returncode == 0
     assert "curl" not in _calls(env)
+
+
+# ── node-26#19: images pinned to the target's source tree ─────────────────
+
+def test_pins_images_and_pulls_before_checkout(env):
+    (env["inst"] / "configs" / "update-requested").write_text("")
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    lines = _calls(env).splitlines()
+    pull = next(i for i, ln in enumerate(lines) if ln.startswith("docker compose ") and ln.endswith(" pull"))
+    checkout = next(i for i, ln in enumerate(lines) if ln.startswith("git") and " checkout " in ln)
+    assert pull < checkout, "images must be pulled before the new code is checked out"
+    dotenv = (env["inst"] / ".env").read_text()
+    for var in ("DRB_TAG_EDGE_NODE", "DRB_TAG_OP25", "DRB_TAG_ICECAST", "DRB_TAG_SECONDARY_SDR"):
+        assert f"{var}=src-{TREE}\n" in dotenv
+    assert dotenv.startswith("NODE_ID=node-7\n")  # existing lines kept
+    assert not (env["inst"] / ".drb-update-compose.yml").exists()
+
+
+def test_missing_pinned_image_changes_nothing(env):
+    env["env"]["STUB_MISSING_IMAGE"] = "1"
+    (env["inst"] / "configs" / "update-requested").write_text("")
+    r = _run(env)
+    assert r.returncode != 0
+    assert (env["stub"] / "head").read_text().strip() == OLD
+    calls = _calls(env)
+    assert " checkout " not in calls
+    assert "up -d" not in calls
+    assert "DRB_TAG_" not in (env["inst"] / ".env").read_text()
+
+
+def test_target_without_pinning_still_updates(env):
+    env["env"]["STUB_NO_PIN"] = "1"
+    (env["inst"] / "configs" / "update-requested").write_text("")
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+    assert _pulled(_calls(env))
+    assert "DRB_TAG_" not in (env["inst"] / ".env").read_text()
