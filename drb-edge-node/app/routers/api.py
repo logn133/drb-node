@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 import asyncio
 import httpx
 from app.config import settings
 from app.models import SystemConfig, SECONDARY_SDR_MODES
 from app.internal.op25_client import op25_client
-from app.internal.config_manager import load_node_config, save_node_config, apply_system_config
+from app.internal.config_manager import load_node_config, save_node_config
 from app.internal.call_recorder import call_recorder
 from app.internal.discord_radio import radio_bot
 from app.internal.metadata_watcher import metadata_watcher
@@ -36,8 +36,10 @@ async def get_status():
         if (node_cfg.override_system_id and node_cfg.override_config)
         else node_cfg.system_config
     )
+    system_type = None
     if active_config:
         system_name = active_config.name
+        system_type = active_config.type
         if active_tgid:
             # Reverse engineer the TGID to talkgroup name based on active system object
             tgs = active_config.config.get("talkgroups", [])
@@ -58,6 +60,11 @@ async def get_status():
         "configured": node_cfg.configured,
         "assigned_system_id": node_cfg.assigned_system_id,
         "system_name": system_name,
+        "system_type": system_type,
+        # True when what OP25 is tuned to was chosen on this dashboard rather
+        # than assigned by C2 (a local override, revertible to C2's system).
+        "local_choice": bool(node_cfg.override_system_id and node_cfg.override_config),
+        "has_c2_system": node_cfg.system_config is not None,
         "is_recording": call_recorder.is_recording,
         # Health of the PulseAudio capture that feeds every recording — the single
         # most useful signal when recordings come back empty. Segment boundaries
@@ -77,15 +84,27 @@ async def get_status():
         "icecast_url": (
             f"http://{settings.icecast_host}:{settings.icecast_port}{settings.icecast_mount}"
         ),
+        # The browser builds its own URL from these + window.location.hostname;
+        # icecast_host is "localhost" from the node's point of view.
+        "icecast_port": settings.icecast_port,
+        "icecast_mount": settings.icecast_mount,
         "op25": op25_status,
     }
 
 
+@router.get("/health")
+async def get_health():
+    """Plain-language setup/status checklist for the dashboard (see internal/health.py)."""
+    from app.internal import health
+    facts = await health.gather_facts()
+    return {"checks": health.build_checks(facts), "last_heard": facts["console"].get("last_heard")}
+
+
 @router.post("/op25/start")
 async def start_op25():
-    ok = await op25_client.start()
-    if not ok:
-        raise HTTPException(500, "Failed to start OP25")
+    err = await op25_client.start_with_reason()
+    if err:
+        raise HTTPException(502, err)
     return {"ok": True}
 
 
@@ -93,8 +112,16 @@ async def start_op25():
 async def stop_op25():
     ok = await op25_client.stop()
     if not ok:
-        raise HTTPException(500, "Failed to stop OP25")
+        raise HTTPException(502, "The op25 container did not answer the stop request.")
     return {"ok": True}
+
+
+@router.get("/op25/log")
+async def op25_log(lines: int = 80):
+    out = await op25_client.log(lines)
+    if out is None:
+        raise HTTPException(502, "The op25 container isn't answering.")
+    return {"lines": out}
 
 
 @router.get("/config")
@@ -102,19 +129,116 @@ async def get_config():
     return load_node_config()
 
 
+async def _restart_op25_with(config: SystemConfig) -> None:
+    """Generate OP25's config for `config` and restart OP25 on it."""
+    from app.main import _generate_op25_config
+    if not await _generate_op25_config(config):
+        raise HTTPException(
+            502, f"The op25 container did not accept the config for {config.name} — is it running?",
+        )
+    await op25_client.stop()
+    await asyncio.sleep(2)
+    err = await op25_client.start_with_reason()
+    if err:
+        raise HTTPException(502, f"Config saved, but OP25 did not start: {err}")
+
+
+async def _apply_override(config: SystemConfig) -> None:
+    """Make `config` what this node listens to, chosen locally.
+
+    Stored as an override so a C2-assigned system (if any) survives and can
+    be reverted to, and so C2 sees the node is overridden. A later C2 config
+    push replaces it.
+    """
+    node_cfg = load_node_config()
+    node_cfg.override_system_id = config.system_id
+    node_cfg.override_config = config
+    save_node_config(node_cfg)
+    await _restart_op25_with(config)
+    if mqtt_manager.is_connected:
+        await mqtt_manager.publish_checkin()
+
+
 @router.post("/config/system")
 async def set_system_config(config: SystemConfig):
     """
-    Apply a system config locally — called by the web UI or pushed by C2.
-    Writes the OP25 config and persists the node config.
+    Assign a system as if C2 had (persists as the node's own system, not an
+    override) and restart OP25 on it.
+
+    Used to write the raw `config` blob straight to active.cfg.json, which is
+    not an OP25 config at all — OP25 could not start from it.
     """
+    _validate_type(config.type)
     node_cfg = load_node_config()
     node_cfg.assigned_system_id = config.system_id
     node_cfg.system_config = config
     node_cfg.configured = True
     save_node_config(node_cfg)
-    apply_system_config(config)
+    await _restart_op25_with(config)
     return {"ok": True}
+
+
+def _validate_type(system_type: str) -> None:
+    if str(system_type).upper() == "DMR":
+        raise HTTPException(400, "DMR isn't supported by this node's decoder yet — use P25 or analog (NBFM).")
+    if str(system_type).upper() not in ("P25", "NBFM"):
+        raise HTTPException(400, f"Unknown system type {system_type!r} — use P25 or NBFM.")
+
+
+class Talkgroup(BaseModel):
+    id: int
+    name: str = ""
+
+
+class ListenBody(BaseModel):
+    """What to listen to, chosen on the local dashboard."""
+    mode: Literal["system", "p25", "analog"]
+    system_id: Optional[str] = None       # mode=system: a cached C2 system
+    name: Optional[str] = None
+    frequencies: List[float] = []          # MHz; p25 = control channels, analog = exactly one
+    talkgroups: List[Talkgroup] = []       # p25 only; empty = every talkgroup
+
+
+# RTL-SDR (R820T/R828D) tuning range.
+_MIN_MHZ, _MAX_MHZ = 24.0, 1766.0
+
+
+@router.post("/listen")
+async def listen(body: ListenBody):
+    """Point OP25 at a system or frequency and start it — no C2 needed."""
+    if body.mode == "system":
+        from app.internal.system_cacher import get_cached_system
+        cached = get_cached_system(body.system_id or "")
+        if not cached:
+            raise HTTPException(404, "That system isn't in this node's saved list.")
+        config = SystemConfig(**cached)
+        _validate_type(config.type)
+    else:
+        freqs = body.frequencies
+        if not freqs:
+            raise HTTPException(400, "Enter at least one frequency in MHz.")
+        bad = [f for f in freqs if not (_MIN_MHZ <= f <= _MAX_MHZ)]
+        if bad:
+            raise HTTPException(
+                400, f"{bad[0]:g} isn't a frequency an RTL-SDR can tune — enter MHz between "
+                f"{_MIN_MHZ:g} and {_MAX_MHZ:g} (e.g. 851.0125).",
+            )
+        if body.mode == "analog" and len(freqs) != 1:
+            raise HTTPException(400, "Analog listens to exactly one frequency.")
+        is_p25 = body.mode == "p25"
+        first = f"{freqs[0]:.5f}".rstrip("0").rstrip(".")
+        label = (body.name or "").strip() or (f"P25 {first} MHz" if is_p25 else f"Analog {first} MHz")
+        config = SystemConfig(
+            system_id=f"local-{body.mode}",
+            name=label,
+            type="P25" if is_p25 else "NBFM",
+            config={
+                "control_channels": freqs,
+                "talkgroups": [tg.model_dump() for tg in body.talkgroups] if is_p25 else [],
+            },
+        )
+    await _apply_override(config)
+    return {"ok": True, "name": config.name}
 
 
 @router.get("/systems")
@@ -129,9 +253,6 @@ async def set_override(
     system_id: Optional[str] = Body(None),
     system_config: Optional[dict] = Body(None)
 ):
-    node_cfg = load_node_config()
-    config = None
-
     if system_id:
         from app.internal.system_cacher import get_cached_system
         cached = get_cached_system(system_id)
@@ -145,19 +266,8 @@ async def set_override(
     else:
         raise HTTPException(400, "Must specify system_id or system_config.")
 
-    node_cfg.override_system_id = config.system_id
-    node_cfg.override_config = config
-    save_node_config(node_cfg)
-
-    from app.main import _generate_op25_config
-    if not await _generate_op25_config(config):
-        raise HTTPException(500, f"Failed to generate OP25 config for override: {config.name}")
-
-    await op25_client.stop()
-    await asyncio.sleep(2)
-    await op25_client.start()
-
-    await mqtt_manager._publish_checkin()
+    _validate_type(config.type)
+    await _apply_override(config)
     return {"ok": True}
 
 
@@ -172,15 +282,14 @@ async def revert_config():
     save_node_config(node_cfg)
 
     if node_cfg.system_config:
-        from app.main import _generate_op25_config
-        if not await _generate_op25_config(node_cfg.system_config):
-            raise HTTPException(500, "Failed to regenerate original OP25 config.")
-
+        await _restart_op25_with(node_cfg.system_config)
+    else:
+        # Nothing from C2 to go back to: stop rather than keep decoding a
+        # system the dashboard now says is cleared.
         await op25_client.stop()
-        await asyncio.sleep(2)
-        await op25_client.start()
 
-    await mqtt_manager._publish_checkin()
+    if mqtt_manager.is_connected:
+        await mqtt_manager.publish_checkin()
     return {"ok": True}
 
 

@@ -20,3 +20,12 @@ LIQ_PID=$! # Store the PID of the op25.liq process
 # The trap command ensures that SIGTERM is passed to the background jobs.
 trap "kill $MULTI_RX_PID $LIQ_PID" SIGTERM SIGINT
 wait $MULTI_RX_PID
+RC=$?
+
+# multi_rx is gone (crashed, or SDR could not be opened). Take liquidsoap down
+# with it so nothing in this process group outlives the decoder — a leftover
+# liquidsoap kept /op25/status reporting "running" (node-26#12) and held the
+# Icecast mount against the next start.
+echo "multi_rx.py exited (code $RC) — stopping liquidsoap."
+kill $LIQ_PID 2>/dev/null
+exit $RC

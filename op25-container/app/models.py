@@ -52,12 +52,16 @@ class IcecastConfig(BaseModel):
 class ConfigGenerator(BaseModel):
     type: DecodeMode
     systemName: str
+    # P25: control channel list (Hz). NBFM: channels[0] is the one analog
+    # frequency to listen to (Hz).
     channels: List[Union[int, str]]
-    tags: Optional[List[TalkgroupTag]]
-    whitelist: Optional[List[int]]
-    icecastConfig: Optional[IcecastConfig]
+    tags: Optional[List[TalkgroupTag]] = None
+    whitelist: Optional[List[int]] = None
+    icecastConfig: Optional[IcecastConfig] = None
     hardware_preset: str = "rtl-sdr-v3"
     ppm_override: Optional[float] = None  # when set, overrides the preset's default PPM
+    # NBFM only: power squelch threshold in dB (op25_nbfm default is -60).
+    nbfm_squelch: Optional[float] = None
 
 class DemodType(str, Enum):
     CQPSK = "cqpsk"
@@ -69,15 +73,16 @@ class FilterType(str, Enum):
 
 class ChannelConfig(BaseModel):
     name: str
-    trunking_sysname: Optional[str]
+    trunking_sysname: Optional[str] = None
     enable_analog: str
     meta_stream_name: str
     demod_type: DemodType
     filter_type: FilterType
     device: Optional[str] = "sdr"
     cqpsk_tracking: Optional[bool] = None
-    frequency: Optional[float] = None
-    nbfmSquelch: Optional[float] = None
+    frequency: Optional[int] = None
+    # Key name op25_nbfm.py actually reads (from_dict(config, 'nbfm_squelch_threshold', -60)).
+    nbfm_squelch_threshold: Optional[float] = None
     destination: Optional[str] = "udp://127.0.0.1:23456"
     tracking_threshold: Optional[int] = 120
     tracking_feedback: Optional[float] = 0.75
@@ -93,6 +98,9 @@ class DeviceConfig(BaseModel):
     gains: Optional[str] = "lna:39"
     gain_mode: Optional[bool] = False
     name: Optional[str] = "sdr"
+    # Centre frequency (Hz). Unset for trunked P25, where tk_p25 tunes the
+    # device; required for a fixed analog channel (tunable=False).
+    frequency: Optional[int] = None
     offset: Optional[int] = 0
     ppm: Optional[float] = 0.0
     rate: Optional[int] = 1920000

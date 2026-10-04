@@ -3,681 +3,568 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DRB Edge Node Dashboard</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <title>DRB Edge Node</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
+    /* Tokens from UI_REDESIGN.md §2.2/§2.3. Status is triple-encoded
+       (glyph + word + colour) and green is not used. */
     :root {
-      --bg: #0b0f19;
-      --glass-bg: rgba(20, 25, 40, 0.6);
-      --glass-border: rgba(255, 255, 255, 0.08);
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
+      --page: #F4F6F9; --surface: #FFFFFF; --raised: #F7F9FB;
+      --line: rgba(11,17,27,.11); --line-strong: rgba(11,17,27,.22);
+      --ink: #101620; --ink-2: #46536A; --ink-muted: #6B788C;
+      --accent: #2A78D6; --moderate: #B07800; --major: #C0281F;
     }
-
-    *, *::before, *::after {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --page: #0B0E13; --surface: #141922; --raised: #1B2230;
+        --line: rgba(255,255,255,.09); --line-strong: rgba(255,255,255,.17);
+        --ink: #E8EBF0; --ink-2: #A5B0C2; --ink-muted: #77839A;
+        --accent: #3987E5; --moderate: #C98500; --major: #D03B3B;
+      }
     }
-
+    :root[data-theme="dark"] {
+      --page: #0B0E13; --surface: #141922; --raised: #1B2230;
+      --line: rgba(255,255,255,.09); --line-strong: rgba(255,255,255,.17);
+      --ink: #E8EBF0; --ink-2: #A5B0C2; --ink-muted: #77839A;
+      --accent: #3987E5; --moderate: #C98500; --major: #D03B3B;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    [hidden] { display: none !important; }
+    a { color: var(--accent); }
+    a.btn { color: var(--ink); }
     body {
-      font-family: 'Inter', sans-serif;
-      background: var(--bg);
-      background-image: 
-        radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.15), transparent 25%),
-        radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.15), transparent 25%);
-      color: var(--text-main);
-      min-height: 100vh;
-      padding: 2rem;
-      line-height: 1.5;
+      font-family: 'IBM Plex Sans', system-ui, sans-serif;
+      background: var(--page); color: var(--ink);
+      line-height: 1.5; padding: 24px 16px 48px;
     }
-
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
-    }
-
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      margin-bottom: 3rem;
-    }
-
-    .title-area h1 {
-      font-size: 2.5rem;
-      font-weight: 800;
-      background: linear-gradient(to right, #fff, #94a3b8);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      letter-spacing: -0.02em;
-    }
-
-    .title-area p {
-      color: var(--text-muted);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.9rem;
-      margin-top: 0.5rem;
-    }
-
-    .header-actions {
-      display: flex;
-      gap: 1rem;
-    }
-
+    .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+    .wrap { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+    h1 { font-size: 1.5rem; font-weight: 600; }
+    h2 { font-size: 1rem; font-weight: 600; margin-bottom: 4px; }
+    .sub { color: var(--ink-muted); font-size: .875rem; }
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+    .card > .sub { margin-bottom: 12px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0.75rem 1.5rem;
-      border-radius: 8px;
-      font-weight: 600;
-      font-size: 0.9rem;
-      text-decoration: none;
-      transition: all 0.2s ease;
-      cursor: pointer;
-      border: none;
+      font: inherit; font-size: .875rem; font-weight: 500; cursor: pointer;
+      padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line-strong);
+      background: var(--raised); color: var(--ink); text-decoration: none; display: inline-flex; align-items: center;
+    }
+    .btn:hover { border-color: var(--ink-muted); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn:disabled { opacity: .45; cursor: default; }
+    .msg { font-size: .875rem; color: var(--ink-2); }
+    .msg.err { color: var(--major); }
+
+    /* Checklist */
+    .summary { font-weight: 600; margin-bottom: 8px; }
+    .check { display: grid; grid-template-columns: 22px 1fr; gap: 2px 8px; padding: 10px 0; border-top: 1px solid var(--line); }
+    .check:first-of-type { border-top: none; }
+    .glyph { font-size: 1rem; line-height: 1.4; text-align: center; }
+    .check .label { font-weight: 500; }
+    .check .label .state { font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin-left: 6px; }
+    .check .text { grid-column: 2; color: var(--ink-2); font-size: .9rem; }
+    .check .action { grid-column: 2; color: var(--ink); font-size: .875rem; }
+    .check .action:empty { display: none; }
+    .s-ok .glyph, .s-ok .state { color: var(--ink-2); }
+    .s-warn .glyph, .s-warn .state { color: var(--moderate); }
+    .s-error .glyph, .s-error .state { color: var(--major); }
+    .s-off .glyph, .s-off .state { color: var(--ink-muted); }
+    .s-off .label { color: var(--ink-2); }
+
+    /* Now playing */
+    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 12px 0; font-size: .9rem; }
+    .kv dt { color: var(--ink-muted); }
+    .live { color: var(--accent); font-weight: 600; }
+    audio { width: 100%; margin-top: 4px; }
+    pre.log {
+      font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: .75rem; line-height: 1.45;
+      background: var(--raised); border: 1px solid var(--line); border-radius: 6px;
+      padding: 10px; max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin-top: 10px;
     }
 
-    .btn-primary {
-      background: var(--accent);
-      color: white;
-      box-shadow: 0 4px 14px 0 rgba(59, 130, 246, 0.39);
+    /* Listen form */
+    .tabs { display: flex; border: 1px solid var(--line-strong); border-radius: 6px; overflow: hidden; width: fit-content; max-width: 100%; flex-wrap: wrap; }
+    .tabs label { padding: 7px 12px; font-size: .875rem; cursor: pointer; border-left: 1px solid var(--line); }
+    .tabs label:first-child { border-left: none; }
+    .tabs input { position: absolute; opacity: 0; pointer-events: none; }
+    .tabs label:has(input:checked) { background: var(--accent); color: #fff; }
+    .tabs label:has(input:disabled) { color: var(--ink-muted); cursor: default; }
+    .tabs label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .field { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; max-width: 520px; }
+    .field label { font-size: .875rem; font-weight: 500; }
+    .field .hint { font-size: .8rem; color: var(--ink-muted); }
+    input[type=text], select, textarea {
+      font: inherit; font-size: .9rem; color: var(--ink); background: var(--raised);
+      border: 1px solid var(--line-strong); border-radius: 6px; padding: 7px 9px; width: 100%;
     }
-    .btn-primary:hover {
-      background: var(--accent-hover);
-      box-shadow: 0 6px 20px rgba(59, 130, 246, 0.23);
-      transform: translateY(-1px);
-    }
+    textarea { min-height: 84px; font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: .8rem; }
+    .current { padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--raised); margin-bottom: 12px; font-size: .9rem; }
 
-    .btn-secondary {
-      background: rgba(255, 255, 255, 0.05);
-      color: white;
-      border: 1px solid var(--glass-border);
-      backdrop-filter: blur(10px);
-    }
-    .btn-secondary:hover {
-      background: rgba(255, 255, 255, 0.1);
-    }
-
-    .sdr-row {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      padding: 0.55rem 0;
-      border-bottom: 1px solid var(--glass-border);
-    }
-    .sdr-row:last-child { border-bottom: none; }
-    .sdr-rank { width: 1.2rem; color: var(--text-muted); font-size: 0.8rem; text-align: right; }
-    .sdr-name { flex: 1; }
-    .sdr-name small { display: block; color: var(--text-muted); font-size: 0.75rem; }
-    .sdr-move {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--glass-border);
-      color: var(--text-main);
-      border-radius: 6px;
-      width: 1.9rem;
-      height: 1.9rem;
-      cursor: pointer;
-    }
-    .sdr-move:disabled { opacity: 0.3; cursor: default; }
-    .sdr-state { font-size: 0.75rem; min-width: 6.5rem; text-align: right; color: var(--text-muted); }
-    .sdr-state.on { color: var(--success); }
-    .sdr-select {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--glass-border);
-      color: var(--text-main);
-      border-radius: 6px;
-      padding: 0.3rem 0.4rem;
-      font-size: 0.8rem;
-      max-width: 13rem;
-    }
-    .sdr-select option { background: #111827; }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 1.5rem;
-      margin-bottom: 2rem;
-    }
-
-    .glass-card {
-      background: var(--glass-bg);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      border: 1px solid var(--glass-border);
-      border-radius: 16px;
-      padding: 1.5rem;
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
-    }
-
-    .glass-card:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-      border-color: rgba(255,255,255,0.15);
-    }
-
-    .card-header {
-      display: flex;
-      align-items: center;
-      margin-bottom: 1.5rem;
-      padding-bottom: 0.75rem;
-      border-bottom: 1px solid rgba(255,255,255,0.05);
-    }
-
-    .card-title {
-      font-size: 0.85rem;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      font-weight: 700;
-      color: var(--text-muted);
-    }
-
-    .data-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 0.75rem 0;
-    }
-
-    .data-label {
-      font-size: 0.9rem;
-      color: var(--text-muted);
-    }
-
-    .data-value {
-      font-size: 0.95rem;
-      font-weight: 500;
-      color: var(--text-main);
-      text-align: right;
-    }
-
-    .data-value.mono {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.85rem;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.25rem 0.75rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-
-    .badge-online { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.2); }
-    .badge-offline { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.2); }
-    .badge-recording { 
-      background: rgba(245, 158, 11, 0.15); 
-      color: var(--warning); 
-      border: 1px solid rgba(245, 158, 11, 0.2);
-      animation: pulse-border 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }
-    .badge-unconfigured { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.2); }
-
-    @keyframes pulse-border {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-
-    /* Player Section */
-    .player-card {
-      grid-column: 1 / -1;
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-    
-    .player-controls {
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-      background: rgba(0,0,0,0.2);
-      padding: 1rem;
-      border-radius: 12px;
-    }
-    
-    audio {
-      flex: 1;
-      height: 40px;
-      outline: none;
-    }
-
-    audio::-webkit-media-controls-panel {
-      background-color: var(--text-main);
-    }
-
-    .alert {
-      background: rgba(59, 130, 246, 0.1);
-      border: 1px solid var(--accent);
-      border-radius: 8px;
-      padding: 1rem 1.5rem;
-      color: #bfdbfe;
-      margin-bottom: 2rem;
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-    }
-    .alert code {
-      background: rgba(0,0,0,0.3);
-      padding: 0.2rem 0.4rem;
-      border-radius: 4px;
-      font-family: 'JetBrains Mono', monospace;
-    }
-
-    .footer {
-      margin-top: 3rem;
-      text-align: center;
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      font-family: 'JetBrains Mono', monospace;
-    }
-
-    /* Active Call Highlights */
-    .active-call-highlight {
-      color: var(--accent);
-      font-size: 1.1rem;
-      font-weight: 700;
-    }
+    /* SDRs */
+    .sdr-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
+    .sdr-rank { width: 1.2rem; color: var(--ink-muted); font-size: .8rem; text-align: right; }
+    .sdr-name { flex: 1; min-width: 120px; }
+    .sdr-name small { display: block; color: var(--ink-muted); font-size: .75rem; }
+    .sdr-move { font: inherit; background: var(--raised); border: 1px solid var(--line-strong); color: var(--ink); border-radius: 6px; width: 30px; height: 30px; cursor: pointer; }
+    .sdr-move:disabled { opacity: .3; cursor: default; }
+    .sdr-state { font-size: .75rem; min-width: 6.5rem; text-align: right; color: var(--ink-muted); }
+    .sdr-state.on { color: var(--accent); }
+    .sdr-select { width: auto; max-width: 14rem; font-size: .8rem; padding: 4px 6px; }
+    footer { text-align: center; font-size: .8rem; color: var(--ink-muted); }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <div class="title-area">
-        <h1 id="node-name">DRB Edge Node</h1>
-        <p>ID: <span id="node-id">Loading…</span></p>
-      </div>
-      <div class="header-actions">
-        <a href="/scanner" target="_blank" class="btn btn-secondary">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-          Scanner Mode
-        </a>
-        <a href="/logout" class="btn btn-secondary">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
-          Logout
-        </a>
-      </div>
-    </header>
+<div class="wrap">
+  <header>
+    <div>
+      <h1 id="node-name">DRB Edge Node</h1>
+      <div class="sub">Node ID <span class="mono" id="node-id">…</span></div>
+    </div>
+    <div class="row">
+      <a href="/scanner" target="_blank" class="btn">Scanner view</a>
+      <a href="/logout" class="btn">Log out</a>
+    </div>
+  </header>
 
-    <div id="unconfigured-banner" class="alert" style="display:none">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-      <div>
-        <strong>Node Unconfigured</strong> — This node has not been assigned a system yet. Connect it to a C2 server or configure it manually via the API (<code>POST /api/config/system</code>).
+  <!-- 1. Status checklist (GET /api/health) -->
+  <section class="card" aria-labelledby="h-status">
+    <h2 id="h-status">Node status</h2>
+    <div class="summary" id="health-summary">Checking…</div>
+    <div id="checks"></div>
+  </section>
+
+  <!-- 2. Now playing + OP25 controls -->
+  <section class="card" aria-labelledby="h-now">
+    <h2 id="h-now">Listen</h2>
+    <p class="sub">The node's own live stream. It is a few seconds behind the radio, and silence between transmissions is normal.</p>
+    <audio id="player" controls preload="none">Your browser can't play the stream — use the direct link.</audio>
+    <dl class="kv">
+      <dt>Listening to</dt><dd id="now-system">—</dd>
+      <dt>Talkgroup</dt><dd id="now-tg">—</dd>
+      <dt>Last heard</dt><dd id="now-heard">—</dd>
+      <dt>Stream link</dt><dd><a id="stream-link" class="mono" href="#" target="_blank" rel="noopener">—</a></dd>
+    </dl>
+    <div class="row">
+      <button class="btn" id="op25-start" onclick="op25('start')">Start OP25</button>
+      <button class="btn" id="op25-stop" onclick="op25('stop')">Stop OP25</button>
+      <button class="btn" id="log-toggle" onclick="toggleLog()" aria-expanded="false">Show OP25 log</button>
+      <span class="msg" id="op25-msg" role="status"></span>
+    </div>
+    <pre class="log" id="op25-log" hidden></pre>
+  </section>
+
+  <!-- 3. Choose what to listen to (POST /api/listen) -->
+  <section class="card" aria-labelledby="h-choose">
+    <h2 id="h-choose">Listen locally</h2>
+    <p class="sub">Choose what this node's radio tunes to. Works with or without the DRB server. If the server assigns a system later, it takes over.</p>
+    <div class="current" id="current-source">Nothing chosen yet.</div>
+    <div class="row" id="source-actions" style="margin:-4px 0 12px" hidden>
+      <button class="btn" id="revert-btn" onclick="revert()"></button>
+      <button class="btn" id="ack-btn" onclick="ackOverride()" hidden>Keep for 24h on the server</button>
+    </div>
+
+    <div class="tabs" role="radiogroup" aria-label="Source type">
+      <label><input type="radio" name="mode" value="p25" checked> P25 trunked</label>
+      <label><input type="radio" name="mode" value="analog"> Analog FM</label>
+      <label><input type="radio" name="mode" value="system" id="mode-system"> Server's systems</label>
+    </div>
+
+    <div class="pane" data-pane="p25">
+      <div class="field">
+        <label for="p25-freqs">Control channel frequencies (MHz)</label>
+        <input type="text" id="p25-freqs" class="mono" placeholder="851.0125, 851.5125" inputmode="decimal">
+        <span class="hint">The system's control channels, comma-separated. Find them on RadioReference under your county's trunked system.</span>
+      </div>
+      <div class="field">
+        <label for="p25-name">Name <span class="hint">(optional)</span></label>
+        <input type="text" id="p25-name" placeholder="County P25">
+      </div>
+      <div class="field">
+        <label for="p25-tgs">Talkgroups to keep <span class="hint">(optional)</span></label>
+        <textarea id="p25-tgs" placeholder="1001 Fire Dispatch&#10;1002 Fireground"></textarea>
+        <span class="hint">One per line: decimal ID, then a name. Leave empty to hear every talkgroup.</span>
       </div>
     </div>
 
-    <div id="override-banner" class="alert" style="display:none; background: rgba(245, 158, 11, 0.1); border-color: var(--warning); color: #fef08a;">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
-      <div style="flex: 1;">
-        <strong>Local Override Active</strong> — System overridden to: <span id="override-system-text"></span>.
-        <span id="timeout-timer-text">Timeout is active on C2 server.</span>
+    <div class="pane" data-pane="analog" hidden>
+      <div class="field">
+        <label for="an-freq">Frequency (MHz)</label>
+        <input type="text" id="an-freq" class="mono" placeholder="154.4300" inputmode="decimal">
+        <span class="hint">One conventional narrowband FM channel.</span>
       </div>
-      <div style="display: flex; gap: 0.5rem; align-items: center;">
-        <button class="btn btn-secondary" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;" onclick="revertToServerConfig()">Revert</button>
-        <button id="ack-override-btn" class="btn btn-primary" style="padding: 0.4rem 0.8rem; font-size: 0.8rem; background: var(--warning); box-shadow: none;" onclick="ackOverrideC2()">Ack C2 Timer</button>
-      </div>
-    </div>
-
-    <div class="grid">
-      <!-- Status Card -->
-      <div class="glass-card">
-        <div class="card-header">
-          <div class="card-title">System Status</div>
-        </div>
-        <div class="data-row">
-          <span class="data-label">State</span>
-          <span class="data-value"><span id="status-badge" class="badge badge-unconfigured">—</span></span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">Discord</span>
-          <span class="data-value" id="discord-status">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">Recording</span>
-          <span class="data-value" id="recording-status">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">OP25 Core</span>
-          <span class="data-value" id="op25-status">—</span>
-        </div>
-      </div>
-
-      <!-- Call Card -->
-      <div class="glass-card" id="call-card">
-        <div class="card-header">
-          <div class="card-title">Live Activity</div>
-        </div>
-        <div class="data-row">
-          <span class="data-label">System</span>
-          <span class="data-value active-call-highlight" id="system-name">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">Talkgroup</span>
-          <span class="data-value active-call-highlight" id="tgid-name">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">TGID</span>
-          <span class="data-value mono" id="tgid">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">Call ID</span>
-          <span class="data-value mono" id="call-id">—</span>
-        </div>
-      </div>
-
-      <!-- Node Info Card -->
-      <div class="glass-card">
-        <div class="card-header">
-          <div class="card-title">Hardware & Config</div>
-        </div>
-        <div class="data-row">
-          <span class="data-label">Location</span>
-          <span class="data-value mono" id="location">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">Configured</span>
-          <span class="data-value" id="configured">—</span>
-        </div>
-        <div class="data-row">
-          <span class="data-label">System ID</span>
-          <span class="data-value mono" id="system-id">—</span>
-        </div>
-      </div>
-
-      <!-- SDRs Card (node-26#9, #11) -->
-      <div class="glass-card">
-        <div class="card-header">
-          <div class="card-title">SDRs</div>
-        </div>
-        <div class="data-row" style="align-items:center;">
-          <span class="data-label">OP25 SDR</span>
-          <select id="sdr-op25" class="sdr-select" aria-label="OP25 SDR"></select>
-        </div>
-        <p id="sdr-op25-note" style="color: var(--text-muted); font-size: 0.75rem; margin: 0.25rem 0 0.75rem;"></p>
-        <p style="color: var(--text-muted); font-size: 0.8rem; margin: 0 0 0.5rem;">
-          Every other SDR runs the next enabled service, top first. Pin a service to the SDR
-          that has its antenna, or leave it on "Any spare SDR".
-        </p>
-        <div id="sdr-list"></div>
-        <p id="sdr-warning" style="color: var(--danger); font-size: 0.8rem; margin: 0.5rem 0 0; display:none;"></p>
-        <div style="display:flex; gap:0.75rem; align-items:center; margin-top:0.75rem;">
-          <button id="sdr-save" class="btn btn-primary" style="padding:0.5rem 1rem;" onclick="saveSdr()" disabled>Save</button>
-          <span id="sdr-msg" style="color: var(--text-muted); font-size: 0.8rem;"></span>
-        </div>
-      </div>
-
-      <!-- Local Listening Card -->
-      <div class="glass-card player-card">
-        <div class="card-header" style="margin-bottom:0.5rem; border:none;">
-          <div class="card-title">Local Audio Stream</div>
-        </div>
-        <div class="player-controls">
-          <audio id="icecast-player" controls preload="none">
-            Your browser does not support the audio element.
-          </audio>
-          <a id="icecast-link" class="btn btn-primary" href="#" target="_blank" style="padding: 0.5rem 1rem;">Direct Link</a>
-        </div>
+      <div class="field">
+        <label for="an-name">Name <span class="hint">(optional)</span></label>
+        <input type="text" id="an-name" placeholder="Fire dispatch">
       </div>
     </div>
 
-    <div class="footer">
-      Last updated: <span id="last-updated">—</span>
+    <div class="pane" data-pane="system" hidden>
+      <div class="field">
+        <label for="sys-pick">System</label>
+        <select id="sys-pick"></select>
+        <span class="hint" id="sys-hint"></span>
+      </div>
     </div>
-  </div>
 
-  <script>
-    const player = document.getElementById('icecast-player');
-    let currentIcecastUrl = null;
+    <p class="sub" style="margin-top:12px">DMR isn't supported by this node's decoder yet.</p>
+    <div class="row" style="margin-top:8px">
+      <button class="btn primary" id="listen-btn" onclick="listen()">Start listening</button>
+      <span class="msg" id="listen-msg" role="status"></span>
+    </div>
+  </section>
 
-    async function refresh() {
-      try {
-        const r = await fetch('/api/status');
-        if (!r.ok) return;
-        const d = await r.json();
+  <!-- 4. SDRs (node-26#9, #11) -->
+  <section class="card" aria-labelledby="h-sdr">
+    <h2 id="h-sdr">SDRs</h2>
+    <p class="sub">Only matters with more than one SDR plugged in. OP25 always gets one; every other SDR runs the next enabled service, top first.</p>
+    <div class="row">
+      <label for="sdr-op25" style="font-size:.875rem;font-weight:500">OP25 uses</label>
+      <select id="sdr-op25" class="sdr-select"></select>
+    </div>
+    <p id="sdr-op25-note" class="sub" style="margin:6px 0 4px"></p>
+    <div id="sdr-list"></div>
+    <p id="sdr-warning" class="msg err" style="margin-top:8px" hidden></p>
+    <div class="row" style="margin-top:12px">
+      <button id="sdr-save" class="btn primary" onclick="saveSdr()" disabled>Save SDR settings</button>
+      <span id="sdr-msg" class="msg"></span>
+    </div>
+  </section>
 
-        // Header
-        document.getElementById('node-name').textContent = d.node_name || 'DRB Edge Node';
-        document.getElementById('node-id').textContent = d.node_id || '';
+  <footer>Updated <span id="last-updated">—</span></footer>
+</div>
 
-        // Status
-        const status = d.is_recording ? 'recording' : (d.configured ? 'online' : 'unconfigured');
-        const badge = document.getElementById('status-badge');
-        badge.textContent = status;
-        badge.className = 'badge badge-' + status;
+<script>
+  const $ = id => document.getElementById(id);
+  function esc(v) {
+    return String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  }
+  async function api(path, opts = {}) {
+    const r = await fetch(path, opts);
+    let body = null;
+    try { body = await r.json(); } catch (e) { /* non-JSON */ }
+    if (r.status === 401) { location.href = '/login'; throw new Error('Session expired'); }
+    if (!r.ok) throw new Error((body && body.detail) || r.statusText || `HTTP ${r.status}`);
+    return body;
+  }
+  function ago(epoch) {
+    const s = Math.max(0, Math.round(Date.now() / 1000 - epoch));
+    return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)} min ago` : `${Math.floor(s / 3600)} h ago`;
+  }
+  function mhz(f) {
+    const n = Number(f);
+    if (!n) return '';
+    return (n > 1e5 ? n / 1e6 : n).toFixed(4) + ' MHz';
+  }
 
-        document.getElementById('discord-status').textContent = d.discord_connected ? 'Connected' : 'Disconnected';
-        document.getElementById('recording-status').textContent = d.is_recording ? 'Active' : 'Idle';
-        document.getElementById('op25-status').textContent = d.op25?.status === 'running' ? 'Running' : 'Stopped';
+  // ── Status checklist ───────────────────────────────────────────────────
+  const GLYPH = { ok: '✓', warn: '△', error: '▲', off: '–' };
+  const WORD = { ok: 'OK', warn: 'Attention', error: 'Problem', off: 'Not active' };
+  let lastHealth = null;
 
-        // Call Info
-        document.getElementById('system-name').textContent = d.system_name || '—';
-        document.getElementById('tgid-name').textContent = d.active_tgid_name || (d.active_tgid ? `TG ${d.active_tgid}` : 'Scanning...');
-        document.getElementById('tgid').textContent = d.active_tgid ?? '—';
-        document.getElementById('call-id').textContent = d.active_call_id ? d.active_call_id.slice(0, 8) + '…' : '—';
-        
-        // Highlight active call card
-        const callCard = document.getElementById('call-card');
-        if (d.is_recording) {
-          callCard.style.borderColor = 'var(--accent)';
-          callCard.style.boxShadow = '0 0 20px rgba(59, 130, 246, 0.2)';
-        } else {
-          callCard.style.borderColor = 'var(--glass-border)';
-          callCard.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1)';
-        }
+  async function refreshHealth() {
+    try {
+      const d = await api('/api/health');
+      lastHealth = d;
+      const box = $('checks');
+      box.innerHTML = d.checks.map(c => `
+        <div class="check s-${c.state}">
+          <span class="glyph" aria-hidden="true">${GLYPH[c.state] || '?'}</span>
+          <div class="label">${esc(c.label)}<span class="state">${WORD[c.state] || esc(c.state)}</span></div>
+          <div class="text">${esc(c.summary)}</div>
+          <div class="action">${esc(c.action)}</div>
+        </div>`).join('');
+      const bad = d.checks.filter(c => c.state === 'error').length;
+      const warn = d.checks.filter(c => c.state === 'warn').length;
+      $('health-summary').textContent = bad
+        ? `${bad} problem${bad > 1 ? 's' : ''}${warn ? ` and ${warn} thing${warn > 1 ? 's' : ''} to check` : ''} — see below.`
+        : warn ? `${warn} thing${warn > 1 ? 's' : ''} need${warn > 1 ? '' : 's'} attention — see below.`
+        : 'Everything is working.';
+      const heard = d.last_heard;
+      $('now-heard').innerHTML = heard
+        ? `<span class="mono">TG ${esc(heard.tgid)}</span>${heard.name ? ' ' + esc(heard.name) : ''}` +
+          ` · ${ago(heard.epoch)}${heard.freq ? ` · <span class="mono">${esc(mhz(heard.freq))}</span>` : ''}`
+        : 'Nothing heard since the node started.';
+      const op = d.checks.find(c => c.id === 'op25');
+      const src = d.checks.find(c => c.id === 'source');
+      const running = op && op.state === 'ok';
+      $('op25-start').disabled = running || (src && src.state !== 'ok');
+      $('op25-stop').disabled = !running;
+      if (op && op.state === 'error' && $('op25-log').hidden) loadLog();
+    } catch (e) {
+      $('health-summary').textContent = `Couldn't load status: ${e.message}`;
+    }
+  }
 
-        // Node Info
-        document.getElementById('location').textContent = `${d.lat}, ${d.lon}`;
-        document.getElementById('configured').textContent = d.configured ? 'Yes' : 'No';
-        document.getElementById('system-id').textContent = d.assigned_system_id ?? '—';
+  // ── Live status: system, talkgroup, stream URL ─────────────────────────
+  let streamUrl = null;
+  let status = null;
+  async function refreshStatus() {
+    try {
+      const d = await api('/api/status');
+      status = d;
+      $('node-name').textContent = d.node_name || 'DRB Edge Node';
+      $('node-id').textContent = d.node_id || '';
+      document.title = `${d.node_name || 'DRB Edge Node'} — DRB`;
+      $('now-system').textContent = d.system_name ? `${d.system_name} (${d.system_type})` : 'Nothing chosen yet';
+      $('now-tg').innerHTML = d.active_tgid
+        ? `<span class="live">${esc(d.active_tgid_name || 'Talkgroup')}</span> <span class="mono">TG ${esc(d.active_tgid)}</span>`
+        : 'No call right now';
 
-        // Audio Player
-        if (d.icecast_url) {
-          const dynamicUrl = d.icecast_url.replace('localhost', window.location.hostname);
-          if (dynamicUrl !== currentIcecastUrl) {
-            currentIcecastUrl = dynamicUrl;
-            player.src = currentIcecastUrl;
-            document.getElementById('icecast-link').href = currentIcecastUrl;
-          }
-        }
-
-        // Override Banner
-        const overrideBanner = document.getElementById('override-banner');
-        if (d.is_overridden) {
-          overrideBanner.style.display = 'flex';
-          document.getElementById('override-system-text').textContent = d.system_name || 'Manual';
-          
-          const ackBtn = document.getElementById('ack-override-btn');
-          const timerText = document.getElementById('timeout-timer-text');
-          
-          if (d.enforce_override_timeout) {
-            timerText.textContent = "C2 reset timer active (24h default).";
-            ackBtn.style.display = 'inline-flex';
-          } else {
-            timerText.textContent = "No C2 timeout is enforced.";
-            ackBtn.style.display = 'none';
-          }
-        } else {
-          overrideBanner.style.display = 'none';
-        }
-
-        document.getElementById('unconfigured-banner').style.display = d.configured ? 'none' : 'flex';
-        document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
-      } catch (e) {
-        console.error('Status fetch failed:', e);
+      // The node calls Icecast "localhost"; the browser must use the node's address.
+      const url = `${location.protocol}//${location.hostname}:${d.icecast_port}${d.icecast_mount}`;
+      if (url !== streamUrl) {
+        streamUrl = url;
+        $('player').src = url;
+        $('stream-link').href = url;
+        $('stream-link').textContent = url;
       }
+      renderSource(d);
+      $('last-updated').textContent = new Date().toLocaleTimeString();
+    } catch (e) {
+      console.error('Status fetch failed:', e);
     }
+  }
 
-    async function revertToServerConfig() {
-      try {
-        const r = await fetch('/api/config/revert', { method: 'POST' });
-        if (r.ok) {
-          alert('Config reverted successfully.');
-          refresh();
-        } else {
-          alert('Failed to revert config.');
-        }
-      } catch (e) {
-        console.error('Revert failed:', e);
+  function renderSource(d) {
+    const cur = $('current-source');
+    const actions = $('source-actions');
+    if (!d.system_name) {
+      cur.textContent = 'Nothing chosen yet. Pick a source below and press Start listening.';
+      actions.hidden = true;
+      return;
+    }
+    cur.innerHTML = `Now: <strong>${esc(d.system_name)}</strong> (${esc(d.system_type)}) — ` +
+      (d.local_choice ? 'chosen on this dashboard.' : 'assigned by the DRB server.');
+    actions.hidden = !d.local_choice;
+    $('revert-btn').textContent = d.has_c2_system ? "Go back to the server's system" : 'Clear and stop';
+    $('ack-btn').hidden = !(d.local_choice && d.has_c2_system && d.enforce_override_timeout);
+  }
+
+  // ── OP25 controls + log ────────────────────────────────────────────────
+  async function op25(action) {
+    $('op25-msg').className = 'msg';
+    $('op25-msg').textContent = action === 'start' ? 'Starting…' : 'Stopping…';
+    try {
+      await api(`/api/op25/${action}`, { method: 'POST' });
+      $('op25-msg').textContent = action === 'start' ? 'Started. Give it ~20 seconds to lock on.' : 'Stopped.';
+    } catch (e) {
+      $('op25-msg').className = 'msg err';
+      $('op25-msg').textContent = e.message;
+    }
+    refreshHealth();
+  }
+  async function loadLog() {
+    const pre = $('op25-log');
+    try {
+      const d = await api('/api/op25/log?lines=120');
+      pre.textContent = d.lines.length ? d.lines.join('\n') : 'OP25 has printed nothing since it last started.';
+    } catch (e) {
+      pre.textContent = `Couldn't load the log: ${e.message}`;
+    }
+    pre.hidden = false;
+    $('log-toggle').textContent = 'Hide OP25 log';
+    $('log-toggle').setAttribute('aria-expanded', 'true');
+  }
+  function toggleLog() {
+    const pre = $('op25-log');
+    if (pre.hidden) return loadLog();
+    pre.hidden = true;
+    $('log-toggle').textContent = 'Show OP25 log';
+    $('log-toggle').setAttribute('aria-expanded', 'false');
+  }
+
+  // ── Listen locally ─────────────────────────────────────────────────────
+  let systems = [];
+  function mode() { return document.querySelector('input[name=mode]:checked').value; }
+  document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', () => {
+    document.querySelectorAll('.pane').forEach(p => { p.hidden = p.dataset.pane !== mode(); });
+    $('listen-msg').textContent = '';
+  }));
+
+  async function loadSystems() {
+    try { systems = await api('/api/systems'); } catch (e) { systems = []; }
+    const pick = $('sys-pick');
+    const usable = systems.filter(s => String(s.type).toUpperCase() !== 'DMR');
+    pick.innerHTML = usable.map(s => `<option value="${esc(s.system_id)}">${esc(s.name)} (${esc(s.type)})</option>`).join('');
+    const none = usable.length === 0;
+    $('mode-system').disabled = none;
+    pick.disabled = none;
+    $('sys-hint').textContent = none
+      ? "The server's systems appear here once this node is approved and online."
+      : `${usable.length} system${usable.length > 1 ? 's' : ''} saved from the DRB server.`;
+  }
+
+  function parseFreqs(text) {
+    return text.split(/[\s,;]+/).filter(Boolean).map(Number);
+  }
+
+  async function listen() {
+    const m = mode();
+    const msg = $('listen-msg');
+    let body;
+    if (m === 'system') {
+      body = { mode: 'system', system_id: $('sys-pick').value };
+    } else if (m === 'p25') {
+      const freqs = parseFreqs($('p25-freqs').value);
+      if (!freqs.length || freqs.some(isNaN)) { msg.className = 'msg err'; msg.textContent = 'Enter control channel frequencies in MHz, e.g. 851.0125'; return; }
+      const tgs = [];
+      for (const line of $('p25-tgs').value.split('\n').map(l => l.trim()).filter(Boolean)) {
+        const mm = line.match(/^(\d+)\s*[,\t ]?\s*(.*)$/);
+        if (!mm) { msg.className = 'msg err'; msg.textContent = `Talkgroup line "${line}" should start with a decimal ID.`; return; }
+        tgs.push({ id: Number(mm[1]), name: mm[2] });
       }
+      body = { mode: 'p25', frequencies: freqs, name: $('p25-name').value, talkgroups: tgs };
+    } else {
+      const freqs = parseFreqs($('an-freq').value);
+      if (freqs.length !== 1 || isNaN(freqs[0])) { msg.className = 'msg err'; msg.textContent = 'Enter one frequency in MHz, e.g. 154.4300'; return; }
+      body = { mode: 'analog', frequencies: freqs, name: $('an-name').value };
     }
-
-    async function ackOverrideC2() {
-      try {
-        const r = await fetch('/api/config/override/ack', { 
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ timeout_minutes: 1440 })
-        });
-        if (r.ok) {
-          alert('Override acknowledged on C2.');
-        } else {
-          alert('Failed to send acknowledgement.');
-        }
-      } catch (e) {
-        console.error('Ack failed:', e);
-      }
+    $('listen-btn').disabled = true;
+    msg.className = 'msg';
+    msg.textContent = 'Applying — restarting OP25…';
+    try {
+      const d = await api('/api/listen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      msg.textContent = `Listening to ${d.name}. Give it ~20 seconds, then press play above.`;
+    } catch (e) {
+      msg.className = 'msg err';
+      msg.textContent = e.message;
+    } finally {
+      $('listen-btn').disabled = false;
+      refreshStatus(); refreshHealth();
     }
+  }
 
-    // ── SDRs: OP25's dongle, secondary priority and per-service pins ────────
-    const SDR_LABELS = {
-      adsb: ['ADS-B', 'Aircraft · 1090 MHz'],
-      ais: ['AIS', 'Vessels · 162 MHz'],
-    };
-    let sdr = null;         // last GET /api/sdr
-    let sdrRows = [];       // [{mode, enabled, pin}] in display order
-    let sdrOp25Pin = '';    // '' = automatic
-    let sdrDirty = false;
-
-    function esc(v) {
-      return String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  async function revert() {
+    const toServer = status && status.has_c2_system;
+    if (!toServer && !confirm('Clear this choice and stop OP25?')) return;
+    const msg = $('listen-msg');
+    msg.className = 'msg';
+    msg.textContent = toServer ? "Switching back to the server's system…" : 'Stopping…';
+    try {
+      await api('/api/config/revert', { method: 'POST' });
+      msg.textContent = toServer ? "Back on the server's system." : 'Cleared. OP25 is stopped.';
+    } catch (e) {
+      msg.className = 'msg err';
+      msg.textContent = e.message;
     }
+    refreshStatus(); refreshHealth();
+  }
 
-    function deviceOptions(selected, autoLabel) {
-      const devs = sdr.devices || [];
-      const known = devs.some(d => d.serial === selected);
-      return `<option value="">${esc(autoLabel)}</option>` +
-        devs.map(d => `<option value="${esc(d.serial)}" ${d.serial === selected ? 'selected' : ''}>` +
-          `SDR ${d.index + 1} · serial ${esc(d.serial)}${d.duplicate_serial ? ' (shared serial!)' : ''}</option>`).join('') +
-        (selected && !known ? `<option value="${esc(selected)}" selected>serial ${esc(selected)} ` +
-          `(${sdr.devices === null ? 'not reported' : 'not plugged in'})</option>` : '');
+  async function ackOverride() {
+    const msg = $('listen-msg');
+    try {
+      await api('/api/config/override/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timeout_minutes: 1440 }) });
+      msg.className = 'msg';
+      msg.textContent = 'The server will keep this choice for 24 hours.';
+    } catch (e) {
+      msg.className = 'msg err';
+      msg.textContent = `Couldn't reach the server: ${e.message}`;
     }
+  }
 
-    function renderSdr() {
-      const op25 = document.getElementById('sdr-op25');
-      op25.innerHTML = deviceOptions(sdrOp25Pin, 'Automatic (first SDR)');
-      op25.onchange = () => { sdrOp25Pin = op25.value; markSdrDirty(); };
-      document.getElementById('sdr-op25-note').textContent = sdrOp25Pin !== (sdr.pins.op25 || '')
-        ? 'Saving will restart OP25 on the selected SDR.'
-        : (sdr.op25_serial ? `OP25 is using serial ${sdr.op25_serial}.` : '');
+  // ── SDRs: OP25's dongle, secondary priority and per-service pins ──────
+  const SDR_LABELS = { adsb: ['ADS-B', 'Aircraft · 1090 MHz'], ais: ['AIS', 'Vessels · 162 MHz'] };
+  let sdr = null, sdrRows = [], sdrOp25Pin = '', sdrDirty = false;
 
-      const list = document.getElementById('sdr-list');
-      list.innerHTML = '';
-      let rank = 0;
-      const running = sdr.running || [];
-      sdrRows.forEach((row, i) => {
-        const [name, hint] = SDR_LABELS[row.mode] || [row.mode, ''];
-        const pinMissing = row.pin && sdr.devices !== null && !sdr.devices.some(d => d.serial === row.pin);
-        const state = !row.enabled ? 'Off'
-          : sdrDirty ? 'Unsaved'
-          : sdr.running === null ? 'Unknown'
-          : running.includes(row.mode) ? 'Running'
-          : pinMissing ? 'Pinned SDR missing' : 'Waiting for SDR';
-        const el = document.createElement('div');
-        el.className = 'sdr-row';
-        el.innerHTML = `
-          <span class="sdr-rank">${row.enabled ? ++rank : ''}</span>
-          <input type="checkbox" ${row.enabled ? 'checked' : ''} aria-label="Enable ${name}">
-          <span class="sdr-name">${name}<small>${hint}</small></span>
-          <select class="sdr-select" aria-label="${name} SDR">${deviceOptions(row.pin, 'Any spare SDR')}</select>
-          <button class="sdr-move" aria-label="Move ${name} up" ${i === 0 ? 'disabled' : ''}>▲</button>
-          <button class="sdr-move" aria-label="Move ${name} down" ${i === sdrRows.length - 1 ? 'disabled' : ''}>▼</button>
-          <span class="sdr-state ${state === 'Running' ? 'on' : ''}">${state}</span>`;
-        const [box] = el.getElementsByTagName('input');
-        const [pick] = el.getElementsByTagName('select');
-        const [up, down] = el.getElementsByTagName('button');
-        box.onchange = () => { row.enabled = box.checked; markSdrDirty(); };
-        pick.onchange = () => { row.pin = pick.value; markSdrDirty(); };
-        up.onclick = () => { [sdrRows[i - 1], sdrRows[i]] = [sdrRows[i], sdrRows[i - 1]]; markSdrDirty(); };
-        down.onclick = () => { [sdrRows[i + 1], sdrRows[i]] = [sdrRows[i], sdrRows[i + 1]]; markSdrDirty(); };
-        list.appendChild(el);
-      });
+  function deviceOptions(selected, autoLabel) {
+    const devs = sdr.devices || [];
+    const known = devs.some(d => d.serial === selected);
+    return `<option value="">${esc(autoLabel)}</option>` +
+      devs.map(d => `<option value="${esc(d.serial)}" ${d.serial === selected ? 'selected' : ''}>` +
+        `SDR ${d.index + 1} · serial ${esc(d.serial)}${d.duplicate_serial ? ' (shared serial!)' : ''}</option>`).join('') +
+      (selected && !known ? `<option value="${esc(selected)}" selected>serial ${esc(selected)} ` +
+        `(${sdr.devices === null ? 'not reported' : 'not plugged in'})</option>` : '');
+  }
 
-      const warn = document.getElementById('sdr-warning');
-      const pinned = [sdrOp25Pin, ...sdrRows.map(r => r.pin)].filter(Boolean);
-      const problems = [];
-      if (sdr.devices === null) problems.push('The secondary SDR service is not responding, so SDRs can\'t be listed.');
-      if ((sdr.devices || []).some(d => d.duplicate_serial)) {
-        problems.push('Two SDRs share a serial number, so they can\'t be told apart. Give each a unique serial (rtl_eeprom -s) before pinning.');
-      }
-      if (new Set(pinned).size !== pinned.length) problems.push('Two services are pinned to the same SDR.');
-      warn.textContent = problems.join(' ');
-      warn.style.display = problems.length ? 'block' : 'none';
-      document.getElementById('sdr-save').disabled = !sdrDirty || new Set(pinned).size !== pinned.length;
+  function renderSdr() {
+    const op25sel = $('sdr-op25');
+    op25sel.innerHTML = deviceOptions(sdrOp25Pin, 'Automatic (first SDR)');
+    op25sel.onchange = () => { sdrOp25Pin = op25sel.value; markSdrDirty(); };
+    $('sdr-op25-note').textContent = sdrOp25Pin !== (sdr.pins.op25 || '')
+      ? 'Saving will restart OP25 on the selected SDR.'
+      : (sdr.op25_serial ? `OP25 is using serial ${sdr.op25_serial}.` : '');
+    const list = $('sdr-list');
+    list.innerHTML = '';
+    let rank = 0;
+    const running = sdr.running || [];
+    sdrRows.forEach((row, i) => {
+      const [name, hint] = SDR_LABELS[row.mode] || [row.mode, ''];
+      const pinMissing = row.pin && sdr.devices !== null && !sdr.devices.some(d => d.serial === row.pin);
+      const state = !row.enabled ? 'Off' : sdrDirty ? 'Unsaved' : sdr.running === null ? 'Unknown'
+        : running.includes(row.mode) ? 'Running' : pinMissing ? 'Pinned SDR missing' : 'Waiting for SDR';
+      const el = document.createElement('div');
+      el.className = 'sdr-row';
+      el.innerHTML = `
+        <span class="sdr-rank">${row.enabled ? ++rank : ''}</span>
+        <input type="checkbox" ${row.enabled ? 'checked' : ''} aria-label="Enable ${name}">
+        <span class="sdr-name">${name}<small>${hint}</small></span>
+        <select class="sdr-select" aria-label="${name} SDR">${deviceOptions(row.pin, 'Any spare SDR')}</select>
+        <button class="sdr-move" aria-label="Move ${name} up" ${i === 0 ? 'disabled' : ''}>▲</button>
+        <button class="sdr-move" aria-label="Move ${name} down" ${i === sdrRows.length - 1 ? 'disabled' : ''}>▼</button>
+        <span class="sdr-state ${state === 'Running' ? 'on' : ''}">${state}</span>`;
+      const [box] = el.getElementsByTagName('input');
+      const [pick] = el.getElementsByTagName('select');
+      const [up, down] = el.getElementsByTagName('button');
+      box.onchange = () => { row.enabled = box.checked; markSdrDirty(); };
+      pick.onchange = () => { row.pin = pick.value; markSdrDirty(); };
+      up.onclick = () => { [sdrRows[i - 1], sdrRows[i]] = [sdrRows[i], sdrRows[i - 1]]; markSdrDirty(); };
+      down.onclick = () => { [sdrRows[i + 1], sdrRows[i]] = [sdrRows[i], sdrRows[i + 1]]; markSdrDirty(); };
+      list.appendChild(el);
+    });
+    const warn = $('sdr-warning');
+    const pinned = [sdrOp25Pin, ...sdrRows.map(r => r.pin)].filter(Boolean);
+    const problems = [];
+    if (sdr.devices === null) problems.push("The SDR service isn't responding, so SDRs can't be listed.");
+    if ((sdr.devices || []).some(d => d.duplicate_serial)) {
+      problems.push("Two SDRs share a serial number, so they can't be told apart. Give each a unique serial (rtl_eeprom -s) before pinning.");
     }
+    if (new Set(pinned).size !== pinned.length) problems.push('Two services are pinned to the same SDR.');
+    warn.textContent = problems.join(' ');
+    warn.hidden = !problems.length;
+    $('sdr-save').disabled = !sdrDirty || new Set(pinned).size !== pinned.length;
+  }
+  function markSdrDirty() { sdrDirty = true; $('sdr-msg').textContent = ''; renderSdr(); }
 
-    function markSdrDirty() {
-      sdrDirty = true;
-      document.getElementById('sdr-msg').textContent = '';
+  async function loadSdr() {
+    if (sdrDirty) return;  // never clobber unsaved edits with a poll
+    try {
+      sdr = await api('/api/sdr');
+      sdrOp25Pin = sdr.pins.op25 || '';
+      sdrRows = [
+        ...sdr.priority.map(mode => ({ mode, enabled: true, pin: sdr.pins[mode] || '' })),
+        ...sdr.modes.filter(m => !sdr.priority.includes(m)).map(mode => ({ mode, enabled: false, pin: sdr.pins[mode] || '' })),
+      ];
       renderSdr();
+    } catch (e) {
+      console.error('SDR load failed:', e);
     }
-
-    async function loadSdr() {
-      if (sdrDirty) return;  // never clobber unsaved edits with a poll
-      try {
-        const r = await fetch('/api/sdr');
-        if (!r.ok) return;
-        sdr = await r.json();
-        sdrOp25Pin = sdr.pins.op25 || '';
-        sdrRows = [
-          ...sdr.priority.map(mode => ({ mode, enabled: true, pin: sdr.pins[mode] || '' })),
-          ...sdr.modes.filter(m => !sdr.priority.includes(m)).map(mode => ({ mode, enabled: false, pin: sdr.pins[mode] || '' })),
-        ];
-        renderSdr();
-      } catch (e) {
-        console.error('SDR load failed:', e);
-      }
+  }
+  async function saveSdr() {
+    const pins = { op25: sdrOp25Pin || null };
+    sdrRows.forEach(r => { pins[r.mode] = r.pin || null; });
+    const btn = $('sdr-save'), msg = $('sdr-msg');
+    btn.disabled = true;
+    msg.textContent = 'Applying…';
+    try {
+      const d = await api('/api/sdr', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ priority: sdrRows.filter(r => r.enabled).map(r => r.mode), pins }),
+      });
+      sdrDirty = false;
+      msg.textContent = d.running === null ? "Saved, but the SDR service didn't respond." : 'Saved.';
+      await loadSdr();
+    } catch (e) {
+      msg.textContent = `Save failed: ${e.message}`;
+      btn.disabled = false;
     }
+  }
 
-    async function saveSdr() {
-      const pins = { op25: sdrOp25Pin || null };
-      sdrRows.forEach(r => { pins[r.mode] = r.pin || null; });
-      const btn = document.getElementById('sdr-save');
-      const msg = document.getElementById('sdr-msg');
-      btn.disabled = true;
-      msg.textContent = 'Applying…';
-      try {
-        const r = await fetch('/api/sdr', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ priority: sdrRows.filter(r => r.enabled).map(r => r.mode), pins }),
-        });
-        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
-        const d = await r.json();
-        sdrDirty = false;
-        msg.textContent = d.running === null ? 'Saved, but the secondary SDR service did not respond.' : 'Saved.';
-        await loadSdr();
-      } catch (e) {
-        console.error('SDR save failed:', e);
-        msg.textContent = `Save failed: ${e.message}`;
-        btn.disabled = false;
-      }
-    }
-
-    loadSdr();
-    setInterval(loadSdr, 10000);
-
-    refresh();
-    setInterval(refresh, 2000); // Polling every 2 seconds
-  </script>
+  refreshStatus(); setInterval(refreshStatus, 2000);
+  refreshHealth(); setInterval(refreshHealth, 5000);
+  loadSystems();
+  loadSdr(); setInterval(loadSdr, 10000);
+</script>
 </body>
 </html>
