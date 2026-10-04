@@ -144,20 +144,11 @@ async def on_command(payload: dict):
     action = payload.get("action")
     logger.info(f"Command received: {action}")
 
-    if action == "discord_join":
-        token = payload.get("token")
-        if not token:
-            logger.error("discord_join command missing token — ignoring.")
-            return
-        await radio_bot.join(
-            guild_id=int(payload["guild_id"]),
-            channel_id=int(payload["channel_id"]),
-            token=token,
-            call_active=metadata_watcher.is_active,
-            system_name=payload.get("system_name"),
-        )
-    elif action == "discord_leave":
-        await radio_bot.leave()
+    if action in ("discord_join", "discord_leave"):
+        # Pre-desired-state C2. Discord streams now arrive on
+        # nodes/{id}/discord/desired (node-26#25); a raw-token join is refused
+        # so a bot token is never taken from an MQTT command again.
+        logger.warning(f"Ignoring legacy {action} command — Discord radio is driven by desired state now.")
     elif action in ("set_sdr_config", "set_secondary_priority"):
         from app.internal.sdr_settings import set_sdr_settings
         try:
@@ -300,8 +291,9 @@ async def lifespan(app: FastAPI):
     mqtt_manager.on_command = on_command
     mqtt_manager.on_config_push = on_config_push
     mqtt_manager.on_api_key = on_api_key
+    mqtt_manager.on_discord_desired = radio_bot.apply_desired
 
-    # Start services (radio_bot starts on-demand when a discord_join command arrives)
+    # Start services (radio_bot starts when C2's retained discord/desired arrives)
     await mqtt_manager.connect()
     await metadata_watcher.start()
     await call_recorder.start()  # persistent PulseAudio ring buffer
