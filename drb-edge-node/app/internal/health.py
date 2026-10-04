@@ -182,6 +182,7 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
         freq = _mhz(chans[0].get("freq")) if chans else None
         checks.append(_check(
             "decode", "Decoding", OK, f"Tuned to {freq or 'the analog frequency'} (analog FM — no decoding needed).",
+            "Live listening only: analog calls are not recorded or uploaded yet (node-26#20).",
         ))
     else:
         trunk = console.get("trunk") or []

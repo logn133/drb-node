@@ -126,6 +126,7 @@ def test_analog_needs_no_control_channel():
         console={"last_poll_epoch": now, "channels": [{"freq": 154430000}], "trunk": [], "last_heard": None},
     )))
     assert c["decode"]["state"] == "ok" and "154.4300 MHz" in c["decode"]["summary"]
+    assert "not recorded" in c["decode"]["action"]
     assert "this dashboard" in c["source"]["summary"]
 
 

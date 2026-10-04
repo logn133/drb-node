@@ -124,7 +124,7 @@
     }
     .softkey:last-child { border-right: none; }
     
-    /* Overlay UI (Volume, Hold) */
+    /* Overlay UI (Volume, status) */
     .overlay {
       position: absolute;
       top: 50%; left: 50%;
@@ -153,7 +153,6 @@
     <ul>
       <li><span>Up Arrow</span> Volume Up</li>
       <li><span>Down Arrow</span> Volume Down</li>
-      <li><span>Enter / H</span> Toggle Hold (UI mock)</li>
       <li><span>P</span> Play/Pause Stream</li>
       <li><span>S</span> Select System</li>
       <li><span>R</span> Revert Override</li>
@@ -211,7 +210,7 @@
     <div class="softkey">PLAY (P)</div>
   </div>
 
-  <div class="overlay" id="overlay">HOLD</div>
+  <div class="overlay" id="overlay"></div>
 
   <!-- Audio element for local playback -->
   <audio id="audio-player" autoplay></audio>
@@ -230,7 +229,6 @@
     const elOverlay = document.getElementById('overlay');
 
     let currentIcecastUrl = null;
-    let isHolding = false;
     let volume = 1.0;
 
     // Clock updater
@@ -372,25 +370,20 @@
       }
       closeSystemModal();
       showOverlay("APPLYING MANUAL", 3000);
-      const manualConfig = {
-        system_id: "manual-override",
-        name: `Freq ${freqVal} (${typeVal})`,
-        type: typeVal,
-        config: {
-          control_channels: [freqVal],
-          talkgroups: []
-        }
-      };
+      // Same validated path as the dashboard's "Listen locally" (MHz range check).
+      const mode = typeVal === 'NBFM' ? 'analog' : 'p25';
+      const freqs = freqVal.split(/[\s,;]+/).filter(Boolean).map(Number);
       try {
-        const res = await fetch('/api/config/override', {
+        const res = await fetch('/api/listen', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ system_config: manualConfig })
+          body: JSON.stringify({ mode, frequencies: freqs })
         });
         if (res.ok) {
-          showOverlay('MANUAL OVERRIDE OK', 1500);
+          showOverlay('MANUAL OK', 1500);
         } else {
-          showOverlay('MANUAL OVERRIDE FAIL', 2000);
+          const d = await res.json().catch(() => ({}));
+          showOverlay((d.detail || 'MANUAL FAILED').slice(0, 60), 4000);
         }
       } catch (err) {
         showOverlay('ERROR APPLYING', 2000);
@@ -443,9 +436,6 @@
         audioPlayer.volume = volume;
         elVol.textContent = `VOL: ${Math.round(volume * 100)}%`;
         showOverlay(`VOL: ${Math.round(volume * 100)}%`);
-      } else if (e.key === 'Enter' || e.key === 'h' || e.key === 'H') {
-        isHolding = !isHolding;
-        showOverlay(isHolding ? 'HOLD ON' : 'HOLD OFF');
       } else if (e.key === 'p' || e.key === 'P') {
           if (audioPlayer.paused) {
               audioPlayer.play();
