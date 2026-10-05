@@ -74,6 +74,43 @@ class _Voice:
     code: Optional[str] = None
 
 
+def _join_refusal(guild, channel) -> Optional[tuple[str, str]]:
+    """Why Discord would refuse this bot's voice join, or None.
+
+    Discord does not answer a join the bot lacks permission for — the gateway
+    just never sends the voice-server update, discord.py times out after 30s,
+    and the admin page used to read "(TimeoutError: )". Checking first turns
+    that into an instruction. Best effort: if the bot's own member or the
+    permission data is not cached, let the join go ahead.
+    """
+    me = getattr(guild, "me", None)
+    permissions_for = getattr(channel, "permissions_for", None)
+    if me is None or permissions_for is None:
+        return None
+    try:
+        perms = permissions_for(me)
+    except Exception:
+        return None
+    missing = [label for attr, label in (("view_channel", "View Channel"), ("connect", "Connect"))
+               if not getattr(perms, attr, True)]
+    if getattr(channel, "type", None) == discord.ChannelType.voice and not getattr(perms, "speak", True):
+        missing.append("Speak")
+    if missing:
+        return ("missing_permissions",
+                f"The radio bot lacks {', '.join(missing)} on that voice channel — "
+                "allow it in the channel's permission settings in Discord.")
+    limit = getattr(channel, "user_limit", 0) or 0
+    # The bot's own lingering voice state (a dropped connection) is not a
+    # slot it needs; counting it would block the rejoin of a full channel.
+    me_id = getattr(me, "id", None)
+    members = [m for m in (getattr(channel, "members", None) or [])
+               if me_id is None or getattr(m, "id", None) != me_id]
+    if limit and len(members) >= limit and not getattr(perms, "move_members", False):
+        return ("channel_full", f"That voice channel is full ({len(members)}/{limit}) — "
+                                "raise its user limit or free a slot.")
+    return None
+
+
 def _default_client_factory():
     intents = discord.Intents.none()
     intents.guilds = True
@@ -220,6 +257,10 @@ class RadioManager:
                     v.error = self._session_errors.get(d["token_id"], "The radio bot could not log in to Discord.")
                     continue
                 await self._ensure_voice(sess, v, d)
+            # 4) presence follows voice: "Listening to <system>" only while a
+            #    voice connection for that bot is actually up.
+            for sess in list(self._sessions.values()):
+                await self._sync_presence(sess, target)
 
     async def _ensure_session(self, token_id: str) -> Optional[_Session]:
         sess = self._sessions.get(token_id)
@@ -275,7 +316,12 @@ class RadioManager:
             if not vc.is_playing():
                 self._play(v)
             v.state, v.error, v.code = "connected", None, None
-            await self._set_presence(sess, d.get("system_name"))
+            return
+        refusal = _join_refusal(guild, channel)
+        if refusal:
+            if v.error != refusal[1]:   # once per change, not every watchdog pass
+                logger.error(f"Stream {v.stream_id}: {refusal[1]}")
+            v.state, v.code, v.error = "error", refusal[0], refusal[1]
             return
         v.state = "connecting"
         try:
@@ -287,11 +333,23 @@ class RadioManager:
                 if existing is not None:
                     await existing.disconnect(force=True)
                 v.vc = await channel.connect()
+        except asyncio.TimeoutError:
+            # discord.py's TimeoutError has no message, so the old text read
+            # "(TimeoutError: )" — useless on the admin page.
+            v.vc = None
+            v.state, v.code = "error", "connect_timeout"
+            # Permissions were checked above, so this is usually the voice
+            # handshake itself (e.g. a pre-2.7 discord.py refused with 4017 for
+            # lacking DAVE E2EE, then retried until the 30s timeout) or UDP egress.
+            v.error = ("Discord never completed the voice join (timed out). Permissions look fine, so "
+                       "check the node's discord.py voice log (DAVE close 4017, UDP blocked).")
+            logger.error(f"Stream {v.stream_id}: voice connect timed out")
+            return
         except Exception as e:
             v.vc = None
             v.state, v.code = "error", "connect_failed"
             v.error = f"Could not connect to the voice channel ({type(e).__name__}: {str(e)[:120]})."
-            logger.error(f"Stream {v.stream_id}: voice connect failed: {e}")
+            logger.error(f"Stream {v.stream_id}: voice connect failed: {type(e).__name__}: {e}")
             return
         # Bounded wait for the shared PulseAudio socket (op25 container creates it).
         if not await pulse.wait_until_ready():
@@ -300,15 +358,27 @@ class RadioManager:
             return
         self._play(v, pulse_checked=True)
         v.state, v.error, v.code = "connected", None, None
-        await self._set_presence(sess, d.get("system_name"))
         logger.info(f"Stream {v.stream_id} connected (bot {v.token_id})")
 
-    async def _set_presence(self, sess: _Session, name: Optional[str]) -> None:
-        if not name or sess.presence == name:
+    async def _sync_presence(self, sess: _Session, target: dict[str, dict]) -> None:
+        """Show "Listening to <system>" only while this bot is really in voice.
+
+        It used to be set once on the first successful join and never cleared,
+        so a bot whose voice later dropped (or kept failing to rejoin) still
+        looked healthy in Discord's member list.
+        """
+        name = None
+        for sid, v in sorted(self._voices.items()):
+            if (v.token_id == sess.token_id and v.state == "connected"
+                    and v.vc is not None and v.vc.is_connected()):
+                name = (target.get(sid) or {}).get("system_name") or name
+                if name:
+                    break
+        if sess.presence == name:
             return
         try:
-            await sess.client.change_presence(
-                activity=discord.Activity(type=discord.ActivityType.listening, name=name))
+            activity = discord.Activity(type=discord.ActivityType.listening, name=name) if name else None
+            await sess.client.change_presence(activity=activity)
             sess.presence = name
         except Exception as e:
             logger.warning(f"Presence update failed: {e}")

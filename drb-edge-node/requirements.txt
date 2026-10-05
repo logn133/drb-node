@@ -3,7 +3,9 @@ uvicorn[standard]
 pydantic-settings
 paho-mqtt>=2.0.0
 httpx
-discord.py[voice]
+# >=2.7: Discord requires DAVE (E2EE) voice since 2026-03-01; 2.7 is the first
+# discord.py with it (the [voice] extra pulls `davey`). Older releases cannot join voice.
+discord.py[voice]>=2.7
 PyNaCl
 python-multipart
 pytest

@@ -47,8 +47,18 @@ class FakeVC:
 class FakeChannel:
     def __init__(self, guild, cid, kind=discord.ChannelType.voice):
         self.guild, self.id, self.type = guild, cid, kind
+        self.perms = discord.Permissions(view_channel=True, connect=True, speak=True)
+        self.user_limit = 0
+        self.members = []
+        self.connect_error = None
+
+    def permissions_for(self, member):
+        assert member is self.guild.me
+        return self.perms
 
     async def connect(self):
+        if self.connect_error:
+            raise self.connect_error
         vc = FakeVC(self)
         self.guild.voice_client = vc
         return vc
@@ -57,6 +67,7 @@ class FakeChannel:
 class FakeGuild:
     def __init__(self, gid, channel_ids):
         self.id = gid
+        self.me = object()
         self.voice_client = None
         self.channels = {c: FakeChannel(self, c) for c in channel_ids}
 
@@ -149,6 +160,7 @@ async def test_apply_connects_and_reports(env):
     assert env.mgr.is_connected
     vc = env.guilds[1].voice_client
     assert vc.plays == 1 and vc.channel.id == 11
+    assert FakeClient.instances[0].presence.name == "County"
 
 
 async def test_one_session_serves_two_guilds(env):
@@ -258,3 +270,64 @@ async def test_no_message_content_intent_on_real_client():
         assert client.intents.voice_states and client.intents.guilds
     finally:
         await client.close()
+
+
+def _presence(client):
+    activity = getattr(client, "presence", None)
+    return activity.name if activity else None
+
+
+async def test_missing_connect_permission_is_named_not_a_timeout(env):
+    """Discord ignores a join the bot may not make; say which permission is missing."""
+    env.guilds[1].channels[11].perms = discord.Permissions(view_channel=True, speak=True)
+    await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
+    st = env.published[-1]["streams"]["1:11"]
+    assert st["state"] == "error" and st["code"] == "missing_permissions"
+    assert "Connect" in st["error"] and "View Channel" not in st["error"]
+    assert env.guilds[1].voice_client is None
+    assert _presence(FakeClient.instances[0]) is None   # not "Listening to …" while out of voice
+
+
+async def test_full_channel_is_reported(env):
+    ch = env.guilds[1].channels[11]
+    ch.user_limit, ch.members = 2, [object(), object()]
+    await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
+    st = env.published[-1]["streams"]["1:11"]
+    assert st["code"] == "channel_full" and "2/2" in st["error"]
+
+
+async def test_bots_own_lingering_voice_state_does_not_fill_the_channel(env):
+    """A dropped connection can leave the bot listed in the channel; that is
+    not a slot it needs to rejoin."""
+    guild = env.guilds[1]
+    guild.me = type("Me", (), {"id": 999})()
+    ch = guild.channels[11]
+    ch.user_limit, ch.members = 2, [object(), guild.me]
+    await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
+    assert env.published[-1]["streams"]["1:11"]["state"] == "connected"
+
+
+async def test_connect_timeout_has_a_readable_error(env):
+    env.guilds[1].channels[11].connect_error = asyncio.TimeoutError()
+    await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
+    st = env.published[-1]["streams"]["1:11"]
+    assert st["state"] == "error" and st["code"] == "connect_timeout"
+    assert "timed out" in st["error"] and "TimeoutError: )" not in st["error"]
+
+
+async def test_presence_is_cleared_when_voice_is_lost_and_rejoin_fails(env):
+    """The owner saw "Listening to <system>" on a bot that was not in voice:
+    presence was set once on join and never cleared."""
+    await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
+    client = FakeClient.instances[0]
+    assert _presence(client) == "County"
+    env.guilds[1].voice_client.connected = False
+    env.guilds[1].voice_client = None
+    env.guilds[1].channels[11].connect_error = RuntimeError("voice handshake failed")
+    await env.mgr.tick()
+    st = env.mgr.snapshot()["streams"]["1:11"]
+    assert st["state"] == "error" and st["code"] == "connect_failed"
+    assert _presence(client) is None
+    env.guilds[1].channels[11].connect_error = None
+    await env.mgr.tick()
+    assert _presence(client) == "County"
