@@ -100,7 +100,11 @@ def _join_refusal(guild, channel) -> Optional[tuple[str, str]]:
                 f"The radio bot lacks {', '.join(missing)} on that voice channel — "
                 "allow it in the channel's permission settings in Discord.")
     limit = getattr(channel, "user_limit", 0) or 0
-    members = getattr(channel, "members", None) or []
+    # The bot's own lingering voice state (a dropped connection) is not a
+    # slot it needs; counting it would block the rejoin of a full channel.
+    me_id = getattr(me, "id", None)
+    members = [m for m in (getattr(channel, "members", None) or [])
+               if me_id is None or getattr(m, "id", None) != me_id]
     if limit and len(members) >= limit and not getattr(perms, "move_members", False):
         return ("channel_full", f"That voice channel is full ({len(members)}/{limit}) — "
                                 "raise its user limit or free a slot.")
@@ -334,8 +338,11 @@ class RadioManager:
             # "(TimeoutError: )" — useless on the admin page.
             v.vc = None
             v.state, v.code = "error", "connect_timeout"
-            v.error = ("Discord never completed the voice join (timed out). Check the channel's "
-                       "permission overrides for the radio bot and that Discord voice is healthy.")
+            # Permissions were checked above, so this is usually the voice
+            # handshake itself (e.g. a pre-2.7 discord.py refused with 4017 for
+            # lacking DAVE E2EE, then retried until the 30s timeout) or UDP egress.
+            v.error = ("Discord never completed the voice join (timed out). Permissions look fine, so "
+                       "check the node's discord.py voice log (DAVE close 4017, UDP blocked).")
             logger.error(f"Stream {v.stream_id}: voice connect timed out")
             return
         except Exception as e:

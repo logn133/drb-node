@@ -296,6 +296,17 @@ async def test_full_channel_is_reported(env):
     assert st["code"] == "channel_full" and "2/2" in st["error"]
 
 
+async def test_bots_own_lingering_voice_state_does_not_fill_the_channel(env):
+    """A dropped connection can leave the bot listed in the channel; that is
+    not a slot it needs to rejoin."""
+    guild = env.guilds[1]
+    guild.me = type("Me", (), {"id": 999})()
+    ch = guild.channels[11]
+    ch.user_limit, ch.members = 2, [object(), guild.me]
+    await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
+    assert env.published[-1]["streams"]["1:11"]["state"] == "connected"
+
+
 async def test_connect_timeout_has_a_readable_error(env):
     env.guilds[1].channels[11].connect_error = asyncio.TimeoutError()
     await env.mgr.apply_desired(_desired(1, (1, 11, "t1")))
