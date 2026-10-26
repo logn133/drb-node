@@ -151,6 +151,17 @@ def test_mqtt_sentinel_triggers_update_and_is_consumed(env):
     assert "evil" not in calls and "rm -rf" not in calls
 
 
+def test_update_prunes_build_cache_and_stale_images_after_up(env):
+    # node-26#41: the build cache was never pruned and filled node-002's disk.
+    (env["stub"] / "response").write_text(json.dumps({"update_requested_at": "2026-10-04T12:00:00+00:00"}))
+    assert _run(env).returncode == 0
+    lines = _calls(env).splitlines()
+    up = next(i for i, ln in enumerate(lines) if ln.startswith("docker compose up -d"))
+    builder = next(i for i, ln in enumerate(lines) if ln.startswith("docker builder prune -af --filter until="))
+    images = next(i for i, ln in enumerate(lines) if ln.startswith("docker image prune -af --filter until="))
+    assert up < builder and up < images  # only after the new containers are running
+
+
 def test_c2_response_is_never_used_as_a_ref_or_command(env):
     (env["stub"] / "response").write_text(json.dumps({"update_requested_at": "$(touch /tmp/pwned); main"}))
     r = _run(env)

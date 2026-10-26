@@ -225,6 +225,14 @@ do_update() {
         done || true
   fi
   docker image prune -f >/dev/null 2>&1 || true
+
+  # node-26#41: neither of the above ever freed BuildKit cache or untagged-
+  # but-unused images, so a BUILD=1 node grew ~40 GB of build cache plus
+  # 16 GB of stale images until the root disk hit 100% and recording silently
+  # stopped (node-002, 17 days). Both prunes skip anything a container uses;
+  # the age filters keep the cache warm for the next build.
+  docker builder prune -af --filter until=72h >/dev/null 2>&1 || true
+  docker image prune -af --filter until=168h >/dev/null 2>&1 || true
 }
 
 main "$@"
