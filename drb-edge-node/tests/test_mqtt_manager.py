@@ -140,3 +140,16 @@ def test_build_client_does_not_touch_offline_buffer(monkeypatch):
 
     assert list(mqtt_manager._offline_buffer) == [("nodes/test/metadata", {"call_id": "sentinel"})]
     mqtt_manager._offline_buffer.clear()
+
+
+def test_disk_report_reads_free_and_total(tmp_path):
+    from app.internal.mqtt_manager import disk_report
+    rep = disk_report(str(tmp_path))
+    assert rep["disk_total_bytes"] > 0
+    assert 0 <= rep["disk_free_bytes"] <= rep["disk_total_bytes"]
+
+
+def test_disk_report_nulls_when_path_unreadable(tmp_path):
+    # node-26#41: nulls (not omitted keys) so C2 never keeps a stale reading.
+    from app.internal.mqtt_manager import disk_report
+    assert disk_report(str(tmp_path / "missing")) == {"disk_free_bytes": None, "disk_total_bytes": None}
