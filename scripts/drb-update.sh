@@ -51,6 +51,12 @@ main() {
   flock -n 9 || { log "another update is already running"; return 0; }
 
   cd "$INSTALL_DIR"
+  # This runs as root, but a pre-install.sh checkout (e.g. /home/pi/node-26)
+  # is owned by the login user, and git >= 2.35.2 then refuses every command
+  # with "dubious ownership" — which surfaced as origin '' != REPO_URL. Trust
+  # exactly the configured INSTALL_DIR, for this process only (env config is
+  # command-line scope, which safe.directory honours; no global config change).
+  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$INSTALL_DIR"
   envget() { grep -E "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true; }
   local NODE_ID C2_URL
   NODE_ID="$(envget NODE_ID)"; C2_URL="$(envget C2_URL)"; C2_URL="${C2_URL%/}"
