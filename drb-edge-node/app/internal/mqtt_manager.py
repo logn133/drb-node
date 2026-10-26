@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 from datetime import datetime, timezone
 from collections import deque
 from typing import Optional, Callable, Awaitable, Dict, Any
@@ -7,6 +8,22 @@ import paho.mqtt.client as mqtt
 from app.config import settings
 from app.internal.logger import logger
 from app.internal import credentials, key_pickup
+
+
+def disk_report(path: str) -> Dict[str, Optional[int]]:
+    """Free/total bytes of the filesystem holding `path` (node-26#41).
+
+    /recordings is a bind mount of the host checkout, so this is the host disk
+    the recorder writes to and Docker's images/build cache live on. A full disk
+    stopped node-002 recording for 17 days while it still showed Online. Nulls
+    on error, so C2 overwrites a stale reading instead of keeping it.
+    """
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return {"disk_free_bytes": None, "disk_total_bytes": None}
+    return {"disk_free_bytes": usage.free, "disk_total_bytes": usage.total}
+
 
 CommandCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 ConfigCallback = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -372,6 +389,7 @@ class MQTTManager:
             count = devices.get("count") or None
         if count is not None:
             payload["sdr_count"] = count
+        payload.update(disk_report(settings.recordings_path))
         self._publish(self._t_checkin, payload, qos=1)
 
     def _publish(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):
