@@ -15,8 +15,8 @@ Failure classes (see `classify`):
 
   retry    network error, timeout, 5xx, 2xx with no URL (C2 accepted the
            request but storage failed), 401 (a reissued key is on its way
-           over MQTT/key pickup), 408, 429
-  reject   any other 4xx — 400 empty file, 403 not approved, 413 too large.
+           over MQTT/key pickup), 403 (not approved yet), 408, 429
+  reject   any other 4xx — 400 empty file, 413 too large.
            Retrying the same bytes cannot change the answer, so the file is
            deleted with an ERROR log naming the status.
 
@@ -54,7 +54,9 @@ from app.internal.logger import logger
 SIDECAR_SUFFIX = ".json"
 UPLOAD_TIMEOUT_SECONDS = 120.0
 # Statuses in the 4xx range that are worth retrying unchanged.
-RETRYABLE_4XX = {401, 408, 429}
+# 403 = node not approved yet: approval can arrive later, and the spool caps
+# bound what a never-approved node keeps.
+RETRYABLE_4XX = {401, 403, 408, 429}
 
 OK, RETRY, REJECT = "ok", "retry", "reject"
 

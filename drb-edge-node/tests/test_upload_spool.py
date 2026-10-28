@@ -61,7 +61,7 @@ def _spool(tmp_path: Path, uploader, clock=None, **kw) -> UploadSpool:
     (500, None, RETRY),
     (503, None, RETRY),
     (400, None, REJECT),
-    (403, None, REJECT),
+    (403, None, RETRY),      # not approved yet: approval may still come
     (413, None, REJECT),
 ])
 def test_classify(status, url, kind):
@@ -111,7 +111,7 @@ async def test_successful_upload_deletes_the_file(tmp_path, recorder, monkeypatc
 
 
 async def test_rejected_upload_is_not_spooled(tmp_path, recorder, monkeypatch):
-    _patch_post(monkeypatch, UploadResult(REJECT, status=403, detail="HTTP 403: Node is not approved"))
+    _patch_post(monkeypatch, UploadResult(REJECT, status=413, detail="HTTP 413: File too large"))
     path = _recording(tmp_path)
     assert await recorder.upload_recording(path, "call-1") is None
     assert not path.exists()
