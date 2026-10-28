@@ -51,6 +51,35 @@ services:
     volumes:
       - /dev:/dev
 
+  # Trunk Recorder (node-26#45) — the alternative recorder. Opt-in per node:
+  # it only starts when the node's .env has COMPOSE_PROFILES=trunk-recorder,
+  # and the edge-node only uses it with RECORDER_BACKEND=trunk-recorder. Set
+  # both or neither. Upstream image, pinned by tag AND digest (the digest is
+  # the multi-arch index for 5.2.1 on Docker Hub, amd64/arm64/arm/v7); bump
+  # both together. GPL-3.0: we ship it unmodified as a separate program —
+  # see trunk-recorder/README.md for the source offer.
+  #
+  # The edge-node writes ./configs/trunk-recorder/config.json; run.sh (our
+  # supervisor, replacing the image's CMD) restarts TR when it changes. It
+  # shares OP25's dongle slot, so op25 is never started on such a node.
+  trunk-recorder:
+    image: robotastic/trunk-recorder:5.2.1@sha256:c3e425858bfca16c609d8612808a83f06b0f376d950d11733d7c25b2a28f8866
+    profiles: ["trunk-recorder"]
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    # TR stages each transmission in tempDir (/dev/shm); Docker's 64 MB
+    # default is tight with several recorders running at once.
+    shm_size: 256m
+    entrypoint: ["/bin/sh", "/drb/run.sh"]
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./configs/trunk-recorder:/app
+      - ./recordings:/recordings
+      - ./trunk-recorder:/drb:ro
+
   edge-node:
     image: ${IMAGE_REGISTRY:-git.vpn.cusano.net}/${DOCKER_ORG:-logan}/${DOCKER_REPO:-node-26}/edge-node:${DRB_TAG_EDGE_NODE:-latest}
     build: ./drb-edge-node
