@@ -154,6 +154,22 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
             f"Not connected to {broker} — expected until the node is approved (the broker only admits approved nodes).",
             "Fixes itself once the node is approved and has its API key (see above).",
         ))
+    elif (f.get("mqtt_last_error") or {}).get("kind") == "refused":
+        err = f["mqtt_last_error"]
+        checks.append(_check(
+            "mqtt", "Live link (MQTT)", ERROR,
+            f"{broker} refused this node's login ({err.get('detail')}).",
+            "The API key on file is not the one the broker expects — every re-approval issues a new one. "
+            "Re-run install.sh to fetch the current key, or ask a DRB admin to re-approve the node.",
+        ))
+    elif (f.get("mqtt_last_error") or {}).get("kind") == "unreachable":
+        err = f["mqtt_last_error"]
+        checks.append(_check(
+            "mqtt", "Live link (MQTT)", ERROR,
+            f"Can't reach {broker} ({err.get('detail')}).",
+            f"Check this site's internet connection, DNS, and that outbound port {f['mqtt_port']} isn't "
+            "blocked by a firewall. The key is not the problem.",
+        ))
     else:
         checks.append(_check(
             "mqtt", "Live link (MQTT)", ERROR,
@@ -333,6 +349,7 @@ async def gather_facts() -> Dict[str, Any]:
         "c2_url": settings.c2_url,
         "has_api_key": bool(credentials.get_api_key()),
         "mqtt_connected": mqtt_manager.is_connected,
+        "mqtt_last_error": mqtt_manager.last_error,
         "mqtt_broker": settings.mqtt_broker,
         "mqtt_port": settings.mqtt_port,
         "sdr_count": sdr_count,

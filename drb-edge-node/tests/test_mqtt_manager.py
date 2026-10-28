@@ -153,3 +153,28 @@ def test_disk_report_nulls_when_path_unreadable(tmp_path):
     # node-26#41: nulls (not omitted keys) so C2 never keeps a stale reading.
     from app.internal.mqtt_manager import disk_report
     assert disk_report(str(tmp_path / "missing")) == {"disk_free_bytes": None, "disk_total_bytes": None}
+
+
+def test_last_error_records_refusal_and_clears_on_connect(monkeypatch):
+    """node-26#21: the refusal reason survives the disconnect that follows it."""
+    from unittest.mock import MagicMock
+    mqtt_manager._last_error = None
+    mqtt_manager._loop = None
+    mqtt_manager._on_connect(MagicMock(), None, None, 135, None)
+    mqtt_manager._on_disconnect(MagicMock(), None, None, 135, None)
+    assert mqtt_manager.last_error["kind"] == "refused"
+    monkeypatch.setattr(mqtt_manager, "_flush_offline_buffer", MagicMock())
+    monkeypatch.setattr(mqtt_manager, "_publish_checkin", MagicMock())
+    monkeypatch.setattr(mqtt_manager, "_maybe_request_key", MagicMock())
+    monkeypatch.setattr("asyncio.run_coroutine_threadsafe", lambda *a, **k: None)
+    mqtt_manager._on_connect(MagicMock(), None, None, 0, None)
+    assert mqtt_manager.last_error is None
+    mqtt_manager._connected = False
+
+
+def test_last_error_unreachable_from_connect_fail():
+    mqtt_manager._last_error = None
+    mqtt_manager._connected = False
+    mqtt_manager._on_connect_fail(None, None)
+    assert mqtt_manager.last_error["kind"] == "unreachable"
+    mqtt_manager._last_error = None
