@@ -419,6 +419,14 @@ class MQTTManager:
         last = spool["last_result"] or {}
         payload["last_upload_status"] = last.get("status")
         payload["last_upload_kind"] = last.get("kind")
+        # node-26#45: which recorder this node runs; C2 ignores unknown keys.
+        payload["recorder_backend"] = settings.recorder_backend
+        from app.internal import trunk_recorder as tr
+        if tr.enabled():
+            facts = tr.trunk_recorder.health_facts()
+            payload["tr_state"] = (facts["status"] or {}).get("state")
+            payload["tr_decode_rate"] = facts["decode_rate"]
+            payload["tr_inbox_backlog"] = facts["inbox_backlog"]
         self._publish(self._t_checkin, payload, qos=1)
 
     def _publish(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):

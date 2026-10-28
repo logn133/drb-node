@@ -83,7 +83,18 @@ async def set_sdr_settings(priority: Optional[Iterable[str]] = None,
         cfg.sdr_pins = normalize_sdr_pins(pins)
     save_node_config(cfg)
 
-    if cfg.sdr_pins.get("op25") != old_op25:
+    if cfg.sdr_pins.get("op25") != old_op25 and settings.recorder_backend == "trunk-recorder":
+        # Trunk Recorder takes the "op25" dongle (node-26#45): rewrite its
+        # config with the new serial; run.sh restarts it on the change.
+        from app.internal.health import active_config
+        from app.main import _generate_op25_config
+        await secondary_sdr_client.apply([], {}, [])
+        current = active_config(cfg)
+        if current is not None and await _generate_op25_config(current):
+            from app.internal import radio_backend
+            await radio_backend.start()  # waits until TR holds the new dongle
+        logger.info(f"Trunk Recorder moved to SDR {cfg.sdr_pins.get('op25') or 'rtl=0 (first dongle)'}")
+    elif cfg.sdr_pins.get("op25") != old_op25:
         from app.internal.op25_client import op25_client
         # Free the new dongle first if a decoder holds it, then move OP25.
         await secondary_sdr_client.apply([], {}, [])

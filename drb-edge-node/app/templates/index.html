@@ -142,6 +142,7 @@
     <audio id="player" controls preload="none">Your browser can't play the stream — use the direct link.</audio>
     <dl class="kv">
       <dt>Listening to</dt><dd id="now-system">—</dd>
+      <dt>Recorder</dt><dd id="now-backend">—</dd>
       <dt>Talkgroup</dt><dd id="now-tg">—</dd>
       <dt>Last heard</dt><dd id="now-heard">—</dd>
       <dt>Stream link</dt><dd><a id="stream-link" class="mono" href="#" target="_blank" rel="noopener">—</a></dd>
@@ -318,7 +319,8 @@
         ? `<span class="mono">TG ${esc(heard.tgid)}</span>${heard.name ? ' ' + esc(heard.name) : ''}` +
           ` · ${ago(heard.epoch)}${heard.freq ? ` · <span class="mono">${esc(mhz(heard.freq))}</span>` : ''}`
         : 'Nothing heard since the node started.';
-      const op = d.checks.find(c => c.id === 'op25');
+      // 'recorder' is the Trunk Recorder backend's check (node-26#45).
+      const op = d.checks.find(c => c.id === 'op25' || c.id === 'recorder');
       const src = d.checks.find(c => c.id === 'source');
       const running = op && op.state === 'ok';
       $('op25-start').disabled = running || (src && src.state !== 'ok');
@@ -340,6 +342,15 @@
       $('node-id').textContent = d.node_id || '';
       document.title = `${d.node_name || 'DRB Edge Node'} — DRB`;
       $('now-system').textContent = d.system_name ? `${d.system_name} (${d.system_kind || d.system_type})` : 'Nothing chosen yet';
+      const isTR = d.recorder_backend === 'trunk-recorder';
+      const trState = isTR && d.trunk_recorder && d.trunk_recorder.status ? d.trunk_recorder.status.state : null;
+      $('now-backend').textContent = isTR
+        ? `Trunk Recorder${trState ? ` (${trState.replace(/_/g, ' ')})` : ' (not running)'} — every talkgroup recorded at once`
+        : 'OP25 — one call at a time';
+      recorderName = isTR ? 'Trunk Recorder' : 'OP25';
+      $('op25-start').textContent = `Start ${recorderName}`;
+      $('op25-stop').textContent = `Stop ${recorderName}`;
+      if ($('op25-log').hidden) $('log-toggle').textContent = `Show ${recorderName} log`;
       $('now-tg').innerHTML = d.active_tgid
         ? `<span class="live">${esc(d.active_tgid_name || 'Talkgroup')}</span> <span class="mono">TG ${esc(d.active_tgid)}</span>`
         : 'No call right now';
@@ -374,7 +385,8 @@
     $('ack-btn').hidden = !(d.local_choice && d.has_c2_system && d.enforce_override_timeout);
   }
 
-  // ── OP25 controls + log ────────────────────────────────────────────────
+  // ── OP25 / Trunk Recorder controls + log ───────────────────────────────
+  let recorderName = 'OP25';
   async function op25(action) {
     $('op25-msg').className = 'msg';
     $('op25-msg').textContent = action === 'start' ? 'Starting…' : 'Stopping…';
@@ -391,19 +403,19 @@
     const pre = $('op25-log');
     try {
       const d = await api('/api/op25/log?lines=120');
-      pre.textContent = d.lines.length ? d.lines.join('\n') : 'OP25 has printed nothing since it last started.';
+      pre.textContent = d.lines.length ? d.lines.join('\n') : `${recorderName} has printed nothing since it last started.`;
     } catch (e) {
       pre.textContent = `Couldn't load the log: ${e.message}`;
     }
     pre.hidden = false;
-    $('log-toggle').textContent = 'Hide OP25 log';
+    $('log-toggle').textContent = `Hide ${recorderName} log`;
     $('log-toggle').setAttribute('aria-expanded', 'true');
   }
   function toggleLog() {
     const pre = $('op25-log');
     if (pre.hidden) return loadLog();
     pre.hidden = true;
-    $('log-toggle').textContent = 'Show OP25 log';
+    $('log-toggle').textContent = `Show ${recorderName} log`;
     $('log-toggle').setAttribute('aria-expanded', 'false');
   }
 

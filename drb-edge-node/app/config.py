@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Literal, Optional
 
 
 class Settings(BaseSettings):
@@ -169,6 +169,46 @@ class Settings(BaseSettings):
     # call close, so a black-holed C2 used to stall segmentation for the full
     # 120 s; a failure here just lands in the spool.
     upload_inline_timeout_seconds: float = 30.0
+
+    # ------------------------------------------------------------------
+    # Recorder backend (node-26#45)
+    #
+    #   op25            OP25 decodes, Liquidsoap mixes into PulseAudio, and
+    #                   call_recorder/metadata_watcher cut calls out of that
+    #                   one stream. The default; every existing node.
+    #   trunk-recorder  Trunk Recorder owns the SDR and records every grant at
+    #                   once, with call boundaries from the decoder. Its
+    #                   uploadScript drops each finished call in tr_inbox_dir
+    #                   and app/internal/trunk_recorder.py uploads it through
+    #                   the same spool. OP25 is never started (it would fight
+    #                   TR for the dongle) and the PulseAudio recorder stays
+    #                   off, so a call is never uploaded twice. Needs the
+    #                   compose profile too: COMPOSE_PROFILES=trunk-recorder.
+    # ------------------------------------------------------------------
+    recorder_backend: Literal["op25", "trunk-recorder"] = "op25"
+    # Shared with the trunk-recorder container (mounted there as /app):
+    # config.json, the CSVs, its logs, and the supervisor's status file.
+    tr_config_dir: Optional[str] = None  # default <config_path>/trunk-recorder
+    # Where TR's uploadScript hands over finished calls (default
+    # <recordings_path>/tr-inbox). Same bind mount in both containers.
+    tr_inbox_dir: Optional[str] = None
+    # Source (SDR) settings for the generated config. 2.4 Msps is the most an
+    # RTL-SDR does without dropping samples; ~2 MHz of it is usable.
+    tr_sample_rate: int = 2_400_000
+    tr_gain: float = 34.0  # dB; matches op25-container's rtl-sdr-v3 preset (lna:34)
+    tr_center_hz: Optional[int] = None  # override the computed centre frequency
+    # Simultaneous voice channels on a trunked system. Each costs CPU (on a
+    # Pi 4 roughly 4-6 is the ceiling); conventional channels get one each.
+    tr_digital_recorders: int = 4
+    # TR deletes calls shorter than this. Matches the key-up noise the old
+    # recorder's trim + all-silence check threw away.
+    tr_min_duration: float = 1.0
+    # Conventional squelch, absolute dB (TR has no noise squelch). Used when
+    # the system config gives no squelch_threshold. Needs hand tuning per site.
+    tr_squelch_db: float = -50.0
+    # simplestream UDP port for live audio (TR -> edge-node -> PulseAudio ->
+    # Discord). Local only.
+    tr_live_port: int = 9123
 
     # ------------------------------------------------------------------
     # Local dashboard / API authentication

@@ -168,10 +168,12 @@ async def on_command(payload: dict):
         except ValueError as e:
             logger.error(f"Rejected SDR settings from C2: {e}")
     elif action == "op25_restart":
-        from app.internal.op25_client import op25_client
-        await op25_client.stop()
+        # Restarts whichever recorder is active (node-26#45): C2 still calls
+        # it "Restart OP25".
+        from app.internal import radio_backend
+        await radio_backend.stop()
         await asyncio.sleep(2)
-        await op25_client.start()
+        await radio_backend.start()
     elif action == "node_update":
         # node-26#15: the container cannot (and must not) update itself. It
         # drops a sentinel in /configs; the host's drb-update.path unit
@@ -201,7 +203,14 @@ async def _generate_op25_config(config: SystemConfig) -> bool:
 
     Trunked / conventional / analog are told apart in radio_config (node-26#24);
     a system saved before that has no `mode` and is trunked, as it always was.
+
+    With RECORDER_BACKEND=trunk-recorder this writes Trunk Recorder's
+    config.json instead (node-26#45) — the one place every caller (C2 push,
+    dashboard, startup resume) goes through.
     """
+    from app.internal import trunk_recorder as tr
+    if tr.enabled():
+        return await tr.trunk_recorder.apply_config(config)
     from app.internal.op25_client import op25_client
     from app.internal.radio_config import build_generate_payload
     node_cfg = load_node_config()
@@ -264,19 +273,20 @@ async def on_config_push(payload: dict):
             logger.error(f"Ignoring invalid sdr_pins in config push: {e}")
     save_node_config(node_cfg)
 
-    from app.internal.op25_client import op25_client
+    from app.internal import radio_backend
     if not await _generate_op25_config(config):
-        logger.error(f"Failed to generate OP25 config for {config.name}")
+        logger.error(f"Failed to generate {radio_backend.name()} config for {config.name}")
         return
 
     # OP25's (pinned) dongle may be one a decoder holds right now: free the
     # spares, restart OP25 on its own dongle, then hand the rest back out.
+    # (Trunk Recorder takes the same dongle — node-26#45.)
     from app.internal.secondary_sdr_client import secondary_sdr_client
     from app.internal.sdr_settings import apply_secondaries
     await secondary_sdr_client.apply([], {}, [])
-    await op25_client.stop()
+    await radio_backend.stop()
     await asyncio.sleep(2)
-    await op25_client.start()
+    await radio_backend.start()
     logger.info(f"Config push applied: {config.name}")
     await apply_secondaries()
 
@@ -309,8 +319,21 @@ async def lifespan(app: FastAPI):
 
     # Start services (radio_bot starts when C2's retained discord/desired arrives)
     await mqtt_manager.connect()
-    await metadata_watcher.start()
-    await call_recorder.start()  # persistent PulseAudio ring buffer
+    from app.internal import radio_backend
+    from app.internal import trunk_recorder as tr
+    if tr.enabled():
+        # node-26#45: Trunk Recorder records; the OP25 watcher and the
+        # PulseAudio recorder stay off so no call is uploaded twice. Only the
+        # upload spool runs. OP25 is stopped in case it was running before the
+        # backend was switched — it would hold the SDR Trunk Recorder needs.
+        logger.info("Recorder backend: Trunk Recorder (OP25 and the PulseAudio recorder are off).")
+        from app.internal.op25_client import op25_client
+        await op25_client.stop()
+        await call_recorder.start(capture=False)
+        await tr.trunk_recorder.start()
+    else:
+        await metadata_watcher.start()
+        await call_recorder.start()  # persistent PulseAudio ring buffer
 
     # Start system caching in background
     from app.internal.system_cacher import fetch_and_cache_systems
@@ -330,13 +353,14 @@ async def lifespan(app: FastAPI):
     # not-yet-approved node listening to a system chosen on the local
     # dashboard (an override) must come back on it after a reboot too.
     if active_config:
-        from app.internal.op25_client import op25_client
-        logger.info("Node has a system to listen to — waiting for OP25 API then generating config.")
+        logger.info(f"Node has a system to listen to — generating the {radio_backend.name()} config.")
         for attempt in range(10):
             if await _generate_op25_config(active_config):
-                await op25_client.start()
+                # No wait at startup: the trunk-recorder container may still be
+                # coming up, and the app must start serving regardless.
+                await radio_backend.start(wait=False)
                 break
-            logger.warning(f"OP25 not ready yet (attempt {attempt + 1}/10), retrying in 3s…")
+            logger.warning(f"{radio_backend.name()} not ready yet (attempt {attempt + 1}/10), retrying in 3s…")
             await asyncio.sleep(3)
 
     # After op25 has claimed its dongle, so the decoders only get the spares.
@@ -355,6 +379,7 @@ async def lifespan(app: FastAPI):
     heartbeat_task.cancel()
     telemetry_task.cancel()
     await metadata_watcher.stop()
+    await tr.trunk_recorder.stop()
     await call_recorder.stop()
     await radio_bot.stop()
     await mqtt_manager.disconnect()

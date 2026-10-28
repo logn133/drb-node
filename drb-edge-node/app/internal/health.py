@@ -8,6 +8,10 @@ answers one of those for one link in the chain
     password -> C2 enrollment -> MQTT -> SDR -> what to listen to -> OP25
              -> decoding -> audio (PulseAudio) -> local stream (Icecast)
 
+With RECORDER_BACKEND=trunk-recorder (node-26#45) the last four are replaced
+by Trunk Recorder's: supervisor state, control-channel decode rate (from its
+log), recordings handed over, and the live feed to Discord.
+
 `gather_facts()` does the I/O; `build_checks()` is a pure function of those
 facts so every state (unapproved, no SDR, OP25 crashed, …) is unit-testable.
 
@@ -208,6 +212,10 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
         kind = "P25 conventional" if src.get("mode") == "conventional" else src["type"]
         checks.append(_check("source", "What to listen to", OK, f"{src['name']} ({kind}) — {origin}."))
 
+    if f.get("backend") == "trunk-recorder":
+        checks.extend(_trunk_recorder_checks(f, src, now))
+        return checks
+
     # 6. OP25
     op25 = f.get("op25_status")
     running = op25 == "running"
@@ -302,6 +310,104 @@ def build_checks(f: Dict[str, Any]) -> List[Dict[str, str]]:
     return checks
 
 
+def _trunk_recorder_checks(f: Dict[str, Any], src: Optional[Dict[str, Any]], now: float) -> List[Dict[str, str]]:
+    """Checks 6-9 when Trunk Recorder is the recorder (node-26#45)."""
+    tr = f.get("tr") or {}
+    checks: List[Dict[str, str]] = []
+    status = tr.get("status")
+    state = (status or {}).get("state")
+    running = False
+    label = "Radio recorder (Trunk Recorder)"
+    if tr.get("config_error"):
+        checks.append(_check(
+            "recorder", label, ERROR, f"Couldn't build its config — {tr['config_error']}",
+            "Fix the system's channel list (or TR_* settings in .env); the node retries on the next config push.",
+        ))
+    elif status is None:
+        checks.append(_check(
+            "recorder", label, ERROR, "The trunk-recorder service isn't running.",
+            "Set COMPOSE_PROFILES=trunk-recorder in the node's .env, then run `docker compose up -d`.",
+        ))
+    elif status.get("stale"):
+        checks.append(_check(
+            "recorder", label, ERROR, f"Its supervisor stopped reporting {_ago(status.get('age_seconds') or 0)}.",
+            "Check the trunk-recorder container: `docker compose logs trunk-recorder`.",
+        ))
+    elif state == "running":
+        running = True
+        up = now - float(status.get("started_at") or now)
+        restarts = int(status.get("restarts") or 0)
+        checks.append(_check(
+            "recorder", label, OK if restarts < 3 else WARN,
+            f"Running for {_ago(up).replace(' ago', '')}"
+            + (f" — restarted {restarts} times since the container started." if restarts else "."),
+            "" if restarts < 3 else "Frequent restarts: `docker compose logs trunk-recorder` says why.",
+        ))
+    elif state == "crashed":
+        checks.append(_check(
+            "recorder", label, ERROR, f"Exited (code {status.get('last_exit')}) — restarting.",
+            "Usually the SDR is unplugged or held by another program. `docker compose logs trunk-recorder`.",
+        ))
+    elif state == "stopped":
+        checks.append(_check("recorder", label, WARN, "Stopped from the dashboard.", "Press Start."))
+    elif not src:
+        checks.append(_check("recorder", label, OFF, "Waiting — choose what to listen to first."))
+    else:
+        checks.append(_check("recorder", label, WARN, "Waiting for its config…"))
+
+    mode = (src or {}).get("mode")
+    if not running:
+        checks.append(_check("decode", "Decoding", OFF, "Starts when Trunk Recorder runs."))
+    elif mode == "trunked":
+        rate = tr.get("decode_rate")
+        age = tr.get("log_age_seconds")
+        if rate is None or age is None or age > 30:
+            checks.append(_check(
+                "decode", "Decoding", WARN, "No control-channel report from Trunk Recorder yet.",
+                "Give it 30 seconds after a start; if it stays, `docker compose logs trunk-recorder`.",
+            ))
+        elif rate > 0:
+            checks.append(_check("decode", "Decoding", OK, f"Decoding the control channel ({rate:g} messages/sec)."))
+        else:
+            checks.append(_check(
+                "decode", "Decoding", ERROR, "Not decoding the control channel (0 messages/sec).",
+                "Usually a wrong control-channel frequency, a weak signal/antenna, or SDR frequency error (PPM).",
+            ))
+    else:
+        checks.append(_check(
+            "decode", "Decoding", OK, "Listening (conventional) — channels record when their squelch opens.",
+            "If calls never arrive through a busy period, the squelch (TR_SQUELCH_DB or the system's "
+            "squelch_threshold) may be set too high.",
+        ))
+
+    last = tr.get("last_call_epoch")
+    backlog = int(tr.get("inbox_backlog") or 0)
+    if not running and not last:
+        checks.append(_check("audio", "Recordings", OFF, "Nothing recorded yet."))
+    elif backlog > 20:
+        checks.append(_check(
+            "audio", "Recordings", WARN, f"{backlog} finished calls waiting to be sent.",
+            "Normal for a minute after the server link comes back; if it keeps growing, check the C2 link.",
+        ))
+    elif last:
+        extra = f", {tr['encrypted_skipped']} encrypted skipped" if tr.get("encrypted_skipped") else ""
+        checks.append(_check(
+            "audio", "Recordings", OK,
+            f"Last call {_ago(now - last)} ({tr.get('calls_ingested', 0)} since start{extra}).",
+        ))
+    else:
+        checks.append(_check("audio", "Recordings", OK, "Recorder up — no call yet."))
+
+    live = tr.get("live") or {}
+    heard = live.get("last_packet_epoch")
+    checks.append(_check(
+        "stream", "Live audio", OK if heard else OFF,
+        ("Feeding Discord — last audio " + _ago(now - heard) + "." if heard else "Feeds Discord once a call is heard.")
+        + " The local browser stream isn't available with Trunk Recorder.",
+    ))
+    return checks
+
+
 async def icecast_live() -> Optional[bool]:
     """True if the configured mount has a source, False if not, None if Icecast is down."""
     url = f"http://{settings.icecast_host}:{settings.icecast_port}/status-json.xsl"
@@ -342,8 +448,11 @@ async def gather_facts() -> Dict[str, Any]:
             sdr_count = op25_devs["count"]
 
     activity = call_recorder.audio_activity()
+    from app.internal import trunk_recorder as tr
     return {
         "now": time.time(),
+        "backend": settings.recorder_backend,
+        "tr": tr.trunk_recorder.health_facts() if tr.enabled() else None,
         "node_id": settings.node_id,
         "default_password": auth.is_using_default_password(),
         "c2_url": settings.c2_url,

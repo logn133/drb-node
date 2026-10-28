@@ -97,7 +97,16 @@ async def get_status():
         "icecast_port": settings.icecast_port,
         "icecast_mount": settings.icecast_mount,
         "op25": op25_status,
+        # Which recorder is live (node-26#45) and, for Trunk Recorder, its
+        # supervisor state / decode rate / handed-over calls.
+        "recorder_backend": settings.recorder_backend,
+        "trunk_recorder": _tr_facts(),
     }
+
+
+def _tr_facts():
+    from app.internal import trunk_recorder as tr
+    return tr.trunk_recorder.health_facts() if tr.enabled() else None
 
 
 @router.get("/health")
@@ -110,7 +119,9 @@ async def get_health():
 
 @router.post("/op25/start")
 async def start_op25():
-    err = await op25_client.start_with_reason()
+    # The active recorder (node-26#45) — the dashboard's Start button.
+    from app.internal import radio_backend
+    err = await radio_backend.start_with_reason()
     if err:
         raise HTTPException(502, err)
     return {"ok": True}
@@ -118,14 +129,18 @@ async def start_op25():
 
 @router.post("/op25/stop")
 async def stop_op25():
-    ok = await op25_client.stop()
+    from app.internal import radio_backend
+    ok = await radio_backend.stop()
     if not ok:
-        raise HTTPException(502, "The op25 container did not answer the stop request.")
+        raise HTTPException(502, f"{radio_backend.name()} did not accept the stop request.")
     return {"ok": True}
 
 
 @router.get("/op25/log")
 async def op25_log(lines: int = 80):
+    from app.internal import trunk_recorder as tr
+    if tr.enabled():
+        return {"lines": tr.trunk_recorder.log_tail(lines)}
     out = await op25_client.log(lines)
     if out is None:
         raise HTTPException(502, "The op25 container isn't answering.")
@@ -138,17 +153,22 @@ async def get_config():
 
 
 async def _restart_op25_with(config: SystemConfig) -> None:
-    """Generate OP25's config for `config` and restart OP25 on it."""
+    """Generate the active recorder's config for `config` and restart it on it."""
     from app.main import _generate_op25_config
+    from app.internal import radio_backend
     if not await _generate_op25_config(config):
+        from app.internal import trunk_recorder as tr
+        if tr.enabled():
+            detail = tr.trunk_recorder.config_error or f"Trunk Recorder config for {config.name} failed."
+            raise HTTPException(502, detail)
         raise HTTPException(
             502, f"The op25 container did not accept the config for {config.name} — is it running?",
         )
-    await op25_client.stop()
+    await radio_backend.stop()
     await asyncio.sleep(2)
-    err = await op25_client.start_with_reason()
+    err = await radio_backend.start_with_reason()
     if err:
-        raise HTTPException(502, f"Config saved, but OP25 did not start: {err}")
+        raise HTTPException(502, f"Config saved, but {radio_backend.name()} did not start: {err}")
 
 
 async def _apply_override(config: SystemConfig) -> None:
@@ -350,7 +370,8 @@ async def revert_config():
     else:
         # Nothing from C2 to go back to: stop rather than keep decoding a
         # system the dashboard now says is cleared.
-        await op25_client.stop()
+        from app.internal import radio_backend
+        await radio_backend.stop()
 
     if mqtt_manager.is_connected:
         await mqtt_manager.publish_checkin()
