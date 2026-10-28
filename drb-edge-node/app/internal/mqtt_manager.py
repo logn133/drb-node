@@ -411,6 +411,14 @@ class MQTTManager:
         if count is not None:
             payload["sdr_count"] = count
         payload.update(disk_report(settings.recordings_path))
+        # Upload spool depth + last upload outcome (node-26#44, toward #40).
+        from app.internal.call_recorder import call_recorder
+        spool = call_recorder.spool.stats()
+        payload["upload_spool_files"] = spool["files"]
+        payload["upload_spool_bytes"] = spool["bytes"]
+        last = spool["last_result"] or {}
+        payload["last_upload_status"] = last.get("status")
+        payload["last_upload_kind"] = last.get("kind")
         self._publish(self._t_checkin, payload, qos=1)
 
     def _publish(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):

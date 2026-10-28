@@ -82,6 +82,9 @@ async def get_status():
         # it was discarded rather than uploaded. Non-zero means either the
         # console is not decoding or something else is feeding drb_sink.
         "unattributed_segments": metadata_watcher.unattributed_segments,
+        # Recordings whose upload to C2 failed and are waiting for a retry
+        # (node-26#44), plus the outcome of the most recent upload attempt.
+        "upload_spool": call_recorder.spool.stats(),
         "active_tgid": active_tgid,
         "active_tgid_name": active_tgid_name,
         "active_call_id": metadata_watcher.active_call_id,

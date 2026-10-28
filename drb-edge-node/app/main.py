@@ -111,8 +111,20 @@ async def on_call_end(data: dict):
         )
         if audio_url:
             data["audio_url"] = audio_url
-        else:
-            logger.error(f"Audio upload failed for call {data['call_id']}. Verify C2_URL and Node API Key.")
+        elif settings.c2_url:
+            last = call_recorder.spool.last_result or {}
+            if last.get("kind") == "lost":
+                data["audio_upload"] = "lost"
+            elif last.get("kind") == "retry":
+                # The file is in the upload spool and will be retried; C2 attaches
+                # it to this call_id whenever it lands (node-26#44).
+                data["audio_upload"] = "spooled"
+            else:
+                data["audio_upload"] = "rejected"
+                logger.error(
+                    f"Audio upload for call {data['call_id']} was rejected ({last.get('detail')}). "
+                    "Verify the node is approved and its API key is current."
+                )
     elif recording is not None and recording.all_silence:
         # Explicit policy: an all-silence recording is not uploaded. It has no
         # transcript value and silence is what makes Whisper invent text.
@@ -179,6 +191,8 @@ async def on_api_key(payload: dict):
     if key:
         credentials.save_api_key(key)
         mqtt_manager.update_api_key(key)
+        # Uploads spooled on a 401 can go now rather than at their next backoff.
+        call_recorder.spool.wake()
         logger.info("Node API key received and saved.")
 
 

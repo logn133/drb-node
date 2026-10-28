@@ -153,6 +153,23 @@ class Settings(BaseSettings):
     # Offline call buffer — how many call_end events to keep while disconnected
     offline_call_buffer_size: int = 35
 
+    # Upload spool (node-26#44) — recordings whose upload to C2 failed are kept
+    # here and retried instead of deleted. Defaults to <recordings_path>/spool,
+    # i.e. on the host disk via the /recordings bind mount, so it survives a
+    # restart. Bounded both ways because a full host disk stops recording
+    # outright (node-26#41): FLAC is ~1.3 MB per minute of audio, so 512 MiB is
+    # roughly 6 h of continuous traffic. Oldest entries are evicted first.
+    upload_spool_dir: Optional[str] = None
+    upload_spool_max_bytes: int = 512 * 1024 * 1024
+    upload_spool_max_age_hours: float = 72.0
+    # Exponential backoff between retries of one spooled recording.
+    upload_retry_min_seconds: float = 15.0
+    upload_retry_max_seconds: float = 600.0
+    # Timeout for the FIRST, inline upload attempt. metadata_watcher awaits the
+    # call close, so a black-holed C2 used to stall segmentation for the full
+    # 120 s; a failure here just lands in the spool.
+    upload_inline_timeout_seconds: float = 30.0
+
     # ------------------------------------------------------------------
     # Local dashboard / API authentication
     #
