@@ -71,6 +71,18 @@ class UploadMeta:
     system_id: Optional[str] = None
     audio_start_epoch: Optional[float] = None
     audio_end_epoch: Optional[float] = None
+    # Further form fields, sent as-is (Trunk Recorder calls carry units,
+    # emergency, encryption — node-26#45). Kept in the sidecar like the rest.
+    extra: Optional[Dict[str, str]] = None
+
+
+# By extension, so a spooled file is re-sent with the type it was first sent
+# with — the PulseAudio recorder writes FLAC, Trunk Recorder WAV.
+AUDIO_MIME_BY_SUFFIX = {".flac": "audio/flac", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4"}
+
+
+def mime_for(path: Path, default: str = "application/octet-stream") -> str:
+    return AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), default)
 
 
 @dataclass
@@ -108,6 +120,9 @@ def _form(meta: UploadMeta) -> Dict[str, str]:
         form["audio_start_epoch"] = f"{meta.audio_start_epoch:.3f}"
     if meta.audio_end_epoch is not None:
         form["audio_end_epoch"] = f"{meta.audio_end_epoch:.3f}"
+    for key, value in (meta.extra or {}).items():
+        if value is not None and key not in form:
+            form[key] = str(value)
     return form
 
 

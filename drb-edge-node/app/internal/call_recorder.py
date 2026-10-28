@@ -64,7 +64,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.internal import audio_trim, pcm, pulse, upload_spool
@@ -335,10 +335,15 @@ class CallRecorder:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
-        """Start the persistent capture. Call once from app lifespan."""
-        self._stream_task = asyncio.create_task(self._capture_loop())
-        logger.info("PulseAudio ring-buffer starting.")
+    async def start(self, capture: bool = True) -> None:
+        """Start the persistent capture. Call once from app lifespan.
+
+        capture=False starts only the upload spool: with the trunk-recorder
+        backend (node-26#45) TR does the recording, and a second recorder on
+        the same audio would upload every call twice."""
+        if capture:
+            self._stream_task = asyncio.create_task(self._capture_loop())
+            logger.info("PulseAudio ring-buffer starting.")
         if settings.c2_url:
             self.spool.start()
 
@@ -766,14 +771,15 @@ class CallRecorder:
     # ------------------------------------------------------------------
 
     async def _post(self, file_path: Path, meta: UploadMeta) -> UploadResult:
-        return await upload_spool.post_recording(file_path, meta, AUDIO_MIME)
+        return await upload_spool.post_recording(file_path, meta, upload_spool.mime_for(file_path, AUDIO_MIME))
 
     async def _post_inline(self, file_path: Path, meta: UploadMeta) -> UploadResult:
         # metadata_watcher awaits on_call_end, so this attempt blocks the poll
         # loop. With the spool behind it, it can afford a short timeout; the
         # background retries get the full UPLOAD_TIMEOUT_SECONDS.
         return await upload_spool.post_recording(
-            file_path, meta, AUDIO_MIME, timeout=settings.upload_inline_timeout_seconds,
+            file_path, meta, upload_spool.mime_for(file_path, AUDIO_MIME),
+            timeout=settings.upload_inline_timeout_seconds,
         )
 
     async def upload_recording(
@@ -785,6 +791,7 @@ class CallRecorder:
         system_id: Optional[str] = None,
         audio_start_epoch: Optional[float] = None,
         audio_end_epoch: Optional[float] = None,
+        extra: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         """
         Upload once, inline. Returns the storage URL on success.
@@ -802,6 +809,7 @@ class CallRecorder:
         meta = UploadMeta(
             call_id=call_id, talkgroup_id=talkgroup_id, talkgroup_name=talkgroup_name,
             system_id=system_id, audio_start_epoch=audio_start_epoch, audio_end_epoch=audio_end_epoch,
+            extra=extra,
         )
         result = await self._post_inline(file_path, meta)
         self.spool.last_result = {"call_id": call_id, "kind": result.kind, "status": result.status,
