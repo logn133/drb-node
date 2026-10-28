@@ -263,6 +263,18 @@ async def test_local_pause_logs_out_until_next_desired(env):
     assert env.mgr.is_connected
 
 
+async def test_retained_redelivery_does_not_undo_local_pause(env):
+    """node-26#34: the broker redelivers the retained desired message (same
+    seq) on every reconnect; that must not log the bots back in."""
+    await env.mgr.apply_desired(_desired(4, (1, 11, "t1")))
+    await env.mgr.pause_locally()
+    await env.mgr.apply_desired(_desired(4, (1, 11, "t1")))
+    assert not env.mgr.is_connected
+    assert env.published[-1]["streams"]["1:11"]["state"] == "paused_locally"
+    await env.mgr.apply_desired(_desired(5, (1, 11, "t1")))
+    assert env.mgr.is_connected
+
+
 async def test_no_message_content_intent_on_real_client():
     client = discord_radio._default_client_factory()
     try:

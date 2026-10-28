@@ -183,6 +183,10 @@ class RadioManager:
         self._mqtt_down_since: Optional[float] = None
         self._failsafe = False
         self._paused = False
+        # The applied seq at the moment of a local pause (node-26#34). The
+        # broker redelivers the retained desired message on every reconnect
+        # with the SAME seq; only a strictly newer seq from C2 lifts the pause.
+        self._paused_at_seq: Optional[int] = None
         self._ticks = 0
 
     # ------------------------------------------------------------------
@@ -210,15 +214,25 @@ class RadioManager:
                 logger.error(f"Malformed Discord desired stream entry ignored: {s!r}")
         self._ensure_watchdog()
         self._desired = wanted
-        self._paused = False
+        if self._paused and self._redelivery_of_paused_state(seq):
+            logger.info(f"Discord desired seq {seq} is a redelivery — staying paused locally.")
+        else:
+            self._paused = False
+            self._paused_at_seq = None
         await self.reconcile()
         if seq is not None:
             self._applied_seq = seq
         await self.publish_actual()
 
+    def _redelivery_of_paused_state(self, seq: Optional[int]) -> bool:
+        """True when `seq` is not newer than what was applied at pause time."""
+        return seq is not None and self._paused_at_seq is not None and seq <= self._paused_at_seq
+
     async def pause_locally(self) -> None:
-        """Local-dashboard stop: log every bot out until C2 sends a new list."""
+        """Local-dashboard stop: log every bot out until C2 sends a NEW list
+        (a seq strictly greater than the one applied now — node-26#34)."""
         self._paused = True
+        self._paused_at_seq = self._applied_seq
         await self.reconcile()
         await self.publish_actual()
 
