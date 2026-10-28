@@ -123,7 +123,7 @@ async def on_call_end(data: dict):
                 data["audio_upload"] = "rejected"
                 logger.error(
                     f"Audio upload for call {data['call_id']} was rejected ({last.get('detail')}). "
-                    "Verify the node is approved and its API key is current."
+                    "C2 refused this recording (malformed request or file too large); it was not kept."
                 )
     elif recording is not None and recording.all_silence:
         # Explicit policy: an all-silence recording is not uploaded. It has no
