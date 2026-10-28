@@ -17,8 +17,16 @@ RUN apt-get update && \
 # Install custom PulseAudio system config (enables anonymous access for edge-node)
 COPY system.pa /etc/pulse/system.pa
 
-# Clone the boatbod op25 repository
-RUN git clone -b gr310 https://github.com/boatbod/op25 /op25
+# Clone the boatbod op25 repository, PINNED (node-26#29, #46). An unpinned
+# clone plus CI's layer cache meant the image held whatever gr310 HEAD was at
+# the last cache miss. 5b58335 (gr310, 2026-08-23) is the commit tk_drb_conv
+# was verified against for node-26#29 and the first gr310 merge that carries
+# the 2026-08-03 NBFM noise/voice squelch (PR #296, op25_nbfm.py
+# nbfm_squelch_mode). Bump deliberately, re-checking tk_drb_conv against
+# tk_p25.py at the new commit.
+ARG OP25_COMMIT=5b583357240e0172bfae905f0c966474e0d0f094
+RUN git clone -b gr310 https://github.com/boatbod/op25 /op25 && \
+    git -C /op25 checkout --detach "${OP25_COMMIT}"
 
 # Set the working directory
 WORKDIR /op25

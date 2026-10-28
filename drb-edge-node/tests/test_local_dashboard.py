@@ -229,6 +229,17 @@ def test_listen_analog_single_frequency(client, op25):
     assert r.status_code == 200, r.text
     cfg = config_manager.load_node_config().override_config
     assert (cfg.type, cfg.name, cfg.config["control_channels"]) == ("NBFM", "Fire", [154.43])
+    assert cfg.config["squelch_mode"] == "noise"   # node-26#46 default
+
+
+def test_listen_analog_squelch_is_saved(client, op25):
+    r = client.post("/api/listen", json={"mode": "analog", "frequencies": [154.43],
+                                         "squelch_mode": "power", "squelch_threshold": -55})
+    assert r.status_code == 200, r.text
+    cfg = config_manager.load_node_config().override_config.config
+    assert (cfg["squelch_mode"], cfg["squelch_threshold"]) == ("power", -55)
+    assert client.post("/api/listen", json={"mode": "analog", "frequencies": [154.43],
+                                            "squelch_mode": "loud"}).status_code == 422
 
 
 def test_listen_p25_conventional(client, op25):

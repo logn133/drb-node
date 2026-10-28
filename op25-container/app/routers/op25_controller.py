@@ -262,6 +262,8 @@ def create_op25_router():
                     frequency=freq,
                     meta_stream_name="",
                     nbfm_squelch_threshold=generator.nbfm_squelch,
+                    nbfm_squelch_mode=generator.nbfm_squelch_mode.value,
+                    nbfm_noise_squelch_db=generator.nbfm_noise_squelch_db,
                 )]
                 devices = [DeviceConfig(
                     gains=preset["gains"], ppm=ppm, tunable=False,

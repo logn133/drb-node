@@ -208,6 +208,12 @@ class ListenBody(BaseModel):
     frequencies: List[float] = []
     talkgroups: List[Talkgroup] = []       # p25 only; empty = every talkgroup
     nac: Optional[str] = None              # p25conv only, hex; empty = any NAC
+    # analog only (node-26#46): OP25 squelch. noise (default) needs no
+    # calibration; squelch_db = dB of quieting to open (OP25 default 8);
+    # squelch_threshold = absolute dB for power mode (OP25 default -60).
+    squelch_mode: Optional[Literal["noise", "voice", "power"]] = None
+    squelch_db: Optional[float] = None
+    squelch_threshold: Optional[float] = None
 
 
 # RTL-SDR (R820T/R828D) tuning range.
@@ -242,14 +248,21 @@ async def listen(body: ListenBody):
         else:
             is_p25 = body.mode == "p25"
             label = (body.name or "").strip() or (f"P25 {first} MHz" if is_p25 else f"Analog {first} MHz")
+            sys_config = {
+                "control_channels": freqs,
+                "talkgroups": [tg.model_dump() for tg in body.talkgroups] if is_p25 else [],
+            }
+            if not is_p25:
+                sys_config["squelch_mode"] = body.squelch_mode or "noise"
+                if body.squelch_db is not None:
+                    sys_config["squelch_db"] = body.squelch_db
+                if body.squelch_threshold is not None:
+                    sys_config["squelch_threshold"] = body.squelch_threshold
             config = SystemConfig(
                 system_id=f"local-{body.mode}",
                 name=label,
                 type="P25" if is_p25 else "NBFM",
-                config={
-                    "control_channels": freqs,
-                    "talkgroups": [tg.model_dump() for tg in body.talkgroups] if is_p25 else [],
-                },
+                config=sys_config,
             )
     await _apply_override(config)
     return {"ok": True, "name": config.name}

@@ -9,7 +9,11 @@ C2 system documents (the `config` blob is passed through untouched):
     P25 conventional  type "P25", config.mode "conventional",
                       config.channels = [{freq: MHz, name, nac?}, ...]   (node-26#24)
     Analog            type "NBFM", config.channels = [{freq, name}] — or, from
-                      before #24, config.control_channels[0]
+                      before #24, config.control_channels[0]. Optional squelch
+                      (node-26#46): config.squelch_mode "noise" (default) |
+                      "voice" | "power", config.squelch_db (noise/voice: dB
+                      of quieting to open) and config.squelch_threshold
+                      (power: absolute dB, OP25 default -60)
 
 A missing mode is trunked, so every system saved before #24 behaves exactly as
 it did. Pure functions; main._generate_op25_config does the I/O.
@@ -80,6 +84,41 @@ def conventional_channels(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+SQUELCH_MODES = ("noise", "voice", "power")
+DEFAULT_SQUELCH_MODE = "noise"
+
+
+def _optional_float(config: Dict[str, Any], key: str) -> Optional[float]:
+    value = (config or {}).get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} {value!r} isn't a number.")
+
+
+def analog_squelch(config: Dict[str, Any]) -> Dict[str, Any]:
+    """config -> the op25-container squelch fields for an analog channel.
+
+    Noise squelch by default (node-26#46): OP25's power squelch compares an
+    absolute level that depends on dongle, gain and antenna, and left analog
+    open on static; noise squelch measures FM quieting and needs no
+    calibration. A config that says nothing gets noise mode.
+    """
+    mode = str((config or {}).get("squelch_mode") or DEFAULT_SQUELCH_MODE).strip().lower()
+    if mode not in SQUELCH_MODES:
+        raise ValueError(f"Squelch mode {mode!r} isn't one of {', '.join(SQUELCH_MODES)}.")
+    out: Dict[str, Any] = {"nbfm_squelch_mode": mode}
+    db = _optional_float(config, "squelch_db")
+    if db is not None:
+        out["nbfm_noise_squelch_db"] = db
+    threshold = _optional_float(config, "squelch_threshold")
+    if threshold is not None:
+        out["nbfm_squelch"] = threshold
+    return out
+
+
 def analog_frequency(config: Dict[str, Any]) -> Optional[int]:
     chans = (config or {}).get("channels") or []
     if chans and isinstance(chans[0], dict) and chans[0].get("freq") not in (None, ""):
@@ -117,6 +156,7 @@ def build_generate_payload(
     if mode == ANALOG:
         freq = analog_frequency(config)
         payload["channels"] = [freq] if freq else []
+        payload.update(analog_squelch(config))
         return payload
 
     talkgroups = (config or {}).get("talkgroups", []) or []
