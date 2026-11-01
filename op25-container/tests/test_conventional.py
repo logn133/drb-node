@@ -149,6 +149,23 @@ def test_generate_config_route(tmp_path, monkeypatch):
     cfg = json.loads((tmp_path / "active.cfg.json").read_text())
     assert cfg["trunking"]["module"] == "tk_drb_conv.py"
     assert cfg["channels"][0]["frequency"] == 154430000
+    # node-26#46: analog defaults to OP25's noise squelch, not power.
+    assert cfg["channels"][0]["nbfm_squelch_mode"] == "noise"
+    assert "nbfm_noise_squelch_db" not in cfg["channels"][0]
+
+    r = client.post("/op25/generate-config", json={
+        "type": "NBFM", "systemName": "Fire", "channels": [154430000], "icecastConfig": ice,
+        "nbfm_squelch_mode": "power", "nbfm_squelch": -55, "nbfm_noise_squelch_db": 12,
+    })
+    assert r.status_code == 200, r.text
+    ch = json.loads((tmp_path / "active.cfg.json").read_text())["channels"][0]
+    assert ch["nbfm_squelch_mode"] == "power" and ch["nbfm_squelch_threshold"] == -55
+    assert ch["nbfm_noise_squelch_db"] == 12
+
+    r = client.post("/op25/generate-config", json={
+        "type": "NBFM", "systemName": "Fire", "channels": [154430000], "nbfm_squelch_mode": "loud",
+    })
+    assert r.status_code == 422
 
 
 # ---------------------------------------------------------------------------

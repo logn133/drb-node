@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import time
 from datetime import datetime, timezone
 from collections import deque
 from typing import Optional, Callable, Awaitable, Dict, Any
@@ -60,6 +61,12 @@ class MQTTManager:
         # install.sh writing the file). Recovery compares against this.
         self._client_key: Optional[str] = None
         self._recovery_task: Optional[asyncio.Task] = None
+        # Why the link is down, for the dashboard (node-26#21): "refused" (the
+        # broker answered and said no), "unreachable" (TCP/TLS never got that
+        # far) or "disconnected" (an established session dropped). Cleared on
+        # every successful connect. Set from paho's thread as well as the event
+        # loop — a single attribute rebind, so no lock.
+        self._last_error: Optional[Dict[str, Any]] = None
 
         self.on_command: Optional[CommandCallback] = None
         self.on_config_push: Optional[ConfigCallback] = None
@@ -146,12 +153,21 @@ class MQTTManager:
         client.reconnect_delay_set(min_delay=2, max_delay=60)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
+        client.on_connect_fail = self._on_connect_fail
         client.on_message = self._on_message
         return client
+
+    def _set_error(self, kind: str, detail: str) -> None:
+        self._last_error = {"kind": kind, "detail": detail, "epoch": time.time()}
+
+    def _on_connect_fail(self, client, userdata):
+        # paho's own reconnect (after loop_start) could not open the socket.
+        self._set_error("unreachable", f"cannot reach {settings.mqtt_broker}:{settings.mqtt_port}")
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             self._connected = True
+            self._last_error = None
             client.subscribe(self._t_commands, qos=1)
             client.subscribe(self._t_config, qos=1)
             client.subscribe(self._t_discord_desired, qos=1)
@@ -164,6 +180,7 @@ class MQTTManager:
             asyncio.run_coroutine_threadsafe(self._flush_offline_buffer(), self._loop)
         else:
             logger.error(f"MQTT connect refused: {reason_code}")
+            self._set_error("refused", str(reason_code))
             if _is_auth_failure(reason_code) and self._loop is not None:
                 # paho thread -> event loop. A refused login never fixes itself
                 # by retrying the same password, so go get the right one.
@@ -172,6 +189,9 @@ class MQTTManager:
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         self._connected = False
         logger.warning(f"MQTT disconnected: {reason_code}")
+        # A refusal is followed by a disconnect; keep the more specific reason.
+        if self._last_error is None:
+            self._set_error("disconnected", str(reason_code))
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -273,6 +293,7 @@ class MQTTManager:
                 return
             except Exception as e:
                 logger.warning(f"MQTT connect failed ({e}) — retrying in {delay}s")
+                self._set_error("unreachable", f"cannot reach {settings.mqtt_broker}:{settings.mqtt_port}: {e}")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
@@ -390,6 +411,14 @@ class MQTTManager:
         if count is not None:
             payload["sdr_count"] = count
         payload.update(disk_report(settings.recordings_path))
+        # Upload spool depth + last upload outcome (node-26#44, toward #40).
+        from app.internal.call_recorder import call_recorder
+        spool = call_recorder.spool.stats()
+        payload["upload_spool_files"] = spool["files"]
+        payload["upload_spool_bytes"] = spool["bytes"]
+        last = spool["last_result"] or {}
+        payload["last_upload_status"] = last.get("status")
+        payload["last_upload_kind"] = last.get("kind")
         self._publish(self._t_checkin, payload, qos=1)
 
     def _publish(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):
@@ -407,6 +436,11 @@ class MQTTManager:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def last_error(self) -> Optional[Dict[str, Any]]:
+        """{kind, detail, epoch} for the most recent failure, None while connected."""
+        return None if self._connected else self._last_error
 
 
 mqtt_manager = MQTTManager()

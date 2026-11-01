@@ -100,6 +100,17 @@ def test_key_on_disk_but_mqtt_down_says_restart():
     assert "restart the edge-node container" in c["mqtt"]["action"]
 
 
+def test_mqtt_refused_vs_unreachable_are_told_apart():
+    """node-26#21: 'not authorised' and 'can't reach the broker' need different fixes."""
+    refused = _by_id(health.build_checks(_facts(
+        mqtt_connected=False, mqtt_last_error={"kind": "refused", "detail": "Not authorized", "epoch": 1.0})))
+    assert refused["mqtt"]["state"] == "error"
+    assert "refused" in refused["mqtt"]["summary"] and "install.sh" in refused["mqtt"]["action"]
+    unreachable = _by_id(health.build_checks(_facts(
+        mqtt_connected=False, mqtt_last_error={"kind": "unreachable", "detail": "timed out", "epoch": 1.0})))
+    assert "Can't reach" in unreachable["mqtt"]["summary"] and "firewall" in unreachable["mqtt"]["action"]
+
+
 def test_standalone_node_is_not_an_error():
     c = _by_id(health.build_checks(_facts(c2_url=None, has_api_key=False, mqtt_connected=False)))
     assert c["c2"]["state"] == "off"
@@ -218,6 +229,17 @@ def test_listen_analog_single_frequency(client, op25):
     assert r.status_code == 200, r.text
     cfg = config_manager.load_node_config().override_config
     assert (cfg.type, cfg.name, cfg.config["control_channels"]) == ("NBFM", "Fire", [154.43])
+    assert cfg.config["squelch_mode"] == "noise"   # node-26#46 default
+
+
+def test_listen_analog_squelch_is_saved(client, op25):
+    r = client.post("/api/listen", json={"mode": "analog", "frequencies": [154.43],
+                                         "squelch_mode": "power", "squelch_threshold": -55})
+    assert r.status_code == 200, r.text
+    cfg = config_manager.load_node_config().override_config.config
+    assert (cfg["squelch_mode"], cfg["squelch_threshold"]) == ("power", -55)
+    assert client.post("/api/listen", json={"mode": "analog", "frequencies": [154.43],
+                                            "squelch_mode": "loud"}).status_code == 422
 
 
 def test_listen_p25_conventional(client, op25):

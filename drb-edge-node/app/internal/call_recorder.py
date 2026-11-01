@@ -66,10 +66,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import httpx
 from app.config import settings
-from app.internal import audio_trim, credentials, pcm, pulse
+from app.internal import audio_trim, pcm, pulse, upload_spool
 from app.internal.logger import logger
+from app.internal.upload_spool import UploadMeta, UploadResult, UploadSpool
 
 # Safety cap on a single recording; mirrors MAX_SEGMENT_SECONDS in metadata_watcher.
 MAX_RECORDING_SECONDS = 600
@@ -320,6 +320,17 @@ class CallRecorder:
         # why a capture process exited (see _classify_capture_exit).
         self._last_stderr_lines: deque[str] = deque(maxlen=10)
 
+        # Failed uploads wait here for a retry instead of being deleted
+        # (node-26#44). See internal/upload_spool.py.
+        self.spool = UploadSpool(
+            Path(settings.upload_spool_dir or (Path(settings.recordings_path) / "spool")),
+            uploader=self._post,
+            max_bytes=settings.upload_spool_max_bytes,
+            max_age_seconds=settings.upload_spool_max_age_hours * 3600,
+            backoff_min=settings.upload_retry_min_seconds,
+            backoff_max=settings.upload_retry_max_seconds,
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -328,8 +339,11 @@ class CallRecorder:
         """Start the persistent capture. Call once from app lifespan."""
         self._stream_task = asyncio.create_task(self._capture_loop())
         logger.info("PulseAudio ring-buffer starting.")
+        if settings.c2_url:
+            self.spool.start()
 
     async def stop(self) -> None:
+        await self.spool.stop()
         if self._stream_task:
             self._stream_task.cancel()
             try:
@@ -751,6 +765,17 @@ class CallRecorder:
     # Upload (unchanged interface)
     # ------------------------------------------------------------------
 
+    async def _post(self, file_path: Path, meta: UploadMeta) -> UploadResult:
+        return await upload_spool.post_recording(file_path, meta, AUDIO_MIME)
+
+    async def _post_inline(self, file_path: Path, meta: UploadMeta) -> UploadResult:
+        # metadata_watcher awaits on_call_end, so this attempt blocks the poll
+        # loop. With the spool behind it, it can afford a short timeout; the
+        # background retries get the full UPLOAD_TIMEOUT_SECONDS.
+        return await upload_spool.post_recording(
+            file_path, meta, AUDIO_MIME, timeout=settings.upload_inline_timeout_seconds,
+        )
+
     async def upload_recording(
         self,
         file_path: Path,
@@ -761,50 +786,37 @@ class CallRecorder:
         audio_start_epoch: Optional[float] = None,
         audio_end_epoch: Optional[float] = None,
     ) -> Optional[str]:
+        """
+        Upload once, inline. Returns the storage URL on success.
+
+        The file is deleted ONLY after a 2xx with a URL (node-26#44). A
+        retryable failure moves it into the spool, which keeps retrying in the
+        background; C2's /upload writes `audio_gcs_uri` onto the call doc by
+        call_id whenever the upload lands, so a late upload still attaches.
+        """
         if not settings.c2_url:
             logger.info("No C2_URL configured — skipping upload.")
+            file_path.unlink(missing_ok=True)
             return None
 
-        upload_url = f"{settings.c2_url}/upload"
-        api_key = credentials.get_api_key()
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-
-        form: dict = {"call_id": call_id, "node_id": settings.node_id}
-        if talkgroup_id is not None:
-            form["talkgroup_id"] = str(talkgroup_id)
-        if talkgroup_name:
-            form["talkgroup_name"] = talkgroup_name
-        if system_id:
-            form["system_id"] = system_id
-        # Where this audio really sits on the wall clock once silence is trimmed.
-        # C2 does not declare these Form fields yet, so FastAPI ignores them —
-        # they cost nothing and are here for when playback/correlation want them.
-        if audio_start_epoch is not None:
-            form["audio_start_epoch"] = f"{audio_start_epoch:.3f}"
-        if audio_end_epoch is not None:
-            form["audio_end_epoch"] = f"{audio_end_epoch:.3f}"
-
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                with open(file_path, "rb") as f:
-                    r = await client.post(
-                        upload_url,
-                        files={"file": (file_path.name, f, AUDIO_MIME)},
-                        data=form,
-                        headers=headers,
-                    )
-                    r.raise_for_status()
-                    audio_url = r.json().get("url")
-                    logger.info(f"Upload complete: {audio_url}")
-                    return audio_url
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
+        meta = UploadMeta(
+            call_id=call_id, talkgroup_id=talkgroup_id, talkgroup_name=talkgroup_name,
+            system_id=system_id, audio_start_epoch=audio_start_epoch, audio_end_epoch=audio_end_epoch,
+        )
+        result = await self._post_inline(file_path, meta)
+        self.spool.last_result = {"call_id": call_id, "kind": result.kind, "status": result.status,
+                                  "detail": result.detail, "epoch": time.time()}
+        if result.kind == upload_spool.OK:
+            logger.info(f"Upload complete: {result.url}")
+            file_path.unlink(missing_ok=True)
+            return result.url
+        if result.kind == upload_spool.REJECT:
+            logger.error(f"C2 rejected the upload of call {call_id} ({result.detail}) — not retryable, deleting it.")
+            file_path.unlink(missing_ok=True)
             return None
-        finally:
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
+        if self.spool.add(file_path, meta, result) is None:
+            self.spool.last_result = {**self.spool.last_result, "kind": "lost"}
+        return None
 
     # ------------------------------------------------------------------
     # State

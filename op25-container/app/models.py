@@ -54,6 +54,13 @@ class P25Mode(str, Enum):
     CONVENTIONAL = "conventional"
 
 
+class NbfmSquelchMode(str, Enum):
+    """Values op25_nbfm.py accepts for nbfm_squelch_mode (gr310, 2026-08-03)."""
+    POWER = "power"
+    NOISE = "noise"
+    VOICE = "voice"
+
+
 class ConventionalChannel(BaseModel):
     """One fixed P25 conventional voice channel (node-26#24)."""
     frequency: int                 # Hz
@@ -77,7 +84,16 @@ class ConfigGenerator(BaseModel):
     hardware_preset: str = "rtl-sdr-v3"
     ppm_override: Optional[float] = None  # when set, overrides the preset's default PPM
     # NBFM only: power squelch threshold in dB (op25_nbfm default is -60).
+    # Used only in "power" squelch mode.
     nbfm_squelch: Optional[float] = None
+    # NBFM only (node-26#46): OP25 gr310's squelch algorithm — "power" (the
+    # absolute-level squelch, needs per-site calibration), "noise" (FM
+    # quieting, no calibration) or "voice" (noise + speech detector).
+    # Defaults to noise: power mode left analog open on static.
+    nbfm_squelch_mode: NbfmSquelchMode = NbfmSquelchMode.NOISE
+    # dB of quieting needed to open in noise/voice mode (OP25 default 8;
+    # 12-15 opens only on solid signals, ~5 chases weak ones).
+    nbfm_noise_squelch_db: Optional[float] = None
 
 class DemodType(str, Enum):
     CQPSK = "cqpsk"
@@ -99,6 +115,9 @@ class ChannelConfig(BaseModel):
     frequency: Optional[int] = None
     # Key name op25_nbfm.py actually reads (from_dict(config, 'nbfm_squelch_threshold', -60)).
     nbfm_squelch_threshold: Optional[float] = None
+    # Also read by op25_nbfm.py from the channel dict (node-26#46).
+    nbfm_squelch_mode: Optional[str] = None
+    nbfm_noise_squelch_db: Optional[float] = None
     destination: Optional[str] = "udp://127.0.0.1:23456"
     # P25 conventional only, read by tk_drb_conv.py (not by multi_rx): the NAC
     # to lock the frame assembler to. multi_rx passes the whole channel dict

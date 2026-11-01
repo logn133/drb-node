@@ -216,6 +216,20 @@
         <label for="an-name">Name <span class="hint">(optional)</span></label>
         <input type="text" id="an-name" placeholder="Fire dispatch">
       </div>
+      <div class="field">
+        <label for="an-sq-mode">Squelch</label>
+        <select id="an-sq-mode">
+          <option value="noise" selected>Noise (recommended)</option>
+          <option value="voice">Voice (noise + speech detector)</option>
+          <option value="power">Power (old, needs calibration)</option>
+        </select>
+        <span class="hint">Noise squelch opens on a real carrier and needs no tuning per site.</span>
+      </div>
+      <div class="field">
+        <label for="an-sq-level">Squelch level (dB) <span class="hint">(optional)</span></label>
+        <input type="text" id="an-sq-level" class="mono" placeholder="8" inputmode="decimal">
+        <span class="hint" id="an-sq-hint">Noise/voice: dB of quieting to open — 8 default, 12-15 for strong signals only, ~5 for weak ones.</span>
+      </div>
     </div>
 
     <div class="pane" data-pane="system" hidden>
@@ -396,6 +410,13 @@
   // ── Listen locally ─────────────────────────────────────────────────────
   let systems = [];
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
+  $('an-sq-mode').addEventListener('change', () => {
+    const power = $('an-sq-mode').value === 'power';
+    $('an-sq-level').placeholder = power ? '-60' : '8';
+    $('an-sq-hint').textContent = power
+      ? 'Power: absolute signal level in dB to open (-60 default); depends on this SDR, gain and antenna.'
+      : 'Noise/voice: dB of quieting to open — 8 default, 12-15 for strong signals only, ~5 for weak ones.';
+  });
   document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', () => {
     document.querySelectorAll('.pane').forEach(p => { p.hidden = p.dataset.pane !== mode(); });
     $('listen-msg').textContent = '';
@@ -443,7 +464,12 @@
     } else {
       const freqs = parseFreqs($('an-freq').value);
       if (freqs.length !== 1 || isNaN(freqs[0])) { msg.className = 'msg err'; msg.textContent = 'Enter one frequency in MHz, e.g. 154.4300'; return; }
-      body = { mode: 'analog', frequencies: freqs, name: $('an-name').value };
+      const sqMode = $('an-sq-mode').value;
+      const sqRaw = $('an-sq-level').value.trim();
+      const sqLevel = sqRaw === '' ? null : Number(sqRaw);
+      if (sqLevel !== null && isNaN(sqLevel)) { msg.className = 'msg err'; msg.textContent = 'Squelch level must be a number of dB, e.g. 8 (or -60 for power mode).'; return; }
+      body = { mode: 'analog', frequencies: freqs, name: $('an-name').value, squelch_mode: sqMode };
+      if (sqLevel !== null) body[sqMode === 'power' ? 'squelch_threshold' : 'squelch_db'] = sqLevel;
     }
     $('listen-btn').disabled = true;
     msg.className = 'msg';

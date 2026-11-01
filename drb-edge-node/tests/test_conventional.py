@@ -78,6 +78,17 @@ def test_analog_payload_reads_channels_or_legacy(cfg):
     p = rc.build_generate_payload("NBFM", "Fire", cfg, ICE, "rtl-sdr-v3", None)
     assert p["channels"] == [154_430_000]
     assert "p25_mode" not in p
+    assert p["nbfm_squelch_mode"] == "noise"   # node-26#46 default
+
+
+def test_analog_squelch_is_plumbed_and_validated():
+    cfg = {"channels": [{"freq": 154.43}], "squelch_mode": "Power", "squelch_threshold": "-55", "squelch_db": 12}
+    p = rc.build_generate_payload("NBFM", "Fire", cfg, ICE, "rtl-sdr-v3", None)
+    assert p["nbfm_squelch_mode"] == "power" and p["nbfm_squelch"] == -55.0 and p["nbfm_noise_squelch_db"] == 12.0
+    with pytest.raises(ValueError):
+        rc.analog_squelch({"squelch_mode": "loud"})
+    with pytest.raises(ValueError):
+        rc.analog_squelch({"squelch_db": "lots"})
 
 
 def test_system_mode():
