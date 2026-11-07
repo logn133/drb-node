@@ -224,7 +224,13 @@ def build_tr_config(
         # channels are known here, so the SDR is centred on those. A system
         # whose voice channels sit outside that ~2 MHz loses those calls (TR
         # logs "no source covering" for each) — needs a second source.
-        covered = ccs if center_override else widest_cover(ccs, int(sample_rate))
+        if center_override:
+            half = int(sample_rate) * USABLE_BANDWIDTH_SHARE / 2
+            covered = [c for c in ccs if abs(c - center_override) <= half]
+            if not covered:
+                raise ValueError(f"TR_CENTER_HZ {center_override} covers none of {name!r}'s control channels.")
+        else:
+            covered = widest_cover(ccs, int(sample_rate))
         if len(covered) < len(ccs):
             system["control_channels"] = covered
             logger.warning(
@@ -267,7 +273,7 @@ def build_tr_config(
         # reads the control-channel decode rate from it for the health check.
         "logFile": True,
         "logDir": f"{TR_APP_DIR}/logs",
-        "logColor": False,
+        "logColor": "none",  # TR 5.x: a string ("console"|"none"), not a bool
         # Live audio for Discord: simplestream sends every call's PCM to the
         # edge-node, which follows one talkgroup at a time into PulseAudio.
         "audioStreaming": True,

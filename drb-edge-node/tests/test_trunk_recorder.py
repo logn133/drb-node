@@ -499,3 +499,10 @@ def test_wide_control_channel_list_is_cut_to_what_one_sdr_covers():
     # MTA Zone 2 (node-002): five control channels spanning 4.15 MHz.
     ccs = [770_156_250, 770_431_250, 773_293_750, 773_843_750, 774_306_250]
     assert tr_config.widest_cover(ccs, 2_400_000) == ccs[2:]
+
+
+def test_center_override_keeps_only_the_control_channels_it_covers():
+    tr, _ = tr_config.build_tr_config(
+        "P25", "MTA", {"control_channels": [770.15625, 770.43125, 773.29375]},
+        **{**TR_KW, "center_override": 770_900_000})
+    assert tr["systems"][0]["control_channels"] == [770_156_250, 770_431_250]
