@@ -136,7 +136,7 @@ def test_legacy_analog_and_unpinned_sdr():
 @pytest.mark.parametrize("stype,cfg", [
     ("DMR", {"control_channels": [450.0]}),
     ("P25", {"control_channels": []}),
-    ("P25", {"control_channels": [851.0, 855.0]}),     # 4 MHz: wider than one RTL-SDR
+    ("P25", {"mode": "conventional", "channels": [{"freq": 851.0}, {"freq": 855.0}]}),  # 4 MHz: every channel must fit
     ("P25", {"mode": "conventional", "channels": []}),
 ])
 def test_unbuildable_systems_raise(stype, cfg):
@@ -374,7 +374,8 @@ async def test_apply_config_writes_files_and_restart(tr_env, monkeypatch, tmp_pa
     assert cfg["sources"][0]["device"] == "rtl=00000101" and (d / "talkgroups.csv").exists()
 
     bad = await t.apply_config(SystemConfig(system_id="s2", name="Wide", type="P25",
-                                            config={"control_channels": [851.0, 856.0]}))
+                                            config={"mode": "conventional",
+                                                    "channels": [{"freq": 851.0}, {"freq": 856.0}]}))
     assert not bad and "MHz" in t.config_error
     # radio_backend reports the config error instead of pretending to start.
     monkeypatch.setattr(trmod, "trunk_recorder", t)
@@ -492,3 +493,9 @@ def test_health_tr_failures(tr, cid, state):
 
 def test_health_tr_conventional_has_no_decode_rate():
     assert _facts(_tr(decode_rate=None), mode="conventional")["decode"]["state"] == "ok"
+
+
+def test_wide_control_channel_list_is_cut_to_what_one_sdr_covers():
+    # MTA Zone 2 (node-002): five control channels spanning 4.15 MHz.
+    ccs = [770_156_250, 770_431_250, 773_293_750, 773_843_750, 774_306_250]
+    assert tr_config.widest_cover(ccs, 2_400_000) == ccs[2:]

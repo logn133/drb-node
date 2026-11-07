@@ -19,6 +19,7 @@ import csv
 import io
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.internal.logger import logger
 from app.internal.conventional import channel_tgid
 from app.internal.radio_config import (
     ANALOG, CONVENTIONAL, DMR, TRUNKED, analog_frequency, conventional_channels, system_mode, to_hz,
@@ -48,6 +49,21 @@ CENTER_NUDGES_HZ = (0, 150_000, -150_000, 300_000, -300_000)
 
 def _fits(center: int, freqs: List[int], half_band: float) -> bool:
     return all(abs(f - center) <= half_band for f in freqs)
+
+
+def widest_cover(freqs: List[int], rate: int) -> List[int]:
+    """The largest run of frequencies one SDR at `rate` can hold at once
+    (ties: the lowest). A trunked system lists every control channel it might
+    use, but TR needs only one live at a time, so a list wider than the SDR is
+    cut down to what fits instead of refusing the whole system."""
+    half = rate * USABLE_BANDWIDTH_SHARE / 2
+    fs = sorted(set(freqs))
+    best: List[int] = []
+    for i, lo in enumerate(fs):
+        run = [f for f in fs[i:] if f - lo <= 2 * half]
+        if len(run) > len(best):
+            best = run
+    return best
 
 
 def choose_center(freqs: List[int], rate: int, override: Optional[int] = None) -> int:
@@ -208,7 +224,15 @@ def build_tr_config(
         # channels are known here, so the SDR is centred on those. A system
         # whose voice channels sit outside that ~2 MHz loses those calls (TR
         # logs "no source covering" for each) — needs a second source.
-        freqs = ccs
+        covered = ccs if center_override else widest_cover(ccs, int(sample_rate))
+        if len(covered) < len(ccs):
+            system["control_channels"] = covered
+            logger.warning(
+                f"Control channels span {(max(ccs) - min(ccs)) / 1e6:.3f} MHz, wider than one SDR; "
+                f"using the {len(covered)} of {len(ccs)} that fit "
+                f"({min(covered) / 1e6:.5f}-{max(covered) / 1e6:.5f} MHz)."
+            )
+        freqs = covered
         source["digitalRecorders"] = int(digital_recorders)
     elif mode == CONVENTIONAL:
         chans = conventional_channels(config)
