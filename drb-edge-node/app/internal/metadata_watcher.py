@@ -132,6 +132,11 @@ ATTRIBUTION_LOOKAHEAD_SECONDS = 2.0
 CONSOLE_HISTORY_SECONDS = 180.0
 CONSOLE_HISTORY_MAX = 1200
 
+# Sightings of the same radio closer together than this are one transmission.
+# The radio ID shows up in only ~44% of 0.5 s polls during a burst (server-26#304
+# P0 probe, 2026-11-08), so gaps of a few polls inside one key-up are normal.
+TX_MERGE_GAP_SECONDS = 2.0
+
 # How far back to look for a duplicate before appending a grant. OP25's call_log
 # deque drains on read so repeats should not happen, but a re-delivered entry
 # would otherwise inflate the transmission count and the attribution score.
@@ -207,6 +212,21 @@ def _talker(channel: Dict[str, Any]) -> Optional[tuple]:
     return tgid, rid
 
 
+def rebase_radios(radios: List[Dict[str, Any]], shift: float, span: float) -> List[Dict[str, Any]]:
+    """Move call-relative radio offsets into another frame (the trimmed audio file).
+
+    `shift` is call start minus the new origin; offsets land clamped to [0, span]
+    so a talker before the file's first sample sits at 0, not before it.
+    """
+    span = max(0.0, span)
+    return [
+        {**r,
+         "start": round(min(max(0.0, r["start"] + shift), span), 2),
+         "end": round(min(max(0.0, r["end"] + shift), span), 2)}
+        for r in radios
+    ]
+
+
 def _iso(epoch: Optional[float]) -> Optional[str]:
     if epoch is None:
         return None
@@ -254,6 +274,10 @@ class MetadataWatcher:
         self._current_srcaddr: Optional[int] = None
         self._started_at: Optional[float] = None   # audio onset, or grant epoch in fallback mode
         self._transmissions: int = 0
+        # Every radio heard on the open segment, in order: [rid, first_epoch,
+        # last_epoch]. srcaddr above keeps only the latest one; one recording
+        # often holds a dispatcher and a unit (server-26#304).
+        self._tx: List[List[Any]] = []
         # True when the open segment is governed by audio, False for the
         # console fallback. Fixed at open so capture flapping cannot switch the
         # rules underneath a live segment.
@@ -559,6 +583,7 @@ class MetadataWatcher:
             self._current_tgid_name = entry.get("tgtag") or ""
             self._current_freq = entry.get("freq")
             self._current_srcaddr = _as_int(entry.get("rid"))
+            self._note_tx(self._current_srcaddr, started_at)
             self._transmissions += 1
             logger.info(
                 f"Late attribution: segment {self._active_call_id} adopted tgid {tgid} from a grant "
@@ -571,11 +596,13 @@ class MetadataWatcher:
             # of a single conversation lands in one file.
             self._transmissions += 1
             self._refresh_meta_from_log(entry)
+            self._note_tx(_as_int(entry.get("rid")), started_at)
             return
 
         if self._same_channel(tgid, entry.get("freq"), entry.get("tgtag") or ""):
             self._transmissions += 1
             self._refresh_meta_from_log(entry)
+            self._note_tx(_as_int(entry.get("rid")), started_at)
             return
 
         # FORCED SPLIT. Two talkgroups can be back to back with no silence
@@ -626,6 +653,7 @@ class MetadataWatcher:
                 ours = True
                 if srcaddr is not None:
                     self._current_srcaddr = srcaddr
+                    self._note_tx(srcaddr, now)
                 self._last_activity = now
                 self._refresh_meta_from_channel(channel)
 
@@ -638,6 +666,7 @@ class MetadataWatcher:
                 self._current_tgid_name = active[0].get("tag") or ""
                 self._current_freq = active[0].get("freq")
                 self._current_srcaddr = _as_int(active[0].get("srcaddr"))
+                self._note_tx(self._current_srcaddr, now)
                 logger.info(f"Late attribution: segment {self._active_call_id} adopted tgid {tgid} from channel state.")
             return
 
@@ -709,6 +738,7 @@ class MetadataWatcher:
             self._last_tx_end = None
             self._last_activity = now
             self._refresh_meta_from_log(entry)
+            self._note_tx(_as_int(entry.get("rid")), started_at)
             return
 
         await self._close_segment(started_at + _tail_pad(), reason="tgid_change")
@@ -730,6 +760,7 @@ class MetadataWatcher:
                 tx_active = True
                 if srcaddr is not None:
                     self._current_srcaddr = srcaddr
+                    self._note_tx(srcaddr, now)
                 self._refresh_meta_from_channel(channel)
             elif chan_tgid is not None:
                 foreign_active_tgid = chan_tgid
@@ -792,6 +823,28 @@ class MetadataWatcher:
     # Segment open / close
     # ------------------------------------------------------------------
 
+    def _note_tx(self, rid: Optional[int], epoch: float) -> None:
+        """Record a sighting of `rid` talking on the open segment."""
+        if rid is None or self._active_call_id is None:
+            return
+        last = self._tx[-1] if self._tx else None
+        if last is not None and last[0] == rid and epoch - last[2] <= TX_MERGE_GAP_SECONDS:
+            last[2] = max(last[2], epoch)
+            return
+        self._tx.append([rid, epoch, epoch])
+
+    def _radios(self, start: float, end: float) -> List[Dict[str, Any]]:
+        """The segment's transmissions as offsets (seconds) from its start, clamped to it."""
+        span = max(0.0, end - start)
+        return [
+            {
+                "radio": rid,
+                "start": round(min(max(0.0, first - start), span), 2),
+                "end": round(min(max(0.0, last - start), span), 2),
+            }
+            for rid, first, last in self._tx
+        ]
+
     def _refresh_meta_from_log(self, entry: Dict[str, Any]) -> None:
         if not self._current_tgid_name:
             self._current_tgid_name = entry.get("tgtag") or ""
@@ -826,6 +879,8 @@ class MetadataWatcher:
         self._started_at = started_at
         self._transmissions = max(1, transmissions)
         self._audio_driven = audio_driven
+        self._tx = []
+        self._note_tx(srcaddr, started_at)
 
         # Console fallback assumes the transmission is still up; it learns
         # otherwise from the next channel scan.
@@ -876,6 +931,7 @@ class MetadataWatcher:
             "ended_at": _iso(end_epoch),
             "ended_at_epoch": end_epoch,
             "transmissions": self._transmissions,
+            "radios": self._radios(started_at if started_at is not None else end_epoch, end_epoch),
             "end_reason": reason,
             "attributed": attributed,
             "driver": "audio" if self._audio_driven else "console",
@@ -910,6 +966,7 @@ class MetadataWatcher:
         self._current_srcaddr = None
         self._started_at = None
         self._transmissions = 0
+        self._tx = []
         self._tx_active = False
         self._last_tx_end = None
         self._audio_driven = False
@@ -949,6 +1006,10 @@ class MetadataWatcher:
                 self._current_freq = found.freq
             if found.rid is not None and self._current_srcaddr is None:
                 self._current_srcaddr = found.rid
+                if not self._tx:
+                    # Only as the sole entry: the window's latest radio has no
+                    # timing of its own, so it must not reorder real sightings.
+                    self._note_tx(found.rid, start)
             self._transmissions = max(self._transmissions, found.grants)
             return
 

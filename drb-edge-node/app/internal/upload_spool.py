@@ -71,6 +71,10 @@ class UploadMeta:
     system_id: Optional[str] = None
     audio_start_epoch: Optional[float] = None
     audio_end_epoch: Optional[float] = None
+    # JSON list of {radio, start, end} — every radio heard on the call
+    # (server-26#304). Sent here as well as on call_end because C2 starts the
+    # pipeline from /upload, before call_end arrives.
+    radios: Optional[str] = None
 
 
 @dataclass
@@ -108,6 +112,8 @@ def _form(meta: UploadMeta) -> Dict[str, str]:
         form["audio_start_epoch"] = f"{meta.audio_start_epoch:.3f}"
     if meta.audio_end_epoch is not None:
         form["audio_end_epoch"] = f"{meta.audio_end_epoch:.3f}"
+    if meta.radios:
+        form["radios"] = meta.radios
     return form
 
 

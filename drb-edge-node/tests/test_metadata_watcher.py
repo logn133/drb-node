@@ -27,6 +27,7 @@ from app.internal.metadata_watcher import (
     MAX_SEGMENT_SECONDS,
     MetadataWatcher,
     OP25_OFFLINE_GRACE,
+    rebase_radios,
 )
 from app.internal.op25_client import TerminalUpdate, parse_terminal_messages
 
@@ -1147,3 +1148,86 @@ async def test_console_history_is_bounded(hearing, clock, audio):
     clock.advance(CONSOLE_HISTORY_SECONDS + 1)
     await tick(hearing, update())
     assert all(e.epoch >= clock.now - CONSOLE_HISTORY_SECONDS for e in hearing._console)
+
+
+# ---------------------------------------------------------------------------
+# Every radio on the call (server-26#304) — not just the last srcaddr
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_call_end_lists_every_radio_in_order(watcher, clock):
+    """Dispatcher, unit, dispatcher on one talkgroup: three transmissions."""
+    start = clock.now
+    await tick(watcher, update(call_log=[grant(1234, start, rid=555)],
+                               channels=[channel(tgid=1234, srcaddr=555)]))
+    clock.advance(1.0)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=555)]))
+    clock.advance(1.0)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=777)]))
+    clock.advance(0.5)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=777)]))
+    clock.advance(1.0)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=555)]))
+    clock.advance(0.5)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+    clock.advance(settings.call_idle_timeout + 0.5)
+    await tick(watcher, update(channels=[channel()]))
+
+    payload = watcher.on_call_end.call_args[0][0]
+    assert [r["radio"] for r in payload["radios"]] == [555, 777, 555]
+    assert payload["radios"][0] == {"radio": 555, "start": 0.0, "end": 1.0}
+    assert payload["radios"][1] == {"radio": 777, "start": 2.0, "end": 2.5}
+    # srcaddr keeps its old meaning (the latest talker) for existing readers.
+    assert payload["srcaddr"] == 555
+
+
+@pytest.mark.asyncio
+async def test_missed_polls_inside_one_keyup_stay_one_transmission(watcher, clock):
+    """The radio ID drops out of some polls mid-transmission; that is not a new key-up."""
+    await tick(watcher, update(call_log=[grant(1234, clock.now, rid=555)],
+                               channels=[channel(tgid=1234, srcaddr=555)]))
+    clock.advance(0.5)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+    clock.advance(1.0)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=555)]))
+    clock.advance(0.5)
+    await tick(watcher, update(channels=[channel(tgid=1234, srcaddr=0, hold_tgid=1234)]))
+    clock.advance(settings.call_idle_timeout + 0.5)
+    await tick(watcher, update(channels=[channel()]))
+
+    radios = watcher.on_call_end.call_args[0][0]["radios"]
+    assert radios == [{"radio": 555, "start": 0.0, "end": 1.5}]
+
+
+@pytest.mark.asyncio
+async def test_radio_list_resets_between_calls(watcher, clock):
+    await tick(watcher, update(call_log=[grant(1234, clock.now, rid=555)]))
+    clock.advance(0.2)
+    await tick(watcher, update(call_log=[grant(4321, clock.now, rid=888)]))
+
+    first = watcher.on_call_end.call_args[0][0]
+    assert [r["radio"] for r in first["radios"]] == [555]
+    assert watcher._tx == [[888, clock.now, clock.now]]
+
+
+@pytest.mark.asyncio
+async def test_audio_mode_records_a_radio_seen_only_in_a_grant(hearing, clock, audio):
+    """A short key-up between channel polls is only visible as a call_log grant."""
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now, rid=555)],
+                               channels=[channel(tgid=1234, srcaddr=555)]))
+    clock.advance(1.0)
+    audio.speak()
+    await tick(hearing, update(call_log=[grant(1234, clock.now, rid=777)]))
+    clock.advance(settings.call_silence_timeout + 0.5)
+    await tick(hearing, update(channels=[channel()]))
+
+    radios = hearing.on_call_end.call_args[0][0]["radios"]
+    assert [r["radio"] for r in radios] == [555, 777]
+
+
+def test_rebase_radios_moves_offsets_into_the_audio_frame():
+    """The file starts 0.25 s of pre-roll before the call, then 1.0 s of lead was trimmed."""
+    radios = [{"radio": 555, "start": 0.0, "end": 2.0}, {"radio": 777, "start": 3.0, "end": 9.0}]
+    out = rebase_radios(radios, shift=-0.75, span=6.0)
+    assert out == [{"radio": 555, "start": 0.0, "end": 1.25}, {"radio": 777, "start": 2.25, "end": 6.0}]

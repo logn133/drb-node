@@ -785,6 +785,7 @@ class CallRecorder:
         system_id: Optional[str] = None,
         audio_start_epoch: Optional[float] = None,
         audio_end_epoch: Optional[float] = None,
+        radios: Optional[str] = None,
     ) -> Optional[str]:
         """
         Upload once, inline. Returns the storage URL on success.
@@ -802,6 +803,7 @@ class CallRecorder:
         meta = UploadMeta(
             call_id=call_id, talkgroup_id=talkgroup_id, talkgroup_name=talkgroup_name,
             system_id=system_id, audio_start_epoch=audio_start_epoch, audio_end_epoch=audio_end_epoch,
+            radios=radios,
         )
         result = await self._post_inline(file_path, meta)
         self.spool.last_result = {"call_id": call_id, "kind": result.kind, "status": result.status,

@@ -228,3 +228,10 @@ async def test_wake_makes_everything_due_now(tmp_path):
     sp.add(_recording(tmp_path), UploadMeta(call_id="c1"), UploadResult(RETRY, status=401))
     sp.wake()
     assert await sp.drain_once() == 1
+
+
+def test_form_carries_the_radio_list_and_omits_it_when_empty():
+    """C2 starts correlation from /upload, so the radio list rides on it (server-26#304)."""
+    radios = json.dumps([{"radio": 555, "start": 0.0, "end": 1.0}])
+    assert upload_spool._form(UploadMeta(call_id="c1", radios=radios))["radios"] == radios
+    assert "radios" not in upload_spool._form(UploadMeta(call_id="c1"))

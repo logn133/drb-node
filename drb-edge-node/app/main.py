@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -9,7 +10,7 @@ from app.models import SystemConfig, normalize_sdr_pins, normalize_secondary_pri
 from app.internal.logger import logger
 from app.internal.mqtt_manager import mqtt_manager
 from app.internal import credentials
-from app.internal.metadata_watcher import metadata_watcher
+from app.internal.metadata_watcher import metadata_watcher, rebase_radios
 from app.internal.call_recorder import call_recorder
 from app.internal.discord_radio import radio_bot
 from app.internal.config_manager import (
@@ -93,6 +94,15 @@ async def on_call_end(data: dict):
         data["audio_end_at"] = _iso(recording.audio_end_epoch)
         data["audio_start_epoch"] = recording.audio_start_epoch
         data["audio_end_epoch"] = recording.audio_end_epoch
+        # Radio offsets were measured from the call start; C2 maps an offset
+        # to wall clock as audio_start_epoch + t (above), so put them in the
+        # audio file's frame (server-26#304).
+        if data.get("radios") and data.get("started_at_epoch") is not None:
+            data["radios"] = rebase_radios(
+                data["radios"],
+                shift=data["started_at_epoch"] - recording.audio_start_epoch,
+                span=recording.audio_end_epoch - recording.audio_start_epoch,
+            )
         data["audio_lead_trimmed"] = round(recording.lead_trimmed, 3)
         data["audio_tail_trimmed"] = round(recording.tail_trimmed, 3)
         if recording.clamped_seconds:
@@ -108,6 +118,7 @@ async def on_call_end(data: dict):
             system_id=node_cfg.assigned_system_id,
             audio_start_epoch=recording.audio_start_epoch,
             audio_end_epoch=recording.audio_end_epoch,
+            radios=json.dumps(data["radios"]) if data.get("radios") else None,
         )
         if audio_url:
             data["audio_url"] = audio_url
