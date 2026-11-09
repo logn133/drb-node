@@ -1,0 +1,31 @@
+name: Tag release
+
+# node-26#49: every push to main is a release, vMAJOR.MINOR.PATCH (see
+# scripts/next-version.sh). Test nodes (updater REF=latest) install the
+# highest tag on their next timer run; customer nodes (REF=v1) wait for the
+# Promote workflow.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: version-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag this commit
+        run: |
+          git fetch --force --tags origin
+          TAG="$(bash scripts/next-version.sh)"
+          if [ -z "$TAG" ]; then echo "already tagged"; exit 0; fi
+          git tag "$TAG"
+          git push origin "refs/tags/$TAG"
+          echo "released $TAG"

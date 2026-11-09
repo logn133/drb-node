@@ -44,6 +44,11 @@ case "$1" in
           *:docker-compose.yml) cat "$STUB_REPO/docker-compose.yml" ;;
         esac ;;
   checkout) echo "${@: -1}" > "$STUB/head" ;;
+  tag)
+    if [ "$2" = --points-at ]; then
+      if [ "$3" = HEAD ]; then cat "$STUB/tags_head" 2>/dev/null; else cat "$STUB/tags_new" 2>/dev/null; fi
+    else cat "$STUB/tags_all" 2>/dev/null; fi
+    exit 0 ;;
   *) exit 0 ;;
 esac
 '''
@@ -121,7 +126,7 @@ def test_no_request_means_checkin_only(env):
     calls = _calls(env)
     assert "update-check" in calls
     assert "docker" not in calls
-    assert "fetch" not in calls
+    assert "checkout" not in calls
 
 
 def test_c2_request_updates_once_and_reports(env):
@@ -248,3 +253,74 @@ def test_target_without_pinning_still_updates(env):
     assert (env["stub"] / "head").read_text().strip() == NEW
     assert _pulled(_calls(env))
     assert "DRB_TAG_" not in (env["inst"] / ".env").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Releases (node-26#49): a newer version on the node's channel is a reason to
+# update by itself, and versions compare per field as integers.
+# ---------------------------------------------------------------------------
+
+def _channel(env, ref, all_tags, target_tags, head_tags):
+    env["conf"].write_text(env["conf"].read_text().replace("REF=v1", f"REF={ref}"))
+    (env["stub"] / "tags_all").write_text("\n".join(all_tags) + "\n")
+    (env["stub"] / "tags_new").write_text("\n".join(target_tags) + "\n")
+    (env["stub"] / "tags_head").write_text("\n".join(head_tags) + "\n")
+
+
+def test_latest_channel_installs_a_newer_release_unasked(env):
+    # 1.1.10 is newer than 1.1.9: compared as integers, not strings or floats.
+    _channel(env, "latest", ["v1", "v1.1.9", "v1.1.10", "v1.1.2"], ["v1.1.10"], ["v1.1.9"])
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "release 1.1.10 on latest (installed 1.1.9)" in r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+    assert "DRB_VERSION=1.1.10" in (env["inst"] / ".env").read_text()
+
+
+def test_never_downgrades(env):
+    _channel(env, "latest", ["v1.1.9", "v1.2.0"], ["v1.1.9"], ["v1.2.0"])
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+    assert "docker" not in _calls(env)
+
+
+def test_same_release_is_not_reinstalled(env):
+    _channel(env, "v1", ["v1", "v1.1.3"], ["v1", "v1.1.3"], ["v1", "v1.1.3"])
+    assert _run(env).returncode == 0
+    assert "docker" not in _calls(env)
+
+
+def test_promoted_major_tag_installs_on_stable_nodes(env):
+    _channel(env, "v1", ["v1", "v1.1.0", "v1.1.4"], ["v1", "v1.1.4"], ["v1.1.0"])
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "release 1.1.4 on v1" in r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+
+
+def test_untagged_target_still_needs_a_request(env):
+    """v1 before its first promotion points at a commit with no release tag."""
+    _channel(env, "v1", ["v1"], ["v1"], [])
+    assert _run(env).returncode == 0
+    assert "docker" not in _calls(env)
+
+
+def test_next_version_counts_patches_as_integers(tmp_path):
+    script = REPO_ROOT / "scripts" / "next-version.sh"
+    g = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(tmp_path)]
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "VERSION").write_text("1.1\n")
+    subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "a"], check=True)
+
+    def nxt():
+        return subprocess.run(["bash", str(script)], cwd=tmp_path, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    assert nxt() == "v1.1.0"
+    for t in ("v1.1.0", "v1.1.9", "v1.0.30"):
+        subprocess.run(g + ["tag", t], check=True)
+    assert nxt() == "", "a commit that already has a release gets no second one"
+    subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    assert nxt() == "v1.1.10"
+    (tmp_path / "VERSION").write_text("1.2\n")
+    assert nxt() == "v1.2.0"

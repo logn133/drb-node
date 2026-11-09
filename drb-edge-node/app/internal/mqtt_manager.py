@@ -378,6 +378,7 @@ class MQTTManager:
             "enforce_override_timeout": config.enforce_override_timeout,
             "secondary_sdr_mode": config.secondary_sdr_mode,
             "secondary_sdr_priority": config.secondary_sdr_priority,
+            "version": settings.drb_version,
         }
         payload["sdr_pins"] = config.sdr_pins
         # Conventional channels (node-26#24): name/freq/NAC and whether the

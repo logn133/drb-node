@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     # Node identity
     node_id: str
     node_name: str = "Unnamed Node"
+    # The release installed on this node (node-26#49). The host updater writes
+    # DRB_VERSION to .env after each update; "untagged" before the first one.
+    drb_version: str = "untagged"
     node_lat: float = 0.0
     node_lon: float = 0.0
 

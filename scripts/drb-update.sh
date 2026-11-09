@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
 # DRB node host updater (node-26#15). Runs as root from systemd:
-#   drb-update.timer  -> every ~15 min: HTTPS check-in with C2; update if asked
+#   drb-update.timer  -> every ~15 min: HTTPS check-in with C2; update if asked,
+#                        or if the configured channel has a newer release
+#                        (node-26#49: REF=latest follows the highest vX.Y.Z
+#                        tag, REF=v1 follows the promoted major tag)
 #   drb-update.path   -> fires when the edge-node container drops
 #                        <install>/configs/update-requested (MQTT node_update)
 # Both start drb-update.service, which runs this script. install-updater.sh
@@ -25,6 +28,42 @@
 # function completely before running it, so `git checkout` replacing this
 # very file mid-run cannot change what is executing.
 set -euo pipefail
+
+# ── Release versions (node-26#49) ─────────────────────────────────────────
+# Versions are MAJOR.MINOR.PATCH and every comparison is per field, as
+# integers: 1.10.0 > 1.9.3. Never string or float order ("1.10" < "1.9" as a
+# float, "1.10.0" < "1.9.3" as a string).
+semver_sort() { sort -t. -k1,1n -k2,2n -k3,3n; }
+
+semver_gt() {  # semver_gt A B -> true when A is newer than B
+  local a b i
+  IFS=. read -r -a a <<< "$1"; IFS=. read -r -a b <<< "$2"
+  for i in 0 1 2; do
+    (( 10#${a[i]:-0} > 10#${b[i]:-0} )) && return 0
+    (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && return 1
+  done
+  return 1
+}
+
+version_at() {  # highest X.Y.Z release tagged on a commit, or nothing
+  git tag --points-at "$1" 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sed 's/^v//' | semver_sort | tail -1 || true
+}
+
+resolve_target() {  # REF -> a ref name git can resolve, or fail
+  local ref="$1" top
+  if [ "$ref" = latest ]; then
+    top="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | semver_sort | tail -1 || true)"
+    [ -n "$top" ] || return 1
+    echo "refs/tags/v$top"
+  elif git show-ref --verify -q "refs/remotes/origin/$ref"; then
+    echo "refs/remotes/origin/$ref"
+  elif git show-ref --verify -q "refs/tags/$ref"; then
+    echo "refs/tags/$ref"
+  else
+    return 1
+  fi
+}
 
 main() {
   local CONF="${DRB_UPDATER_CONF:-/etc/drb/updater.conf}"
@@ -118,6 +157,22 @@ main() {
     new_request="$requested"
     reason="${reason:-C2 request $requested}"
   fi
+  # A newer release on this node's channel is a reason on its own (node-26#49).
+  # Only ever forward, and only between tagged releases: an untagged target
+  # (a branch REF, or v1 before its first promotion) still needs a request.
+  if [ -z "$reason" ]; then
+    local origin_url target tv iv
+    origin_url="$(git remote get-url origin 2>/dev/null || true)"
+    if [ "$origin_url" = "$REPO_URL" ] \
+       && git -c protocol.allow=never -c protocol.https.allow=always fetch -q --force --tags --prune origin \
+       && target="$(resolve_target "$REF")"; then
+      tv="$(version_at "$(git rev-parse "$target^{commit}")")"
+      iv="$(version_at HEAD)"
+      if [ -n "$tv" ] && { [ -z "$iv" ] || semver_gt "$tv" "$iv"; }; then
+        reason="release $tv on $REF (installed ${iv:-untagged})"
+      fi
+    fi
+  fi
   [ -n "$reason" ] || { log "no update requested"; return 0; }
 
   # ── Update ─────────────────────────────────────────────────────────────
@@ -145,13 +200,7 @@ do_update() {
   git -c protocol.allow=never -c protocol.https.allow=always fetch --force --tags --prune origin || return 1
 
   local target
-  if git show-ref --verify -q "refs/remotes/origin/$REF"; then
-    target="refs/remotes/origin/$REF"
-  elif git show-ref --verify -q "refs/tags/$REF"; then
-    target="refs/tags/$REF"
-  else
-    err "ref '$REF' not found on origin"; return 1
-  fi
+  target="$(resolve_target "$REF")" || { err "ref '$REF' not found on origin"; return 1; }
   local old new
   old="$(git rev-parse HEAD)"; new="$(git rev-parse "$target^{commit}")"
 
@@ -205,6 +254,11 @@ do_update() {
   if [ "$pin" = 1 ]; then
     drb_pin_image_tags "$INSTALL_DIR/.env" "$INSTALL_DIR" "$new" || { err "could not write image pins to .env"; return 1; }
   fi
+
+  # The release this node now runs, for its checkin (node-26#49).
+  local ver; ver="$(version_at "$new")"
+  sed -i '/^DRB_VERSION=/d' "$INSTALL_DIR/.env"
+  printf 'DRB_VERSION=%s\n' "${ver:-untagged}" >> "$INSTALL_DIR/.env"
 
   if [ "$BUILD" = 1 ]; then
     docker compose build || return 1   # tags the local builds with the same pins
