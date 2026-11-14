@@ -305,6 +305,51 @@ def test_untagged_target_still_needs_a_request(env):
     assert "docker" not in _calls(env)
 
 
+def _portal(env, **answer):
+    (env["stub"] / "response").write_text(json.dumps({"update_requested_at": None, **answer}))
+
+
+def test_portal_nightly_channel_overrides_the_installed_ref(env):
+    _channel(env, "v1", ["v1", "v1.1.0", "v1.1.7"], ["v1.1.7"], ["v1.1.0"])
+    _portal(env, channel="nightly", auto_update=True)
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "release 1.1.7 on latest (installed 1.1.0)" in r.stdout
+    assert (env["state"] / "channel").read_text() == "nightly"
+
+
+def test_portal_stable_follows_the_highest_major_tag(env):
+    _channel(env, "latest", ["v1", "v2", "v1.1.0", "v2.0.0", "v2.0.3"], ["v2", "v2.0.0"], ["v1.1.0"])
+    _portal(env, channel="stable")
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "release 2.0.0 on stable (installed 1.1.0)" in r.stdout
+    assert "refs/tags/v2" in _calls(env)
+
+
+def test_auto_update_off_skips_new_releases_but_honours_a_request(env):
+    _channel(env, "latest", ["v1.1.0", "v1.1.5"], ["v1.1.5"], ["v1.1.0"])
+    _portal(env, auto_update=False)
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+    assert "auto-update is off" in r.stdout
+    assert "docker" not in _calls(env)
+
+    _portal(env, update_requested_at="2026-11-13T12:00:00+00:00")
+    r = _run(env)   # C2 unreachable or silent on auto_update: the stored "off" still holds
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+
+
+def test_unknown_channel_word_is_ignored(env):
+    _channel(env, "v1", ["v1", "v1.1.0"], ["v1", "v1.1.0"], ["v1", "v1.1.0"])
+    _portal(env, channel="refs/heads/evil")
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+    assert not (env["state"] / "channel").exists()
+    assert "evil" not in _calls(env)
+
+
 def test_next_version_counts_patches_as_integers(tmp_path):
     script = REPO_ROOT / "scripts" / "next-version.sh"
     g = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(tmp_path)]

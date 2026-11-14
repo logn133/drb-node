@@ -5,6 +5,9 @@
 #                        or if the configured channel has a newer release
 #                        (node-26#49: REF=latest follows the highest vX.Y.Z
 #                        tag, REF=v1 follows the promoted major tag)
+#                        The portal can pick the channel per node: C2's
+#                        check-in answer may say channel=stable|nightly and
+#                        auto_update=true|false (see "Channels" below)
 #   drb-update.path   -> fires when the edge-node container drops
 #                        <install>/configs/update-requested (MQTT node_update)
 # Both start drb-update.service, which runs this script. install-updater.sh
@@ -13,8 +16,11 @@
 # SECURITY MODEL — this is a remote-update path onto devices in the field:
 #   * What gets installed comes ONLY from /etc/drb/updater.conf (root-owned,
 #     written by install.sh): the repo URL, the ref, the image registry. C2's
-#     answer is a single timestamp meaning "update now"; it is never used as a
-#     ref, URL, path or command. The MQTT sentinel's content is never read.
+#     answer is a timestamp meaning "update now" plus, optionally, one of two
+#     fixed channel words; neither is ever used as a ref, URL, path or
+#     command — "nightly" maps to REF=latest and "stable" to the highest
+#     promoted vN tag, both on the configured repo. The MQTT sentinel's
+#     content is never read.
 #   * git origin must equal the configured REPO_URL (https only) and the .env
 #     IMAGE_REGISTRY must equal the configured REGISTRY, or nothing runs.
 #   * Node credentials go to curl via a 0600 header file, never argv.
@@ -52,7 +58,11 @@ version_at() {  # highest X.Y.Z release tagged on a commit, or nothing
 
 resolve_target() {  # REF -> a ref name git can resolve, or fail
   local ref="$1" top
-  if [ "$ref" = latest ]; then
+  if [ "$ref" = stable ]; then   # the highest promoted major tag (v1, v2, ...)
+    top="$(git tag -l 'v*' | grep -E '^v[0-9]+$' | sed 's/^v//' | sort -n | tail -1 || true)"
+    [ -n "$top" ] || return 1
+    echo "refs/tags/v$top"
+  elif [ "$ref" = latest ]; then
     top="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | semver_sort | tail -1 || true)"
     [ -n "$top" ] || return 1
     echo "refs/tags/v$top"
@@ -138,7 +148,7 @@ main() {
       -H "Content-Type: application/json" -H "@$tmpd/h" --data "$body"
   }
 
-  local resp
+  local resp=""
   if [[ "$C2_URL" != https://* ]]; then
     log "C2_URL is not https — skipping the HTTPS check-in"
   elif resp="$(checkin "" "" 2>"$tmpd/err")"; then
@@ -151,6 +161,23 @@ main() {
     log "HTTPS check-in failed: $(tr -d '\n' < "$tmpd/err" | head -c 200)"
   fi
 
+  # ── Channels ───────────────────────────────────────────────────────────
+  # The portal's per-node choice, remembered so an offline C2 doesn't flip a
+  # node back to its install-time REF. Anything but the exact words is ignored.
+  local channel="" auto_update=""
+  if [ -n "${resp:-}" ]; then
+    channel="$(printf '%s' "$resp" | jq -r '.channel // empty' 2>/dev/null || true)"
+    auto_update="$(printf '%s' "$resp" | jq -r 'if .auto_update == false then "false" elif .auto_update == true then "true" else empty end' 2>/dev/null || true)"
+    [[ "$channel" =~ ^(stable|nightly)$ ]] && printf '%s' "$channel" > "$STATE_DIR/channel"
+    [[ "$auto_update" =~ ^(true|false)$ ]] && printf '%s' "$auto_update" > "$STATE_DIR/auto_update"
+  fi
+  channel="$(cat "$STATE_DIR/channel" 2>/dev/null || true)"
+  auto_update="$(cat "$STATE_DIR/auto_update" 2>/dev/null || true)"
+  case "$channel" in
+    nightly) REF=latest ;;
+    stable)  REF=stable ;;
+  esac
+
   local last=""; last="$(cat "$STATE_DIR/last_request" 2>/dev/null || true)"
   local new_request=""
   if [ -n "$requested" ] && [ "$requested" != "$last" ]; then
@@ -160,7 +187,9 @@ main() {
   # A newer release on this node's channel is a reason on its own (node-26#49).
   # Only ever forward, and only between tagged releases: an untagged target
   # (a branch REF, or v1 before its first promotion) still needs a request.
-  if [ -z "$reason" ]; then
+  if [ -z "$reason" ] && [ "$auto_update" = false ]; then
+    log "auto-update is off for this node — updating only when asked"
+  elif [ -z "$reason" ]; then
     local origin_url target tv iv
     origin_url="$(git remote get-url origin 2>/dev/null || true)"
     if [ "$origin_url" = "$REPO_URL" ] \
