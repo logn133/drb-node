@@ -1,0 +1,82 @@
+name: Release images (GitHub / ghcr.io)
+
+# GitHub-side twin of .gitea/workflows/release-images.yml (server-26#318):
+# moves node image hosting off the home-uplink Gitea registry. GitHub ignores
+# .gitea/ and Gitea ignores .github/, so each forge runs only its own copy.
+#
+# Images land at ghcr.io/<owner>/<repo>/<name>:src-<tree hash of its dir>,
+# the same src- scheme as scripts/image-tags.sh, so a node switches over by
+# setting IMAGE_REGISTRY=ghcr.io DOCKER_ORG=<owner> DOCKER_REPO=<repo>; the
+# compose files need no change.
+#
+# Skips any image whose src- tag is already published for both platforms.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ensure:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: edge-node
+            context: drb-edge-node
+          - name: icecast
+            context: icecast
+          - name: op25-client
+            context: op25-container
+          - name: secondary-sdr
+            context: secondary-sdr-container
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve source tag
+        id: meta
+        run: |
+          # ghcr requires lowercase names.
+          REPO="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${REPO}/${{ matrix.name }}"
+          TAG="src-$(git rev-parse HEAD:${{ matrix.context }})"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          RAW="$(docker buildx imagetools inspect --raw "$IMAGE:$TAG" 2>/dev/null | tr -d ' \n' || true)"
+          if printf '%s' "$RAW" | grep -q '"architecture":"amd64"' \
+             && printf '%s' "$RAW" | grep -q '"architecture":"arm64"'; then
+            echo "EXISTS=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE:$TAG already published for amd64 + arm64 — nothing to do"
+          else
+            echo "EXISTS=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.meta.outputs.EXISTS != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.context }}
+          file: ./${{ matrix.context }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.IMAGE }}:${{ steps.meta.outputs.TAG }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.IMAGE }}:buildcache,mode=max
