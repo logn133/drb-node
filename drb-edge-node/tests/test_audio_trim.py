@@ -124,7 +124,7 @@ def test_the_scan_is_bounded_so_a_long_buffer_cannot_stall_the_upload():
 
 def test_leading_and_trailing_silence_are_trimmed_to_the_guard_margin():
     audio = silence(1.85) + speech(2.35) + silence(0.34)
-    kept, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+    kept, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD, tail_guard=GUARD)
 
     assert result.applied and not result.all_silence
     assert result.lead == pytest.approx(1.85 - GUARD, abs=0.05)
@@ -150,7 +150,7 @@ def test_measured_trailing_silence_is_reported_for_field_tuning():
     real silence run reaches the logs.
     """
     audio = silence(0.5) + speech(2.0) + silence(3.0)
-    _, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD)
+    _, result = trim_pcm(audio, threshold_db=-40.0, guard=GUARD, tail_guard=GUARD)
     assert result.tail == pytest.approx(3.0 - GUARD, abs=0.05)
     assert result.trimmed_seconds == pytest.approx(result.lead + result.tail)
 
@@ -197,6 +197,15 @@ def test_thresholds_default_to_settings():
     assert settings.trim_silence_threshold_db == -40.0
     assert settings.trim_silence_guard_seconds == 0.25
     assert result.lead == pytest.approx(1.0 - settings.trim_silence_guard_seconds, abs=0.05)
+
+
+def test_tail_keeps_a_wider_guard_than_the_head_by_default():
+    """node-26#48: a symmetric 0.25s guard clipped the decaying end of the last word."""
+    audio = silence(2.0) + speech(1.0) + silence(2.0)
+    _, result = trim_pcm(audio, threshold_db=-40.0)
+    assert settings.trim_tail_guard_seconds > settings.trim_silence_guard_seconds
+    assert result.lead == pytest.approx(2.0 - settings.trim_silence_guard_seconds, abs=0.05)
+    assert result.tail == pytest.approx(2.0 - settings.trim_tail_guard_seconds, abs=0.05)
 
 
 def test_a_scan_that_gives_up_leaves_the_audio_untouched_and_says_so():

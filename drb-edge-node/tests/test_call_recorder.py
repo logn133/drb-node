@@ -485,7 +485,7 @@ async def test_trim_shifts_the_audio_bounds_but_not_the_call_bounds(recorder, mo
     # Slice began at T0+0.25; speech begins at T0+1.0, so the audio now starts
     # one guard margin before the speech.
     assert rec.audio_start_epoch == pytest.approx(T0 + 1.0 - guard, abs=3 * CHUNK_INTERVAL)
-    assert rec.audio_end_epoch == pytest.approx(T0 + 3.0 + guard, abs=3 * CHUNK_INTERVAL)
+    assert rec.audio_end_epoch == pytest.approx(T0 + 3.0 + settings.trim_tail_guard_seconds, abs=3 * CHUNK_INTERVAL)
     assert rec.audio_end_epoch > rec.audio_start_epoch
 
 

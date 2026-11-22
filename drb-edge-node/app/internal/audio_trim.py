@@ -10,7 +10,7 @@ and a hallucinated sentence poisons entity extraction and then incident
 correlation downstream.
 
 WHY IT IS SAFE: only the head and tail are touched, never the middle, and a
-guard margin is kept around the detected speech so no syllable can be clipped.
+guard margin (wider at the tail, node-26#48) is kept around the detected speech so no syllable can be clipped.
 If detection says the whole buffer is silent we do NOT emit a zero-length
 recording — the caller is told and decides (see call_recorder: it skips the
 upload and logs).
@@ -131,6 +131,7 @@ def keep_window(
     last_signal: Optional[int],
     total_bytes: int,
     guard_bytes: int,
+    tail_guard_bytes: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     Turn detected signal bounds into the byte range to keep.
@@ -140,8 +141,10 @@ def keep_window(
     clamped to the buffer.
     """
     total = pcm.align(total_bytes)
+    if tail_guard_bytes is None:
+        tail_guard_bytes = guard_bytes
     start = 0 if first_signal is None else max(0, first_signal - guard_bytes)
-    end = total if last_signal is None else min(total, last_signal + guard_bytes)
+    end = total if last_signal is None else min(total, last_signal + tail_guard_bytes)
     start = pcm.align(start)
     end = pcm.align(end)
     if end <= start:
@@ -153,6 +156,7 @@ def trim_pcm(
     audio: bytes,
     threshold_db: Optional[float] = None,
     guard: Optional[float] = None,
+    tail_guard: Optional[float] = None,
 ) -> Tuple[bytes, TrimResult]:
     """
     Return (kept_audio, result). Never raises and never returns empty audio.
@@ -164,6 +168,7 @@ def trim_pcm(
     """
     threshold = settings.trim_silence_threshold_db if threshold_db is None else threshold_db
     margin = settings.trim_silence_guard_seconds if guard is None else guard
+    tail_margin = settings.trim_tail_guard_seconds if tail_guard is None else tail_guard
 
     total = pcm.align(len(audio))
     duration = pcm.seconds(total)
@@ -190,7 +195,7 @@ def trim_pcm(
 
     last = last_signal_offset(audio, threshold)
     guard_bytes = pcm.byte_offset(margin)
-    keep_start, keep_end = keep_window(first, last, total, guard_bytes)
+    keep_start, keep_end = keep_window(first, last, total, guard_bytes, pcm.byte_offset(tail_margin))
 
     lead = pcm.seconds(keep_start)
     tail = pcm.seconds(total - keep_end)

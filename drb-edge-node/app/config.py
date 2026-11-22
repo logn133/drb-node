@@ -141,6 +141,12 @@ class Settings(BaseSettings):
     trim_silence_threshold_db: float = -40.0
     # Guard margin kept around detected speech so no syllable is clipped.
     trim_silence_guard_seconds: float = 0.25
+    # Tail gets a wider guard than the head (node-26#48): a word's ending
+    # (trailing consonant, vocoder decay) sits below the -40 dBFS trim threshold
+    # while still being audible, so the symmetric 0.25s clipped the last word.
+    # Dead air here costs ~0.5s of Whisper per call; a lost disposition costs
+    # the incident.
+    trim_tail_guard_seconds: float = 0.75
 
     # OP25 container
     op25_api_url: str = "http://localhost:8001"
