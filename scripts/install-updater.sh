@@ -60,6 +60,33 @@ BUILD=$BUILD
 EOF
 chown root:root "$CONF.tmp"; chmod 644 "$CONF.tmp"; mv -f "$CONF.tmp" "$CONF"
 
+# Release signing key (node-26#17, server-26#318). drb-update.sh checks out
+# ONLY tags signed by a key listed here. This is the PUBLIC half; the private
+# key never leaves the owner's machine. To rotate: add the new line, ship a
+# release signed with the OLD key, then drop the old line in a later release.
+# Skipped on a node whose git/OpenSSH cannot verify SSH signatures (same
+# check as drb-update.sh): enforcing there would strand it permanently.
+SIGNERS=/etc/drb/release-signers
+_g="$(git --version 2>/dev/null | sed -n 's/^git version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+_o="$(ssh -V 2>&1 | sed -n 's/^OpenSSH_\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+_ok=0
+if [ -n "$_g" ] && [ -n "$_o" ]; then
+  # shellcheck disable=SC2086
+  set -- $_g $_o
+  { [ "$1" -gt 2 ] || { [ "$1" -eq 2 ] && [ "$2" -ge 34 ]; }; } \
+    && { [ "$3" -gt 8 ] || { [ "$3" -eq 8 ] && [ "$4" -ge 2 ]; }; } && _ok=1
+fi
+if [ "$_ok" != 1 ]; then
+  echo "install-updater: WARNING: git/OpenSSH too old for release signatures — not enforcing on this node" >&2
+else
+cat > "$SIGNERS.tmp" <<'SIGNERS_EOF'
+drb-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILH/K1yTZiNFAjKYvYRzDbpBJa110zCbQRP9x9BNEqxM
+SIGNERS_EOF
+chown root:root "$SIGNERS.tmp"; chmod 644 "$SIGNERS.tmp"; mv -f "$SIGNERS.tmp" "$SIGNERS"
+# Never removed: from here on a missing/empty signers file fails closed.
+install -m 644 -o root -g root /dev/null /etc/drb/signing-required
+fi
+
 cat > "$UNIT_DIR/drb-update.service" <<EOF
 [Unit]
 Description=DRB node updater (node-26#15)

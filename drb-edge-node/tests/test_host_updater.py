@@ -31,6 +31,7 @@ STUB_GIT = r'''#!/usr/bin/env bash
 echo "git $*" >> "$STUB/calls"
 while [ "$1" = -c ] || [ "$1" = -C ]; do shift 2; done
 case "$1" in
+  --version) echo "git version ${STUB_GIT_VERSION:-2.39.5}" ;;
   rev-parse)
     if [ "$2" = HEAD ]; then cat "$STUB/head"
     elif [ "$2" = --verify ]; then echo "$STUB_TREE"   # tree hash of <commit>:<dir>
@@ -38,12 +39,17 @@ case "$1" in
   remote) echo "$STUB_ORIGIN" ;;
   fetch) exit 0 ;;
   show-ref) [ "$4" = "refs/tags/v1" ] ;;
-  cat-file) [ -z "${STUB_NO_PIN:-}" ] ;;   # target has scripts/image-tags.sh
+  cat-file)
+    if [ "$2" = tag ]; then   # signed `tag` header; STUB_TAG_HEADER forges a relabel
+      echo "object $STUB_NEW"; echo "tag ${STUB_TAG_HEADER:-${3#refs/tags/}}"
+    else [ -z "${STUB_NO_PIN:-}" ]; fi ;;   # target has scripts/image-tags.sh
+  merge-base) [ -z "${STUB_NOT_AHEAD:-}" ] ;;
   show) case "$2" in
           *:scripts/image-tags.sh) cat "$STUB_REPO/scripts/image-tags.sh" ;;
           *:docker-compose.yml) cat "$STUB_REPO/docker-compose.yml" ;;
         esac ;;
   checkout) echo "${@: -1}" > "$STUB/head" ;;
+  verify-tag) grep -qxF "${2#refs/tags/}" "$STUB/signed" 2>/dev/null ;;
   tag)
     if [ "$2" = --points-at ]; then
       if [ "$3" = HEAD ]; then cat "$STUB/tags_head" 2>/dev/null; else cat "$STUB/tags_new" 2>/dev/null; fi
@@ -104,8 +110,11 @@ def env(tmp_path):
         "DRB_UPDATER_CONF": str(conf),
         "DRB_UPDATER_STATE": str(tmp_path / "state"),
         "DRB_UPDATER_LOCK": str(tmp_path / "lock"),
+        "DRB_UPDATER_SIGNERS": str(tmp_path / "release-signers"),
+        "DRB_UPDATER_SIGNING_REQUIRED": str(tmp_path / "signing-required"),
     })
-    return {"env": e, "stub": stub, "inst": inst, "conf": conf, "state": tmp_path / "state"}
+    return {"env": e, "stub": stub, "inst": inst, "conf": conf, "state": tmp_path / "state",
+            "signers": tmp_path / "release-signers", "required": tmp_path / "signing-required"}
 
 
 def _run(env):
@@ -369,3 +378,149 @@ def test_next_version_counts_patches_as_integers(tmp_path):
     assert nxt() == "v1.1.10"
     (tmp_path / "VERSION").write_text("1.2\n")
     assert nxt() == "v1.2.0"
+
+
+# ---------------------------------------------------------------------------
+# Release signatures (node-26#17, server-26#318)
+# ---------------------------------------------------------------------------
+
+def _enforce(env, signed):
+    env["signers"].write_text('drb-release namespaces="git" ssh-ed25519 AAAA\n')
+    (env["stub"] / "signed").write_text("".join(t + "\n" for t in signed))
+
+
+def test_without_a_signers_file_it_warns_and_still_updates(env):
+    _channel(env, "v1", ["v1", "v1.1.0", "v1.1.4"], ["v1", "v1.1.4"], ["v1.1.0"])
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "release signatures NOT checked" in r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+
+
+def test_signed_release_tag_installs(env):
+    _channel(env, "v1", ["v1", "v1.1.0", "v1.1.4"], ["v1", "v1.1.4"], ["v1.1.0"])
+    _enforce(env, ["v1"])
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "NOT checked" not in r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+
+
+def test_unsigned_release_tag_is_never_checked_out(env):
+    """A compromised git host can move v1, but it cannot sign it."""
+    (env["stub"] / "response").write_text(json.dumps({"update_requested_at": "2026-11-22T00:00:00Z"}))
+    _channel(env, "v1", ["v1", "v1.1.0", "v1.1.4"], ["v1", "v1.1.4"], ["v1.1.0"])
+    _enforce(env, [])
+    r = _run(env)
+    assert r.returncode != 0
+    assert "not signed" in r.stderr
+    assert (env["stub"] / "head").read_text().strip() == OLD
+    assert not _pulled(_calls(env))
+
+
+def test_branch_ref_is_refused_once_signing_is_on(env):
+    (env["stub"] / "response").write_text(json.dumps({"update_requested_at": "2026-11-22T00:00:00Z"}))
+    env["conf"].write_text(env["conf"].read_text().replace("REF=v1", "REF=main"))
+    _enforce(env, ["main"])   # even a name in the signed list: a branch is not a tag
+    r = _run(env)
+    assert r.returncode != 0
+    assert (env["stub"] / "head").read_text().strip() == OLD
+
+
+def test_latest_skips_an_unsigned_newer_tag_for_the_newest_signed_one(env):
+    # An attacker-pushed v9.9.9 must neither install nor block real releases.
+    _channel(env, "latest", ["v1.1.9", "v1.1.10", "v9.9.9"], ["v1.1.10"], ["v1.1.9"])
+    _enforce(env, ["v1.1.9", "v1.1.10"])
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "skipping unsigned or untrusted tag v9.9.9" in r.stderr
+    assert "release 1.1.10 on latest" in r.stdout
+
+
+def _requested(env):
+    (env["stub"] / "response").write_text(json.dumps({"update_requested_at": "2026-11-22T00:00:00Z"}))
+
+
+def test_old_signed_tag_relabelled_as_newer_is_refused(env):
+    """The signature covers the tag object, not the ref name it is served under."""
+    _channel(env, "latest", ["v1.1.9", "v9.9.9"], ["v9.9.9"], ["v1.1.9"])
+    _enforce(env, ["v1.1.9", "v9.9.9"])
+    env["env"]["STUB_TAG_HEADER"] = "v1.0.0"
+    r = _run(env)
+    assert "release 9.9.9" not in r.stdout
+    assert (env["stub"] / "head").read_text().strip() == OLD
+
+
+def test_signed_rollback_is_refused(env):
+    _requested(env)
+    _channel(env, "v1", ["v1"], ["v1"], [])
+    _enforce(env, ["v1"])
+    env["env"]["STUB_NOT_AHEAD"] = "1"
+    r = _run(env)
+    assert r.returncode != 0
+    assert "refusing a rollback" in r.stderr
+    assert not _pulled(_calls(env))
+
+
+def test_old_git_never_enforces_so_the_node_is_not_stranded(env):
+    """git < 2.34 cannot verify SSH signatures: enforcing would block every update forever."""
+    _requested(env)
+    _channel(env, "v1", ["v1"], ["v1"], [])
+    _enforce(env, [])          # nothing verifies, as on a real old git
+    env["required"].write_text("")
+    env["env"]["STUB_GIT_VERSION"] = "2.30.2"
+    r = _run(env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "too old to verify release signatures" in r.stdout
+    assert (env["stub"] / "head").read_text().strip() == NEW
+
+
+def test_deleted_signers_file_fails_closed_once_required(env):
+    _requested(env)
+    _channel(env, "v1", ["v1"], ["v1"], [])
+    (env["stub"] / "signed").write_text("v1\n")
+    env["required"].write_text("")   # marker present, signers file gone
+    r = _run(env)
+    assert r.returncode != 0
+    assert (env["stub"] / "head").read_text().strip() == OLD
+
+
+@pytest.mark.skipif(not shutil.which("ssh-keygen"), reason="needs ssh-keygen")
+def test_tag_is_signed_against_real_git(tmp_path):
+    """The stubs above trust verify-tag; this checks the real git invocation."""
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+    other = tmp_path / "o"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(other)], check=True)
+    signers = tmp_path / "signers"
+    signers.write_text(f'drb-release namespaces="git" {(key.with_suffix(".pub")).read_text()}')
+    repo = tmp_path / "r"
+    g = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "-c", "gpg.format=ssh"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "a"], check=True)
+    subprocess.run(g + ["-c", f"user.signingkey={key}", "tag", "-s", "-m", "ok", "good"], check=True)
+    subprocess.run(g + ["-c", f"user.signingkey={other}", "tag", "-s", "-m", "x", "forged"], check=True)
+    subprocess.run(g + ["tag", "-a", "-m", "u", "plain"], check=True)
+    subprocess.run(g + ["tag", "light"], check=True)
+    good_obj = subprocess.run(g + ["rev-parse", "refs/tags/good"], capture_output=True, text=True).stdout.strip()
+    subprocess.run(g + ["update-ref", "refs/tags/relabelled", good_obj], check=True)
+
+    funcs = "".join(SCRIPT.read_text().splitlines(keepends=True)[:-1])   # drop `main "$@"`
+
+    def signed(tag):
+        r = subprocess.run(["bash", "-c", funcs + f'\ncd "{repo}"; tag_is_signed {tag}'],
+                           env={**os.environ, "DRB_UPDATER_SIGNERS": str(signers)})
+        return r.returncode == 0
+    assert signed("good")
+    assert not signed("forged")
+    assert not signed("plain")
+    assert not signed("light")
+    assert not signed("relabelled")   # a real signature, served under the wrong name
+
+
+def test_checkin_reports_host_facts_for_the_signing_rollout(env):
+    env["env"]["STUB_GIT_VERSION"] = "2.30.2"
+    assert _run(env).returncode == 0
+    calls = _calls(env)
+    assert '"signing":"unsigned_old_git"' in calls
+    assert '"git_version":"2.30.2"' in calls

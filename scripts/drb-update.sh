@@ -25,8 +25,15 @@
 #     IMAGE_REGISTRY must equal the configured REGISTRY, or nothing runs.
 #   * Node credentials go to curl via a 0600 header file, never argv.
 #   * C2 must be https.
-# What this does NOT defend against: a compromised git host or registry —
-# refs and images are not signed (node-26#17).
+#   * Release tags must be SSH-signed by a key in the root-owned allowed-
+#     signers file (/etc/drb/release-signers, written by install-updater.sh;
+#     node-26#17, server-26#318). Once that file exists, only a signed tag is
+#     ever checked out — never a branch, never an unsigned or forged tag — so a
+#     compromised git host cannot ship code. Until it exists (a node that has
+#     not yet taken the update that installs it), the updater runs unsigned
+#     and says so on every run.
+# What this does NOT yet defend against: a compromised registry. Images are
+# pulled by src- tag, not by digest from a signed manifest.
 #   * Images are pinned to the checked-out source (node-26#19): each one is
 #     pulled as src-<git tree hash of its build directory>, never :latest.
 #
@@ -56,16 +63,58 @@ version_at() {  # highest X.Y.Z release tagged on a commit, or nothing
     | sed 's/^v//' | semver_sort | tail -1 || true
 }
 
+# ── Release signatures (node-26#17) ─────────────────────────────────────────
+SIGNERS="${DRB_UPDATER_SIGNERS:-/etc/drb/release-signers}"
+# Written alongside SIGNERS and never removed: once a node has enforced
+# signatures, a missing or emptied signers file fails CLOSED, not open.
+SIGNING_REQUIRED="${DRB_UPDATER_SIGNING_REQUIRED:-/etc/drb/signing-required}"
+# SSH tag signatures need git >= 2.34 and OpenSSH >= 8.2 (`ssh-keygen -Y`).
+# A node below that cannot verify anything, and enforcing there would strand
+# it for good — the release that fixes it could never install. Those nodes
+# run unsigned and say so loudly; it is a local fact a git host cannot fake.
+# Same check as install-updater.sh, which only installs the key when it passes.
+can_verify_ssh_sigs() {
+  local g o
+  g="$(git --version 2>/dev/null | sed -n 's/^git version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+  o="$(ssh -V 2>&1 | sed -n 's/^OpenSSH_\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+  [ -n "$g" ] && [ -n "$o" ] || return 1
+  set -- $g $o
+  { [ "$1" -gt 2 ] || { [ "$1" -eq 2 ] && [ "$2" -ge 34 ]; }; } \
+    && { [ "$3" -gt 8 ] || { [ "$3" -eq 8 ] && [ "$4" -ge 2 ]; }; }
+}
+signing_enforced() { can_verify_ssh_sigs && { [ -s "$SIGNERS" ] || [ -e "$SIGNING_REQUIRED" ]; }; }
+
+tag_is_signed() {  # tag_is_signed NAME -> true only for a tag signed by a pinned key
+  [ -s "$SIGNERS" ] || return 1
+  git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS" \
+    verify-tag "refs/tags/$1" >/dev/null 2>&1 || return 1
+  # The signature covers the tag object, not the ref name: a git host could
+  # serve an old signed release under a newer name. The signed `tag` header
+  # must match the name it is served under.
+  [ "$(git cat-file tag "refs/tags/$1" 2>/dev/null | sed -n 's/^tag //p' | head -1)" = "$1" ]
+}
+
+pick_top() {  # stdin: version-sorted tag names, oldest first -> newest usable one
+  local t
+  while IFS= read -r t; do
+    if ! signing_enforced || tag_is_signed "$t"; then echo "$t"; return 0; fi
+    printf 'drb-update: skipping unsigned or untrusted tag %s\n' "$t" >&2
+  done < <(tac)
+  return 1
+}
+
 resolve_target() {  # REF -> a ref name git can resolve, or fail
   local ref="$1" top
   if [ "$ref" = stable ]; then   # the highest promoted major tag (v1, v2, ...)
-    top="$(git tag -l 'v*' | grep -E '^v[0-9]+$' | sed 's/^v//' | sort -n | tail -1 || true)"
-    [ -n "$top" ] || return 1
-    echo "refs/tags/v$top"
+    top="$(git tag -l 'v*' | grep -E '^v[0-9]+$' | sed 's/^v//' | sort -n | sed 's/^/v/' | pick_top)" || return 1
+    echo "refs/tags/$top"
   elif [ "$ref" = latest ]; then
-    top="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | semver_sort | tail -1 || true)"
-    [ -n "$top" ] || return 1
-    echo "refs/tags/v$top"
+    top="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | semver_sort | sed 's/^/v/' | pick_top)" \
+      || return 1
+    echo "refs/tags/$top"
+  elif signing_enforced; then   # a named ref: must be a tag, and signed
+    git show-ref --verify -q "refs/tags/$ref" && tag_is_signed "$ref" || return 1
+    echo "refs/tags/$ref"
   elif git show-ref --verify -q "refs/remotes/origin/$ref"; then
     echo "refs/remotes/origin/$ref"
   elif git show-ref --verify -q "refs/tags/$ref"; then
@@ -94,6 +143,12 @@ main() {
   [[ "$REPO_URL" =~ ^https://[A-Za-z0-9._/:-]+$ ]] || { err "REPO_URL must be https: '$REPO_URL'"; return 1; }
   [[ "$REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { err "bad REF '$REF'"; return 1; }
   [[ "$REGISTRY" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || { err "bad REGISTRY '$REGISTRY'"; return 1; }
+
+  if ! can_verify_ssh_sigs; then
+    log "WARNING: git/OpenSSH too old to verify release signatures (need git>=2.34, OpenSSH>=8.2) — NOT checked (node-26#17)"
+  elif ! signing_enforced; then
+    log "WARNING: $SIGNERS missing — release signatures NOT checked (node-26#17)"
+  fi
 
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
   exec 9>"$LOCK"
@@ -140,8 +195,19 @@ main() {
     fi
     [ -s "$tmpd/h" ] || return 1
     local body
+    # Host facts for the signing rollout (node-26#17): lets the portal find
+    # nodes whose git is too old to verify release signatures.
+    local osc gitv sig
+    osc="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")"
+    gitv="$(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9A-Za-z._-]*\).*/\1/p')"
+    if ! can_verify_ssh_sigs; then sig=unsigned_old_git
+    elif signing_enforced; then sig=enforced
+    else sig=unsigned_no_key; fi
     body="$(jq -nc --arg sha "$sha" --arg a "$1" --arg r "$2" \
-      '{sha:$sha} + (if $a != "" then {applied_request_at:$a} else {} end)
+      --arg osc "$osc" --arg gitv "$gitv" --arg sig "$sig" \
+      '{sha:$sha, signing:$sig} + (if $osc != "" then {os_codename:$osc} else {} end)
+                  + (if $gitv != "" then {git_version:$gitv} else {} end)
+                  + (if $a != "" then {applied_request_at:$a} else {} end)
                   + (if $r != "" then {result:$r} else {} end)')"
     curl -fsS --proto '=https' --max-time 20 -X POST \
       "$C2_URL/nodes/$NODE_ID/update-check" \
@@ -229,9 +295,19 @@ do_update() {
   git -c protocol.allow=never -c protocol.https.allow=always fetch --force --tags --prune origin || return 1
 
   local target
-  target="$(resolve_target "$REF")" || { err "ref '$REF' not found on origin"; return 1; }
+  target="$(resolve_target "$REF")" \
+    || { err "no usable ref '$REF' on origin (missing, or not signed by a key in $SIGNERS)"; return 1; }
+  if signing_enforced; then
+    [[ "$target" == refs/tags/* ]] && tag_is_signed "${target#refs/tags/}" \
+      || { err "target $target is not a signed release tag — refusing"; return 1; }
+  fi
   local old new
   old="$(git rev-parse HEAD)"; new="$(git rev-parse "$target^{commit}")"
+  # Forward only: a replayed old signed release must not roll a node back to
+  # code with a known hole. A real rollback is a new signed release.
+  if signing_enforced && [ "$old" != "$new" ] && ! git merge-base --is-ancestor "$old" "$new" 2>/dev/null; then
+    err "target ${new:0:12} is not ahead of installed ${old:0:12} — refusing a rollback"; return 1
+  fi
 
   local env_registry
   env_registry="$(grep -E '^IMAGE_REGISTRY=' .env | head -1 | cut -d= -f2- | tr -d '"' || true)"
